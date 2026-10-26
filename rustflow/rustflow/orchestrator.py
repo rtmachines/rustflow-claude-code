@@ -1039,7 +1039,7 @@ class Orchestrator:
 
 
 def _install_interrupt_handlers() -> None:
-    """`rustflow cancel` sends SIGINT (POSIX) / CTRL_BREAK (Windows); SIGTERM from a supervisor too.
+    """`rustflow cancel` sends SIGINT / Windows console signals; SIGTERM from a supervisor too.
     All become KeyboardInterrupt -> agents are killed, state saved as `interrupted` (resumable)."""
     import signal
     import threading
@@ -1048,6 +1048,11 @@ def _install_interrupt_handlers() -> None:
 
     def handler(signum, frame):  # noqa: ARG001
         raise KeyboardInterrupt
+    if os.name == "nt" and os.environ.get("RUSTFLOW_PRIVATE_CONSOLE") == "1":
+        import ctypes
+        # A parent's "ignore Ctrl+C" console attribute is inherited even by a new console.
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
+        signal.signal(signal.SIGINT, handler)
     for name in ("SIGTERM", "SIGBREAK"):
         sig = getattr(signal, name, None)
         if sig is not None:

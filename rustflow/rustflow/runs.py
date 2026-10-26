@@ -35,6 +35,7 @@ def acquire(repo: Path, state: dict) -> None:
     if act and act.get("run_id") != state["run_id"]:
         raise RunLocked(f"run {act['run_id']} is still active in this repo (pid {act['pid']}). "
                         f"Wait: `rustflow wait {act['run_id']}`, stop: `rustflow cancel {act['run_id']}`.")
+    state["private_console"] = os.name == "nt" and os.environ.get("RUSTFLOW_PRIVATE_CONSOLE") == "1"
     path = gates.active_lock_path(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -97,7 +98,7 @@ def spawn_detached(repo: Path, cli_args: list[str], task: str | None = None, run
     kwargs: dict = {}
     if os.name == "nt":
         # A private, hidden console survives the caller and can receive cancellation signals.
-        # DETACHED_PROCESS has no console, so CTRL_BREAK cannot reach the orchestrator.
+        # DETACHED_PROCESS has no console, so console signals cannot reach the orchestrator.
         kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
         startup = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
@@ -107,6 +108,8 @@ def spawn_detached(repo: Path, cli_args: list[str], task: str | None = None, run
         kwargs["start_new_session"] = True
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    if os.name == "nt":
+        env["RUSTFLOW_PRIVATE_CONSOLE"] = "1"
     proc = subprocess.Popen(argv, cwd=repo, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                             env=env, close_fds=True, **kwargs)
     log.close()
@@ -371,7 +374,7 @@ def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channe
         time.sleep(poll_s)
 
 
-def _windows_interrupt(pid: int) -> None:
+def _windows_interrupt(pid: int, private_console: bool = False) -> None:
     """Run in a helper process: attach to the target console without detaching the caller's console."""
     import ctypes
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -379,7 +382,17 @@ def _windows_interrupt(pid: int) -> None:
     if not kernel.AttachConsole(pid):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+        if private_console:
+            # CREATE_NEW_CONSOLE does not create a process group with id == pid.
+            # Broadcast only within the run's private console; ignore Ctrl+C in this helper.
+            # Provider children use CREATE_NEW_PROCESS_GROUP and have Ctrl+C disabled.
+            if not kernel.SetConsoleCtrlHandler(None, True):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel.GenerateConsoleCtrlEvent(signal.CTRL_C_EVENT, 0):  # type: ignore[attr-defined]
+                raise ctypes.WinError(ctypes.get_last_error())
+            time.sleep(0.1)  # keep this helper attached (and ignoring Ctrl+C) during signal delivery
+        else:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
     finally:
         kernel.FreeConsole()
 
@@ -390,17 +403,21 @@ def cancel(repo: Path, run_dir: Path, grace_s: float = 20.0) -> dict:
     pid = int(state.get("pid") or 0)
     if not gates.pid_alive(pid):
         return {"run_id": state.get("run_id"), "status": effective_status(state), "note": "not running"}
+    interrupt_error = ""
     try:
         if os.name == "nt":
-            subprocess.run([sys.executable, "-c",
+            result = subprocess.run([sys.executable, "-c",
                             "import sys; from rustflow.runs import _windows_interrupt; "
-                            "_windows_interrupt(int(sys.argv[1]))", str(pid)],
+                            "_windows_interrupt(int(sys.argv[1]), sys.argv[2] == 'private')",
+                            str(pid), "private" if state.get("private_console") else "group"],
                            creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
-                           capture_output=True, timeout=5)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+            if result.returncode:
+                interrupt_error = result.stderr[-1000:] or f"interrupt helper exited {result.returncode}"
         else:
             os.kill(pid, signal.SIGINT)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        interrupt_error = str(exc)
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline and gates.pid_alive(pid):
         time.sleep(0.5)
@@ -417,4 +434,5 @@ def cancel(repo: Path, run_dir: Path, grace_s: float = 20.0) -> dict:
         release(repo, state.get("run_id", ""))
     state = load_state(run_dir)
     return {"run_id": state.get("run_id"), "status": effective_status(state), "forced": forced,
-            "next": f"rustflow resume {state.get('run_id')} --detach"}
+            "next": f"rustflow resume {state.get('run_id')} --detach",
+            **({"interrupt_error": interrupt_error} if interrupt_error else {})}

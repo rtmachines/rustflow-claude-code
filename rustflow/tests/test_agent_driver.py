@@ -37,6 +37,20 @@ def _hook(repo, sub, payload, role=None):
     return r
 
 
+def test_lock_refreshes_private_console_on_resume(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    env = {"RUSTFLOW_PRIVATE_CONSOLE": "1"}
+    monkeypatch.setattr(runs, "os", SimpleNamespace(name="nt", environ=env, getpid=lambda: 42))
+    monkeypatch.setattr(gates, "read_active", lambda repo: None)
+    state = {"run_id": "same-run"}
+    runs.acquire(tmp_path, state)
+    assert state["private_console"] is True
+    # A later foreground resume must not broadcast to the user's shared console.
+    env.clear()
+    runs.acquire(tmp_path, state)
+    assert state["private_console"] is False
+
+
 def test_detached_run_lock_hooks_cancel_resume(rust_repo, monkeypatch):
     monkeypatch.setenv("FAKE_SCENARIO", "happy")
     monkeypatch.setenv("FAKE_SLEEP", "60")
@@ -72,7 +86,8 @@ def test_detached_run_lock_hooks_cancel_resume(rust_repo, monkeypatch):
     assert _wait_for(lambda: bool(list((run_dir / "attempts").glob("*.json"))))
     # cancel -> interrupted, lock released, resumable
     res = runs.cancel(rust_repo, runs.find_run(rust_repo, rid))
-    assert res["status"] == "interrupted", res
+    assert res["status"] == "interrupted", (
+        res, (run_dir / "console.log").read_text(encoding="utf-8", errors="replace")[-4000:])
     if os.name == "nt":
         assert res["forced"] is False
     assert gates.read_active(rust_repo) is None
