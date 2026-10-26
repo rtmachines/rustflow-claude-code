@@ -590,7 +590,7 @@ class GateRunner:
 
     # individual steps
     def fmt(self, fix: bool) -> Step:
-        if fix and self.cfg.get("fmt_fix_scope", "changed") == "changed":
+        if fix and self.cfg.get("fmt_fix_scope", "changed") in ("changed", "touched"):
             return self.fmt_changed()
         argv = ["cargo", "fmt", "--all"] + ([] if fix else ["--", "--check", "--color", "never"])
         rc, out, err, dur = self._exec("fmt", argv)
@@ -601,9 +601,14 @@ class GateRunner:
     def fmt_changed(self) -> Step:
         """Format only the .rs files this change touched (vs $RUSTFLOW_BASE, else HEAD; untracked
         included). In a repo that is not rustfmt-clean, `cargo fmt --all` would put a reformat of every
-        file into the diff; check mode still reports the untouched ones, itemized per file."""
+        file into the diff; check mode still reports the untouched ones, itemized per file.
+        Scope "changed" also skips touched files that were not rustfmt-clean at the base: formatting one
+        reformats the whole file (measured: +542/-140 instead of +103 lines); "touched" formats them too."""
         start = time.monotonic()
-        files = changed_rust_files(self.root, os.environ.get("RUSTFLOW_BASE") or "HEAD")
+        base = os.environ.get("RUSTFLOW_BASE") or "HEAD"
+        files = changed_rust_files(self.root, base)
+        if self.cfg.get("fmt_fix_scope", "changed") == "changed":
+            files = [f for f in files if self.clean_at(f, base)]
         failed = [s for s in (self.fmt_file(f) for f in files) if not s.ok]
         argv = ["rustfmt", "<changed files>", *[f.relative_to(self.root).as_posix() for f in files][:20]]
         return Step("fmt", not failed, argv, duration_s=time.monotonic() - start,
@@ -624,6 +629,22 @@ class GateRunner:
         if r.returncode == 0 and r.stdout and r.stdout != src:
             path.write_text(r.stdout, encoding="utf-8")
         return Step("fmt", r.returncode == 0, argv, tail=self._tail(r.stderr) if r.returncode else "")
+
+    def clean_at(self, path: Path, rev: str) -> bool:
+        """Was `path` rustfmt-clean at `rev`? A file that did not exist there counts as clean."""
+        try:
+            rel = path.resolve().relative_to(self.root.resolve()).as_posix()
+        except ValueError:
+            return True
+        old = _git(self.root, "show", f"{rev}:{rel}")
+        if old.returncode != 0:
+            return True
+        try:  # `rustfmt --check` on stdin always exits 0: format the old text and compare instead
+            r = subprocess.run(["rustfmt", "--edition", crate_edition(path, self.root)], input=old.stdout,
+                               capture_output=True, text=True, encoding="utf-8", cwd=path.parent, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            return True
+        return r.returncode != 0 or r.stdout == old.stdout   # unparsable at rev: treat as clean
 
     def cargo_json(self, name: str, sub: str, extra_after: list[str] | None = None,
                    keep_all: bool = False) -> Step:

@@ -97,3 +97,45 @@ def test_changed_file_with_a_syntax_error_fails_fmt_and_stays_as_written(rust_re
     step = gates.GateRunner(rust_repo, gates.load_gate_config(rust_repo)).fmt(fix=True)
     assert not step.ok and "src/lib.rs" in " ".join(step.cmd) and "unclosed delimiter" in step.tail
     assert (rust_repo / "src" / "lib.rs").read_text() == broken
+
+
+def test_touched_file_unformatted_at_base_is_left_as_written(rust_repo, monkeypatch):
+    """Formatting a file that was not rustfmt-clean at the base would put a reformat of the whole file into
+    the diff (measured: +542/-140 instead of +103 on a real library). Clean-at-base and new files are formatted."""
+    _unformatted_base(rust_repo)
+    monkeypatch.delenv("RUSTFLOW_BASE", raising=False)
+    edited = UGLY + "#[test]\nfn   added( ){}\n"
+    (rust_repo / "tests" / "ugly.rs").write_text(edited)
+    (rust_repo / "src" / "lib.rs").write_text("pub fn  f( )->i32{1}\n")        # clean at base -> formatted
+    (rust_repo / "tests" / "new.rs").write_text("#[test]\nfn   fresh( ){}\n")   # new file -> formatted
+    res = gates.run_gates(rust_repo, "edit", use_cache=False)
+    assert res.steps[0].ok, res.feedback()
+    assert (rust_repo / "tests" / "ugly.rs").read_text() == edited
+    assert "pub fn f() -> i32 {" in (rust_repo / "src" / "lib.rs").read_text()
+    assert "fn fresh() {}" in (rust_repo / "tests" / "new.rs").read_text()
+
+
+def test_fmt_fix_scope_touched_formats_whole_touched_files(rust_repo, monkeypatch):
+    _unformatted_base(rust_repo)
+    monkeypatch.delenv("RUSTFLOW_BASE", raising=False)
+    cfg = (rust_repo / "rustflow.toml").read_text()
+    (rust_repo / "rustflow.toml").write_text(cfg.replace('fmt_fix_scope = "changed"', 'fmt_fix_scope = "touched"', 1))
+    (rust_repo / "tests" / "ugly.rs").write_text(UGLY + "\n")
+    gates.run_gates(rust_repo, "edit", use_cache=False)
+    assert "fn ugly() {" in (rust_repo / "tests" / "ugly.rs").read_text()
+
+
+def test_post_edit_hook_leaves_a_file_unformatted_at_base(rust_repo):
+    import os
+    import sys
+    _unformatted_base(rust_repo)
+    edited = UGLY + "#[test]\nfn   added( ){}\n"
+    target = rust_repo / "tests" / "ugly.rs"
+    target.write_text(edited)
+    env = {k: v for k, v in os.environ.items() if k not in ("RUSTFLOW_ROLE", "RUSTFLOW_BASE")}
+    env["CLAUDE_PROJECT_DIR"] = str(rust_repo)
+    r = subprocess.run([sys.executable, str(rust_repo / ".rustflow" / "hooks.py"), "post-edit"],
+                       input=json.dumps({"session_id": "h", "tool_input": {"file_path": str(target)}}),
+                       capture_output=True, text=True, env=env, cwd=rust_repo)
+    assert r.returncode == 0, r.stderr
+    assert target.read_text() == edited

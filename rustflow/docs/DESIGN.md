@@ -306,5 +306,10 @@ Poprawka w hooku po edycji nie wystarczała:
 Teraz: `fmt_fix_scope = "changed"` formatuje tylko pliki `.rs` zmienione względem `$RUSTFLOW_BASE` (interaktywnie:
 HEAD) + nieśledzone; tryb `--check` daje jedną diagnostykę na plik (`fmt|<plik>|fmt|not rustfmt-formatted`), więc
 czerwona baza z samym fmt jest akceptowalna; stop w preflight cofa gałąź/worktree; `next_actions` dla bazy
-czerwonej tylko przez fmt podsuwa `cargo fmt --all` na bazie albo `--accept-red-baseline`. Plik, którego zmiana
-dotyka, jest formatowany w całości (zasada „formatuj to, czego dotykasz”).
+czerwonej tylko przez fmt podsuwa `cargo fmt --all` na bazie albo `--accept-red-baseline`.
+
+Drugi run na żywo (ta sama biblioteka, niesformatowana baza, `--accept-red-baseline`): approved, 6 nietkniętych
+plików bez zmian, ale dwa dotknięte pliki przeformatowane w całości - `src/client.rs` +542/-140 zamiast +103 linii
+na sformatowanej bazie. Dlatego `changed` pomija też pliki, które w bazie nie były sformatowane (sprawdzane przez
+sformatowanie wersji z bazy ze stdin i porównanie; `rustfmt --check` na stdin zawsze zwraca 0) - dotyczy bramek
+i hooka po edycji. Zasada „formatuj to, czego dotykasz” zostaje jako `fmt_fix_scope = "touched"`.
