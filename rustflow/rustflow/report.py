@@ -39,6 +39,15 @@ def render(state: dict, repo: Path) -> str:
     lines.append(f"**Status:** {STATUS_TEXT.get(st, st)}")
     if state.get("stop_reason"):
         lines += ["", "```", state["stop_reason"][:4000], "```"]
+    last = (state.get("rounds") or [{}])[-1]
+    if last.get("failed_reviewers"):
+        ok = sorted(last.get("verdicts") or {})
+        who = "zatwierdził tylko jeden recenzent" if len(ok) == 1 else f"recenzowali tylko: {', '.join(ok)}"
+        errors = (state.get("degraded_review") or {}).get("errors") or {}
+        lines += ["", f"> **Recenzja niepełna** w rundzie {last.get('round')}: {who} (`{', '.join(ok)}`); bez wyniku: "
+                  + ", ".join(f"`{n}`" + (f" ({errors[n][:150]})" if errors.get(n) else "")
+                              for n in last["failed_reviewers"])
+                  + ". Przed merge rozważ `rustflow resume <run> --extra-rounds 1`."]
     lines += ["", "## Zadanie", "", state.get("task", "").strip(), ""]
 
     tri = state.get("triage") or {}

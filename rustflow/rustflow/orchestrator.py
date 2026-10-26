@@ -144,7 +144,7 @@ class Orchestrator:
                 setattr(self.opts, k, v)
         status = self.state.get("status")
         if extra_rounds:
-            if status not in CONTINUABLE:
+            if status not in CONTINUABLE and not (status in runs.APPROVED and runs.degraded(self.state)):
                 self.log(f"--extra-rounds continues a run that ended {'/'.join(CONTINUABLE)}; this one is {status}")
                 return 2
         elif status not in ("running", *RESUMABLE):
@@ -722,6 +722,12 @@ class Orchestrator:
                         + self.state["failed_agent"]["error"])
         if failed:
             self.log(f"WARNING: degraded review - failed: {', '.join(failed)}")
+            # Reaches the driving agent (summary/brief/next_actions), not just this log: an approval by one
+            # of two planned reviewers is not the independent double review the user was promised.
+            self.state["degraded_review"] = {"round": rnd, "failed": failed, "reviewed": sorted(reviews),
+                                             "errors": {n: results[n].error[:300] for n in failed}}
+        else:
+            self.state.pop("degraded_review", None)
 
         ids = fnd.IdAllocator(int(self.state.get("id_counter", 0)))
         agg = fnd.aggregate(
