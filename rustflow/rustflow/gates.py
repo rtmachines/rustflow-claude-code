@@ -603,7 +603,7 @@ class GateRunner:
         included). In a repo that is not rustfmt-clean, `cargo fmt --all` would put a reformat of every
         file into the diff; check mode still reports the untouched ones, itemized per file.
         Scope "changed" also skips touched files that were not rustfmt-clean at the base: formatting one
-        reformats the whole file (measured: +542/-140 instead of +103 lines); "touched" formats them too."""
+        reformats the whole file (measured: diff +712/-140 instead of +240/-0); "touched" formats them too."""
         start = time.monotonic()
         base = os.environ.get("RUSTFLOW_BASE") or "HEAD"
         files = changed_rust_files(self.root, base)

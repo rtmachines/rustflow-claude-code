@@ -309,7 +309,7 @@ czerwona baza z samym fmt jest akceptowalna; stop w preflight cofa gałąź/work
 czerwonej tylko przez fmt podsuwa `cargo fmt --all` na bazie albo `--accept-red-baseline`.
 
 Drugi run na żywo (ta sama biblioteka, niesformatowana baza, `--accept-red-baseline`): approved, 6 nietkniętych
-plików bez zmian, ale dwa dotknięte pliki przeformatowane w całości - `src/client.rs` +542/-140 zamiast +103 linii
-na sformatowanej bazie. Dlatego `changed` pomija też pliki, które w bazie nie były sformatowane (sprawdzane przez
+plików bez zmian, ale dwa dotknięte pliki przeformatowane w całości - diff +712/-140 zamiast +240/-0
+na sformatowanej bazie. Po poprawce: +205/-0, samo zadanie. Dlatego `changed` pomija też pliki, które w bazie nie były sformatowane (sprawdzane przez
 sformatowanie wersji z bazy ze stdin i porównanie; `rustfmt --check` na stdin zawsze zwraca 0) - dotyczy bramek
 i hooka po edycji. Zasada „formatuj to, czego dotykasz” zostaje jako `fmt_fix_scope = "touched"`.

@@ -101,7 +101,7 @@ def test_changed_file_with_a_syntax_error_fails_fmt_and_stays_as_written(rust_re
 
 def test_touched_file_unformatted_at_base_is_left_as_written(rust_repo, monkeypatch):
     """Formatting a file that was not rustfmt-clean at the base would put a reformat of the whole file into
-    the diff (measured: +542/-140 instead of +103 on a real library). Clean-at-base and new files are formatted."""
+    the diff (measured: +712/-140 instead of +240/-0 on a real library). Clean-at-base and new files are formatted."""
     _unformatted_base(rust_repo)
     monkeypatch.delenv("RUSTFLOW_BASE", raising=False)
     edited = UGLY + "#[test]\nfn   added( ){}\n"
