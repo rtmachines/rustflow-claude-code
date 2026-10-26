@@ -160,6 +160,13 @@ def effective_status(state: dict) -> str:
 
 
 # ── decision protocol ────────────────────────────────────────────────────────
+def degraded(state: dict) -> list[str]:
+    """Reviewers planned for the last review round that returned no result (a planned single-reviewer
+    re-review, `rereview = "first"`, is not a failure)."""
+    rounds = state.get("rounds") or []
+    return list(rounds[-1].get("failed_reviewers") or []) if rounds else []
+
+
 def next_actions(state: dict) -> list[dict]:
     st = effective_status(state)
     rid = state.get("run_id", "?")
@@ -175,6 +182,14 @@ def next_actions(state: dict) -> list[dict]:
                  "note": "do not edit files or change git state in this checkout meanwhile"}]
     if st in APPROVED:
         acts.append({"action": "present_result", "note": "summarize the change and the report for the user"})
+        if failed_reviewers := degraded(state):
+            errors = (state.get("degraded_review") or {}).get("errors") or {}
+            why = "; ".join(f"{n}: {errors[n][:120]}" for n in failed_reviewers if errors.get(n))
+            hint = (" Raise its [roles.<reviewer>].max_budget_usd first." if "max_budget" in why else "")
+            acts.append({"action": "ask_user", "command": f"rustflow resume {rid} --extra-rounds 1 --detach",
+                         "question": f"Approved by fewer reviewers than planned - {', '.join(failed_reviewers)} "
+                                     f"returned no result{f' ({why})' if why else ''}. Review again with all "
+                                     f"reviewers before merging?{hint}"})
         if disputed:
             acts.append({"action": "ask_user", "question": "Reviewers and fixer disagreed on: " + "; ".join(
                 f"[{f['id']}] {f['title']}" for f in disputed) + ". Accept as is or fix?"})
@@ -251,6 +266,7 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
         "disputed": [brief(f) for f in fs if f.get("status") == "disputed"][:findings_limit],
         "advisory_count": sum(1 for f in fs if f.get("status") == "advisory"),
         "escalate": bool(state.get("escalate")), "audit_report": (state.get("audit") or {}).get("report"),
+        "degraded": degraded(state),
         "final_gates": state.get("final_gates"), "stop_reason": (state.get("stop_reason") or "")[:600],
         "report": str(Path(state.get("repo", ".")) / RUNS / state.get("run_id", "") / "report.md"),
         "next_actions": next_actions(state),
@@ -270,6 +286,9 @@ def brief_markdown(s: dict) -> str:
             lines += [f"  [{f['id']}] {f['severity']} {f['where']} {f['title']}" for f in s[key]]
     if s["advisory_count"]:
         lines.append(f"advisory: {s['advisory_count']}")
+    if s.get("degraded"):
+        lines.append(f"DEGRADED REVIEW: no result from {', '.join(s['degraded'])} in the last round "
+                     "(approval does not rest on every planned reviewer)")
     if s["escalate"]:
         lines.append("ESCALATE: soundness audit recommended" + (f" (report: {s['audit_report']})"
                                                                if s.get("audit_report") else ""))

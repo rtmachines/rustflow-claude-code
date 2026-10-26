@@ -53,7 +53,9 @@ Each summary ends with `next_actions`. Do the ones without `needs_user`; for `as
 `needs_user` items ask the user with the given question/command. Typical outcomes:
 - `approved` / `approved_with_advisories` -> summarize: what changed, tests, cost, branch, advisories;
   offer merge (`git merge --squash`, user decides), PR comment (`rustflow comment`), and the soundness
-  audit if `escalate` is true.
+  audit if `escalate` is true. If `degraded` is non-empty, say plainly that fewer reviewers than planned
+  approved it (never "two independent reviewers") and ask before merge whether to review again
+  (`rustflow resume <id> --extra-rounds 1 --detach`).
 - `criteria_unmet` -> reviewers approved but a required test did not pass on the final tree; show which
   (`T-<id>` findings / `mechanical` in the summary) and ask: fix round (`rustflow resume <id> --extra-rounds 2
   --detach`), fix by hand, or drop the criterion.
