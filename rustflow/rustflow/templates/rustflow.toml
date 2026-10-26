@@ -112,6 +112,18 @@ allowed_tools_read = [
   "Bash(cargo tree *)", "Bash(cargo metadata *)",
 ]
 disallowed_tools_read = ["Edit", "Write", "NotebookEdit", "Agent"]   # Agent: no delegation to the interactive reviewer
+# Wbudowane narzędzia w ogóle widoczne dla modelu (--tools). allowedTools tylko zatwierdza, --tools usuwa
+# definicje pozostałych narzędzi z promptu (zmierzone na 2.1.308: 27 -> 5 narzędzi, ~4x mniej tokenów przy
+# zimnym starcie). Skill roli działa bez narzędzia Skill (/skill w prompcie). Na Windows dochodzi PowerShell.
+# [] = nie przekazuj flagi. Wywołania z własną listą narzędzi (audyt ToB) zawsze mają pełny zestaw.
+tools_read = ["Read", "Glob", "Grep", "LSP", "Bash"]
+tools_write = ["Read", "Edit", "Write", "Glob", "Grep", "LSP", "Bash"]
+# Model zapasowy przy przeciążeniu/niedostępności modelu głównego (--fallback-model), np. "sonnet";
+# musi być na allowliście [models].claude. Raport pokaże model_mismatch, gdy zadziałał. "" = wyłączone.
+fallback_model = ""
+# Nieudany structured output (np. fixer po długiej sesji): jedna dodatkowa tura w tej samej sesji
+# (--resume, ten sam schemat i narzędzia -> prefiks w cache) zamiast utraty wyniku.
+repair_structured_output = true
 skill_invocation = "slash"  # slash (/skill w prompcie) | inline (treść SKILL.md w prompcie)
 extra_skills_via = "system" # system (--append-system-prompt-file, cache-friendly) | inline (w prompcie)
 # cwd/git status/env do pierwszej wiadomości zamiast system promptu: gałąź rustflow/<run> i ścieżka
@@ -153,6 +165,8 @@ max_kb = 32                 # limit łącznego rozmiaru na rolę (trafia do każ
 # ── Recenzja: dodatkowe sygnały dla recenzentów ──────────────────────────────
 [review]
 inline_diff_max_kb = 80     # większy diff -> recenzent sam robi git diff
+rereview_full_diff_max_kb = 16  # runda >= 2: pełny diff inline tylko do tego rozmiaru, zawsze delta od
+                                # poprzedniej recenzji; 0 = tylko delta, 80 = jak w rundzie 1
 advisory_clippy = ["clippy::pedantic"]   # lints doradcze, filtrowane do zmienionych linii; [] = wyłącz
 
 # Dowolne narzędzia doradcze (wynik doklejany do promptu recenzenta, nie blokuje).
@@ -170,6 +184,7 @@ doc_tests = true
 deny = "auto"               # auto (gdy deny.toml + zmiana manifestów) | always | off
 clippy_args = ["-D", "warnings"]
 edit_check = true           # hook po edycji: cargo check
+edit_fmt = "file"           # hook po edycji: file (tylko edytowany plik, rustfmt) | all (cargo fmt --all) | off
 stop_max_blocks = 3         # hook Stop: ile razy z rzędu może zablokować koniec tury
 tree_stable = true          # pełne bramki: zmiana plików źródłowych W TRAKCIE bramek (build.rs/test piszący
                             # do drzewa) = czerwone; Cargo.lock może się zmienić tylko bez --locked

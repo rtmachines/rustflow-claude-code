@@ -76,6 +76,8 @@ class Doctor:
                         "exclude_dynamic_system_prompt", True) else []
                     needed += ["--strict-mcp-config"] if pc.get("strict_mcp", True) else []
                     needed += ["--setting-sources"] if pc.get("setting_sources") else []
+                    needed += ["--tools"] if pc.get("tools_read") or pc.get("tools_write") else []
+                    needed += ["--fallback-model"] if pc.get("fallback_model") else []
                     missing = [f for f in needed if f not in help_text]
                     self.line("OK" if not missing else "FAIL", "claude flags",
                               "all present" if not missing else f"missing {missing} - update Claude Code")

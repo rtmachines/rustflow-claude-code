@@ -193,6 +193,24 @@ def act(prompt):
     return {"difficulty": "easy", "rationale": "small", "risk_areas": []}
 
 
+def earlier_calls(role):
+    """Invocations of `role` before this one (the log line of this call is already written)."""
+    if not LOG or not Path(LOG).is_file():
+        return 0
+    rows = [json.loads(l) for l in Path(LOG).read_text(encoding="utf-8").splitlines() if l.strip()]
+    return sum(1 for r in rows if r["role"] == role) - 1
+
+
+def overloaded():
+    """What `claude -p` prints when the API is overloaded: a result object with is_error."""
+    if PROVIDER == "codex":
+        print("stream error: 529 overloaded", file=sys.stderr)
+        return 1
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "result": "API Error: 529 overloaded",
+                      "api_error_status": 529, "total_cost_usd": 0.0, "session_id": "sess-err", "usage": {}}))
+    return 1
+
+
 def main():
     if "--version" in ARGS:
         print(f"fake-{PROVIDER} 9.9.9")
@@ -208,15 +226,33 @@ def main():
     if SCENARIO == "codex_auth" and PROVIDER == "codex":
         print("Error: unauthorized - not logged in. Run `codex login`.", file=sys.stderr)
         return 1
-    data = act(prompt)
+    if ROLE == "implementer" and (SCENARIO == "impl_down" or (SCENARIO == "impl_flaky" and earlier_calls(ROLE) == 0)):
+        return overloaded()
+    if SCENARIO == "reviewers_down" and ROLE in ("reviewer_a", "reviewer_b"):
+        return overloaded()
+    gate_fix = "gates are RED" in prompt
+    if ROLE == "fixer" and "--resume" in ARGS:  # structured-output repair turn: answer only, touch nothing
+        assert ARGS[ARGS.index("--resume") + 1] == "sess-fix" and "--json-schema" in ARGS
+        data = {"summary": "repaired", "resolutions": [{"id": "F1", "status": "fixed", "note": "trim + test"}],
+                "tests_added": ["trims_whitespace"]}
+    else:
+        data = act(prompt)
     if PROVIDER == "claude":
         assert "-p" in ARGS and "--effort" in ARGS
-        assert ("--json-schema" in ARGS) == (ROLE not in ("implementer", "tob_audit"))
+        assert ("--json-schema" in ARGS) == (ROLE not in ("implementer", "tob_audit") and not gate_fix)
         if data is None:
             data = {}
+        if SCENARIO == "fix_json" and ROLE == "fixer" and not gate_fix and "--resume" not in ARGS:
+            print(json.dumps({"type": "result", "subtype": "error_max_structured_output_retries", "is_error": True,
+                              "total_cost_usd": 0.25, "session_id": "sess-fix", "usage": {"input_tokens": 100},
+                              "errors": ["Failed to provide valid structured output after 5 attempts"]}))
+            return 1
+        denials = ([{"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "ls -la src"}}]
+                   if SCENARIO == "denials" and ROLE == "implementer" else [])
         print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "done",
                           "structured_output": data, "total_cost_usd": 0.25, "session_id": "sess-1",
                           "usage": {"input_tokens": 100, "output_tokens": 50},
+                          "permission_denials": denials, "num_turns": 3,
                           **({"modelUsage": {os.environ["FAKE_MODEL_REPORT"]: {"outputTokens": 50},
                                              "claude-haiku-5-5": {"outputTokens": 3}}}
                              if os.environ.get("FAKE_MODEL_REPORT") else {})}))

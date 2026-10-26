@@ -168,6 +168,8 @@ def next_actions(state: dict) -> list[dict]:
     open_ = [f for f in state.get("findings", []) if f.get("status") == "open"]
     disputed = [f for f in state.get("findings", []) if f.get("status") == "disputed"]
     acts: list[dict] = []
+    # Another fix round continues THIS run: same branch/worktree, checkpoints and finding ids.
+    more = f"rustflow resume {rid} --extra-rounds 2 --detach"
     if st == "running":
         return [{"action": "wait", "command": f"rustflow wait {rid} --timeout 540",
                  "note": "do not edit files or change git state in this checkout meanwhile"}]
@@ -183,6 +185,10 @@ def next_actions(state: dict) -> list[dict]:
         if branch and state.get("isolation") == "branch":
             acts.append({"action": "merge", "needs_user": True,
                          "command": f"git switch {orig} && git merge --squash {branch}"})
+        elif branch and state.get("isolation") == "worktree":
+            acts.append({"action": "merge", "needs_user": True, "command": f"git merge --squash {branch}",
+                         "note": f"in the main checkout ({orig} is checked out there); afterwards "
+                                 f"`git worktree remove {state.get('workdir', '')}`"})
         acts.append({"action": "comment_pr", "command": f"rustflow comment {rid}", "needs_user": True})
         return acts
     if st == "changes_requested":
@@ -193,11 +199,11 @@ def next_actions(state: dict) -> list[dict]:
         return [{"action": "ask_user", "question": "Review approved, but required tests are not proven: "
                  + "; ".join(f"`{m['test']}` ({m.get('detail', '')})" for m in missing[:5])
                  + ". Add/fix them in another fix round, fix by hand, or drop the criterion?",
-                 "command": f"rustflow review --fix --base {base} --max-rounds 2 --detach"}]
+                 "command": more}]
     if st in ("max_rounds", "stalled", "final_gates_red"):
         return [{"action": "ask_user", "question": (f"Run ended '{st}' with {len(open_)} blocking finding(s): "
                  + "; ".join(f"[{f['id']}] {f['title']}" for f in open_[:5]) + ". Another fix round, fix by "
-                 "hand, or stop?"), "command": f"rustflow review --fix --base {base} --max-rounds 2 --detach"}]
+                 "hand, or stop?"), "command": more}]
     if st == "gates_red":
         return [{"action": "inspect", "command": "rustflow gates --profile full",
                  "note": "the code does not pass the gates even after gate-fix attempts"},
@@ -206,10 +212,15 @@ def next_actions(state: dict) -> list[dict]:
     if st == "baseline_red":
         return [{"action": "ask_user", "question": "The base branch is already red. Fix it first, or continue "
                  "with --accept-red-baseline (only new failures block)?"}]
-    if st in ("budget", "interrupted", "crashed", "tree_changed"):
+    if st in ("budget", "interrupted", "crashed", "tree_changed", "agent_failed"):
+        failed = state.get("failed_agent") or {}
         hint = {"budget": "raise [budget].max_total_usd in rustflow.toml, then",
                 "interrupted": "", "crashed": "check console.log / stop_reason, then",
-                "tree_changed": "files changed during the review; stop editing this checkout, then"}[st]
+                "tree_changed": "files changed during the review; stop editing this checkout, then",
+                "agent_failed": (f"{failed.get('name', 'an agent')} failed, nothing changed - likely transient "
+                                 "(overloaded/network); retry" if failed.get("retryable", True) else
+                                 f"{failed.get('name', 'an agent')} failed permanently - fix it first "
+                                 "(`rustflow doctor`: login, model names), then")}[st]
         return [{"action": "resume", "command": f"rustflow resume {rid} --detach", "note": hint.strip()}]
     if st == "review_failed":
         return [{"action": "inspect", "command": "rustflow doctor", "note": "no reviewer returned a result - "

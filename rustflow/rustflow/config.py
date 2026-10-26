@@ -148,6 +148,11 @@ class Config:
         sources = str(self.get("providers.claude.setting_sources", "") or "").replace(" ", "")
         if sources and not set(sources.split(",")) <= {"user", "project", "local"}:
             raise ConfigError("providers.claude.setting_sources: comma-separated subset of user, project, local")
+        for model in [m for m in str(self.get("providers.claude.fallback_model", "") or "").replace(" ", "").split(",") if m]:
+            models = self.get("models.claude", [])
+            if "*" not in models and model not in models:
+                raise ConfigError(f"providers.claude.fallback_model: '{model}' is not on the [models].claude "
+                                  f"allowlist {models}")
         for role in REVIEW_ROLES:
             lens = self.get(f"roles.{role}.lens", "correctness")
             if lens not in LENSES:

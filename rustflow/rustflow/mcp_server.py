@@ -74,8 +74,11 @@ TOOLS: list[dict] = [
                                                      "default": "brief"}})},
     {"name": "rustflow_cancel", "description": "Stop a running run gracefully; it stays resumable.",
      "inputSchema": _obj({"run": RUN_REF})},
-    {"name": "rustflow_resume", "description": "Resume an interrupted / budget-stopped / crashed run in the background.",
-     "inputSchema": _obj({"run": RUN_REF})},
+    {"name": "rustflow_resume",
+     "description": "Resume an interrupted / budget-stopped / crashed / agent_failed run in the background. With "
+                    "extra_rounds: continue a run that ended max_rounds / stalled / final_gates_red / criteria_unmet "
+                    "with up to that many more fix rounds on its own branch or worktree.",
+     "inputSchema": _obj({"run": RUN_REF, "extra_rounds": {"type": "integer", "minimum": 1, "maximum": 5}})},
     {"name": "rustflow_gates",
      "description": "Run the deterministic gates (fmt, clippy -D warnings, tests, doc tests, deny/semver/sqlx when "
                     "relevant). check_only=true never modifies files.",
@@ -172,7 +175,8 @@ def t_cancel(a: dict) -> tuple[str, dict]:
 def t_resume(a: dict) -> tuple[str, dict]:
     repo = _repo()
     run_dir = runs.find_run(repo, a.get("run"))
-    info = runs.spawn_detached(repo, ["resume", run_dir.name], None, run_id=run_dir.name)
+    more = ["--extra-rounds", str(int(a["extra_rounds"]))] if a.get("extra_rounds") else []
+    info = runs.spawn_detached(repo, ["resume", run_dir.name, *more], None, run_id=run_dir.name)
     return json.dumps(info), info
 
 
@@ -180,7 +184,7 @@ def t_gates(a: dict) -> tuple[str, dict]:
     repo = _repo()
     res = gates.run_gates(repo, a.get("profile", "full"), strict=bool(a.get("check_only", True)))
     data = {"ok": res.ok, "summary": res.summary_line(), "feedback": "" if res.ok else res.feedback()}
-    return res.summary_line() + ("" if res.ok else "\n\n" + res.feedback()[-6000:]), data
+    return res.summary_line() + ("" if res.ok else "\n\n" + res.feedback(max_chars=6000)), data
 
 
 HANDLERS: dict[str, Callable[[dict], tuple[str, dict]]] = {

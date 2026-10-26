@@ -36,7 +36,8 @@ rustflow run "..." --criteria kryteria.toml               # kryteria z wymaganym
 rustflow run "..." --dry-run                              # tylko prompty i komendy do .rustflow/runs/
 rustflow review --base origin/main                        # recenzja istniejących zmian (raport)
 rustflow review --base origin/main --fix                  # + pętla naprawcza w miejscu
-rustflow resume                                           # wznów przerwany run (Ctrl+C, budżet)
+rustflow resume                                           # wznów przerwany run (Ctrl+C, budżet, agent_failed)
+rustflow resume <run> --extra-rounds 2                    # dodatkowe rundy fix dla max_rounds/stalled, na tej samej gałęzi
 rustflow status                                           # stan ostatniego runu
 rustflow gates --profile full                             # bramki ręcznie (to samo co hooki i CI)
 rustflow lints [--apply]                                  # zapadka lintów: włącz te, które kod już spełnia
@@ -110,7 +111,10 @@ Pełny, skomentowany plik tworzy `rustflow init`. Najważniejsze przełączniki:
 `[roles.auditor].spec` (trzeci recenzent tylko przy unsafe/FFI), `[project].isolation`
 (`branch | worktree | none`), `[budget].max_total_usd`, `[gates.extra]` (np. `sqlx prepare --check`),
 `[providers.claude].setting_sources` (np. `"project,local"`: agenci bez Twoich globalnych hooków
-i `~/.claude/CLAUDE.md`; zostają hooki i CLAUDE.md projektu).
+i `~/.claude/CLAUDE.md`; zostają hooki i CLAUDE.md projektu), `[providers.claude].tools_read/tools_write`
+(wbudowane narzędzia w prompcie agentów, `--tools`), `[providers.claude].fallback_model`,
+`[review].rereview_full_diff_max_kb` (runda >= 2: delta zamiast całego diffu), `[gates].edit_fmt`
+(hook po edycji formatuje tylko edytowany plik).
 
 Soczewka `regressions` (domyślna dla reviewer_b) szuka tego, co zmiana psuje istniejącym wywołaniom,
 przypadków brzegowych i testów, które przeszłyby i bez zmiany; idiomy tylko jako P3. Wcześniejsza
@@ -216,7 +220,8 @@ rustflow cancel <run_id>                    # łagodne zatrzymanie, run zostaje 
 ```
 
 Narzędzia MCP: `rustflow_triage`, `rustflow_start`, `rustflow_wait`, `rustflow_status`, `rustflow_report`,
-`rustflow_cancel`, `rustflow_resume`, `rustflow_gates` (w Claude Code: `mcp__rustflow__…`).
+`rustflow_cancel`, `rustflow_resume` (z `extra_rounds`: kolejne rundy fix tego samego runu), `rustflow_gates`
+(w Claude Code: `mcp__rustflow__…`).
 
 Bezpieczniki: jeden aktywny run na repo (`ACTIVE.json` + sprawdzanie PID); dopóki run pracuje w checkoucie,
 hooki odmawiają agentowi sterującemu edycji i zmian w gicie, a jego hook Stop nie odpala bramek na
