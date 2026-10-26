@@ -209,9 +209,16 @@ def next_actions(state: dict) -> list[dict]:
             acts.append({"action": "merge", "needs_user": True,
                          "command": f"git switch {orig} && git merge --squash {branch}"})
         elif branch and state.get("isolation") == "worktree":
+            wt = state.get("workdir", "")
+            if state.get("worktree_removed"):
+                note = f"in the main checkout ({orig} is checked out there)"
+            elif not state.get("checkpoints"):
+                note = (f"the work is uncommitted in {wt} (checkpoint_commits = false): commit it there first, then "
+                        f"merge in the main checkout; afterwards `git worktree remove {wt}`")
+            else:
+                note = f"in the main checkout ({orig} is checked out there); afterwards `git worktree remove {wt}`"
             acts.append({"action": "merge", "needs_user": True, "command": f"git merge --squash {branch}",
-                         "note": f"in the main checkout ({orig} is checked out there); afterwards "
-                                 f"`git worktree remove {state.get('workdir', '')}`"})
+                         "note": note})
         acts.append({"action": "comment_pr", "command": f"rustflow comment {rid}", "needs_user": True})
         return acts
     if st == "changes_requested":
@@ -328,10 +335,12 @@ def exit_code(status: str) -> int:
 
 
 # ── wait / cancel ────────────────────────────────────────────────────────────
-def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0) -> dict:
-    """Block until the run finishes or timeout; stream only NEW orchestrator log lines (compact)."""
+def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channel: str = "cli") -> dict:
+    """Block until the run finishes or timeout; stream only NEW orchestrator log lines (compact).
+    channel: each kind of waiter (CLI, MCP server) has its own read position, so one does not consume the
+    progress lines the other has not seen yet."""
     log = run_dir / "rustflow.log"
-    offset_file = run_dir / ".wait-offset"
+    offset_file = run_dir / f".wait-offset-{re.sub(r'[^a-z0-9_-]', '_', channel.lower())}"
     try:
         offset = int(offset_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):

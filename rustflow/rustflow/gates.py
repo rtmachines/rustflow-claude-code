@@ -199,6 +199,7 @@ def load_gate_config(root: Path) -> dict:
             cfg.update(data.get("gates", {}) or {})
         except (OSError, ValueError) as exc:  # TOMLDecodeError subclasses ValueError
             print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
+            cfg["_config_error"] = str(exc)   # hooks surface it: stderr of a passing hook reaches nobody
     return cfg
 
 
