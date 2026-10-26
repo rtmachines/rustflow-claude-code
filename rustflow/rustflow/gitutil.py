@@ -82,8 +82,8 @@ def checkout_worktree(root: Path, path: Path, branch: str) -> None:
     git(root, "worktree", "add", str(path), branch)
 
 
-def remove_worktree(root: Path, path: Path) -> None:
-    git(root, "worktree", "remove", "--force", str(path), check=False)
+def remove_worktree(root: Path, path: Path, *, force: bool = True, check: bool = False) -> None:
+    git(root, "worktree", "remove", *(["--force"] if force else []), str(path), check=check)
 
 
 def checkpoint(root: Path, message: str) -> str | None:

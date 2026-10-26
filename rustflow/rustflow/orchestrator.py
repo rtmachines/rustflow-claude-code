@@ -11,6 +11,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -172,16 +173,27 @@ class Orchestrator:
         except runs.RunLocked as exc:
             self.log(f"error: {exc}")
             return 2
-        self.event("resumed", previous_status=status, reason=(self.state.pop("stop_reason", "") or "")[:500],
-                   extra_rounds=extra_rounds)
-        self.state.pop("failed_agent", None)
-        if extra_rounds:
-            self._continue(extra_rounds)
-        self.state["status"] = "running"
-        self.state["pid"] = os.getpid()
-        self.save()
-        self.log(f"resuming {self.state['run_id']} at phase {self.state['phase']} (round {self.state['round']})")
-        return self.loop()
+        try:
+            # A failed previous resume may already have re-created this checkout.
+            if self.state.get("isolation") == "worktree":
+                self.state["worktree_removed"] = False
+            try:
+                self._write_baseline()
+            except OSError as exc:
+                self.log(f"refusing to resume: could not restore baseline ({exc})")
+                return 2
+            self.event("resumed", previous_status=status, reason=(self.state.pop("stop_reason", "") or "")[:500],
+                       extra_rounds=extra_rounds)
+            self.state.pop("failed_agent", None)
+            if extra_rounds:
+                self._continue(extra_rounds)
+            self.state["status"] = "running"
+            self.state["pid"] = os.getpid()
+            self.save()
+            self.log(f"resuming {self.state['run_id']} at phase {self.state['phase']} (round {self.state['round']})")
+            return self.loop()
+        finally:
+            runs.release(self.repo, self.state["run_id"])
 
     def _continue(self, extra_rounds: int) -> None:
         """Reopen a finished run for more fix rounds on the SAME branch/worktree (checkpoints, run dir and
@@ -205,9 +217,11 @@ class Orchestrator:
         try:
             return self._loop()
         finally:
-            if self.state.get("status") not in ("running", *RESUMABLE):
-                self._remove_finished_worktree()
-            runs.release(self.repo, self.state["run_id"])
+            try:
+                if self.state.get("status") not in ("running", *RESUMABLE):
+                    self._remove_finished_worktree()
+            finally:
+                runs.release(self.repo, self.state["run_id"])
 
     def _remove_finished_worktree(self) -> None:
         """A finished worktree run leaves its work on the branch (checkpoint commits), so the checkout under
@@ -216,16 +230,55 @@ class Orchestrator:
         if self.state.get("isolation") != "worktree" or self.opts.dry_run or not wt.is_dir() or wt == self.repo:
             return
         try:
-            if gitutil.git(wt, "status", "--porcelain").strip():
+            if gitutil.git(wt, "status", "--porcelain", "--untracked-files=all").strip():
                 return
-            gitutil.remove_worktree(self.repo, wt)
-        except gitutil.GitError as exc:
+            self._archive_worktree_audit()
+            gitutil.remove_worktree(self.repo, wt, force=False, check=True)
+        except (gitutil.GitError, OSError) as exc:
             self.log(f"worktree kept ({exc})")
             return
         if not wt.is_dir():
             self.state["worktree_removed"] = True
             self.log(f"worktree removed (work is on {self.state.get('branch')}): {wt}")
             self.save()
+
+    def _archive_worktree_audit(self) -> None:
+        """Persist complete audit artifacts and their report path before deleting the checkout."""
+        source = self.workdir / ".rust-review-results"
+        if not source.exists():
+            return
+        archive = (self.run_dir / "audit" / "results").resolve()
+        shutil.copytree(source, archive, dirs_exist_ok=True)
+        audit = self.state.get("audit") or {}
+        if audit.get("report"):
+            rpt = Path(audit["report"])
+            if not rpt.is_absolute():
+                rpt = self.workdir / rpt
+            try:
+                relative = rpt.relative_to(source)
+            except ValueError:
+                pass  # Already archived by a previous cleanup, or stored outside the worktree.
+            else:
+                archived_report = archive / relative
+                if not archived_report.is_file():
+                    raise OSError(f"archived audit report missing: {archived_report}")
+                audit["report"] = str(archived_report)
+        self.save()
+        self._write_report()
+
+    def _write_baseline(self) -> None:
+        """Restore the Stop hook's per-run accepted failures, without exposing partial JSON."""
+        signatures = self.state.get("baseline_signatures")
+        if not signatures:
+            return
+        cache = self.workdir / ".rustflow" / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        tmp = cache / "baseline.json.tmp"
+        try:
+            tmp.write_text(json.dumps({"run": self.state["run_id"], "signatures": signatures}), encoding="utf-8")
+            os.replace(tmp, cache / "baseline.json")
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _loop(self) -> int:
         try:
@@ -501,10 +554,7 @@ class Orchestrator:
             if not res.ok:
                 self.state["baseline_red"] = res.feedback()
                 self.state["baseline_signatures"] = sorted(res.signatures())
-                cache = self.workdir / ".rustflow" / "cache"
-                cache.mkdir(parents=True, exist_ok=True)
-                (cache / "baseline.json").write_text(json.dumps(
-                    {"run": self.state["run_id"], "signatures": self.state["baseline_signatures"]}), encoding="utf-8")
+                self._write_baseline()
                 if not self.opts.accept_red_baseline:
                     raise Abort("baseline_red", "gates are already RED on the base. Fix the base first or "
                                                 "rerun with --accept-red-baseline.\n" + res.feedback()[:3000])
