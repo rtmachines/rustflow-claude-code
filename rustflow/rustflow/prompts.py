@@ -130,9 +130,14 @@ Rules:
 
 def review_prompt(ctx: ReviewContext, lens: str, language: str, reviewer: str) -> str:
     lens_text = LENSES.get(lens, LENSES["correctness"])
-    diff_part = (f"```diff\n{ctx.diff_inline}\n```" if ctx.diff_inline is not None else
-                 f"The diff is large. Read it yourself: `git diff {ctx.base} {ctx.head_tree}` "
-                 "(read-only), file by file.")
+    if ctx.diff_inline is not None:
+        diff_part = f"```diff\n{ctx.diff_inline}\n```"
+    elif ctx.round_no > 1 and ctx.delta_inline is not None:
+        diff_part = ("Not inlined in this round: the DELTA above is what changed since the previous review. "
+                     f"For context read `git diff {ctx.base} {ctx.head_tree} -- <file>` (read-only) where needed.")
+    else:
+        diff_part = (f"The diff is large. Read it yourself: `git diff {ctx.base} {ctx.head_tree}` "
+                     "(read-only), file by file.")
     parts = [f"""{_lang(language)}
 
 You are reviewer `{reviewer}`. Review the change set of the TASK below. You are READ-ONLY: never edit files,
@@ -216,8 +221,8 @@ def gate_fix_prompt(task: str, language: str, feedback: str, attempt: int, basel
 The deterministic Rust gates are RED after the last change (attempt {attempt}). Make them green.
 Fix the root cause. Never silence lints with `#[allow]`, never `#[ignore]` or weaken tests, never
 delete functionality required by the TASK. Run `{GATES} run --profile stop` to verify.
-Do not commit or change git state. Your final answer is the JSON object described by the schema
-(use resolutions: [] and describe what you changed in summary).
+Do not commit or change git state. Finish with a short plain-text summary of what you changed and why
+(the orchestrator reruns the gates to judge the result).
 
 {_block("TASK (context)", task)}
 {_block("GATE OUTPUT", feedback)}

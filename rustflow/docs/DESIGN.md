@@ -263,3 +263,33 @@ ale jest ukryta).
 
 Nie przeniesione: kopie katalogów zamiast gita, stały LLM-triage, obowiązkowy plik kryteriów, implementer
 bez Basha, wersjonowanie konfiguracji.
+
+## 14. Ergonomia dla Claude Code (zmierzone)
+
+Pomiary na żywo (Claude Code 2.1.308, haiku, effort low; łącznie kilka centów):
+
+| Pomiar | Wynik | Co z tego wynika |
+|---|---|---|
+| ten sam prompt z `--json-schema`, bez `--tools` / z `--tools "Read,Grep,Glob,Bash"` | 27 / 5 narzędzi w kontekście; zapis do cache 41k / 11k; $0.0085 / $0.0023 | `--allowedTools` tylko zatwierdza, `--tools` usuwa definicje z promptu; StructuredOutput zostaje |
+| `/skill` w prompcie bez narzędzia Skill / z nim | oba wczytują skill; $0.0014 / $0.0038 | `tools_*` bez `Skill` |
+| `--resume <sesja> --json-schema <schemat>` | `success`, poprawny `structured_output`, ta sama sesja | naprawa JSON-u jedną turą zamiast powtarzania sesji; ten sam schemat i argv, bo inny schemat = inny prefiks (odczyt z cache 0) |
+| SIGTERM / SIGINT w trakcie generowania | 143 bez wyjścia / 0 z `error_during_execution`, ale `total_cost_usd = 0` | przy timeoucie koszt nie jest znany: rustflow księguje limit roli (`cost_estimated`) |
+| wynik `-p --output-format json` | `permission_denials`, `num_turns`, `terminal_reason` | odmowy (cicho przy `--permission-prompts none`) trafiają do `state.json` i raportu |
+
+Zmiany:
+- **`[providers.claude].tools_read/tools_write`** (`--tools`); wywołania z własną listą (audyt ToB) mają
+  pełny zestaw. Na Windows dochodzi PowerShell.
+- **Naprawa structured output**: nieudany JSON z `session_id` -> jedna tura `--resume` z tym samym argv.
+  Nie dotyczy kompromisu z §6 (fixer nie wznawia sesji implementera; wznawia własną, jeszcze ciepłą).
+  Gate-fix nie ma już schematu: o wyniku decydują bramki.
+- **`agent_failed`** (wznawialny): wywołanie modelu nie powiodło się i drzewo jest bez zmian - zamiast
+  `no_changes` / `review_failed`. Role piszące mają jedno ponowienie, ale tylko przy niezmienionym drzewie.
+  Opcjonalnie `fallback_model`.
+- **`resume --extra-rounds N`** zamiast nowego `review --fix`: ta sama gałąź/worktree, checkpointy i ID
+  uwag (nowy run w izolacji worktree pracowałby w złym checkoucie). `next_actions` dla worktree podaje merge.
+- **Hook po edycji** formatuje tylko edytowany plik (`rustfmt` ze stdin nie schodzi do modułów `mod x;`);
+  `cargo fmt --all` przepisywał cały niesformatowany workspace przy pierwszej edycji. Powtórzony zestaw
+  błędów `cargo check` wraca jedną linią.
+- **Feedback bramek w hookach** obcinany od końca (dawniej `[-8000:]` gubił nagłówek i pierwsze błędy).
+- **Runda >= 2**: delta inline, pełny diff tylko do `rereview_full_diff_max_kb` (domyślnie 16 KB).
+- `start_tree` po bramkach bazowych: `Cargo.lock` utworzony przez bramki nie jest pracą implementera.

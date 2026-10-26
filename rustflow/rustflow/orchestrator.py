@@ -27,7 +27,9 @@ from rustflow.config import AgentSpec, Config, bump, gates_command, max_difficul
 
 RUNS_DIR = Path(".rustflow") / "runs"
 RUNTIME_GITIGNORE = "runs/\ncache/\nwt/\n__pycache__/\n"
-RESUMABLE = ("interrupted", "budget", "crashed", "tree_changed")
+RESUMABLE = ("interrupted", "budget", "crashed", "tree_changed", "agent_failed")
+# Finished, but another fix round can still help: `rustflow resume <run> --extra-rounds N`.
+CONTINUABLE = ("max_rounds", "stalled", "final_gates_red", "criteria_unmet")
 
 
 @dataclass
@@ -133,15 +135,20 @@ class Orchestrator:
         self.log(f"run {run_id}  ({self.run_dir.relative_to(self.repo).as_posix()})")
         return self.loop()
 
-    def resume(self, run_dir: Path) -> int:
+    def resume(self, run_dir: Path, extra_rounds: int = 0) -> int:
         self.run_dir = run_dir
         self.state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         saved = self.state.get("options", {})
         for k, v in saved.items():
             if hasattr(self.opts, k) and k not in ("dry_run", "verbose"):
                 setattr(self.opts, k, v)
-        if self.state.get("status") not in ("running", *RESUMABLE):
-            self.log(f"run already finished with status {self.state.get('status')}")
+        status = self.state.get("status")
+        if extra_rounds:
+            if status not in CONTINUABLE:
+                self.log(f"--extra-rounds continues a run that ended {'/'.join(CONTINUABLE)}; this one is {status}")
+                return 2
+        elif status not in ("running", *RESUMABLE):
+            self.log(f"run already finished with status {status}")
             return 0
         if self.state.get("dry_run") and not self.opts.dry_run:
             self.log("this run was a --dry-run (no branch was created); start a real run instead")
@@ -155,15 +162,38 @@ class Orchestrator:
         if self.state.get("isolation") == "worktree" and not self.workdir.is_dir():
             self.log(f"refusing to resume: worktree {self.workdir} no longer exists")
             return 2
-        self.state["status"] = "running"
-        self.state["pid"] = os.getpid()
         try:
             runs.acquire(self.repo, self.state)
         except runs.RunLocked as exc:
             self.log(f"error: {exc}")
             return 2
+        self.event("resumed", previous_status=status, reason=(self.state.pop("stop_reason", "") or "")[:500],
+                   extra_rounds=extra_rounds)
+        self.state.pop("failed_agent", None)
+        if extra_rounds:
+            self._continue(extra_rounds)
+        self.state["status"] = "running"
+        self.state["pid"] = os.getpid()
+        self.save()
         self.log(f"resuming {self.state['run_id']} at phase {self.state['phase']} (round {self.state['round']})")
         return self.loop()
+
+    def _continue(self, extra_rounds: int) -> None:
+        """Reopen a finished run for more fix rounds on the SAME branch/worktree (checkpoints, run dir and
+        finding ids continue) instead of a new `review --fix` run in some other checkout."""
+        limit = int(self.state.get("round", 0)) + extra_rounds
+        self.state.setdefault("options", {})["max_rounds"] = limit
+        self.opts.max_rounds = limit
+        if self.state.get("mode") == "review":
+            self.state["options"]["fix"] = self.opts.fix = True
+        for key in ("outcome", "finished", "final_gates", "final_gates_ok", "final_gates_feedback"):
+            self.state.pop(key, None)
+        self.state["gate_fix_attempts"] = 0
+        if any(f.get("status") == "open" for f in self.state.get("findings", [])):
+            self.state["phase"] = "fix"
+        else:  # final gates red / required tests missing: gates (+ gate fixer) -> review recomputes findings
+            self.state["phase"], self.state["gates_after"] = "gates", "continue"
+        self.log(f"continuing with up to {extra_rounds} more round(s) (max_rounds {limit})")
 
     def loop(self) -> int:
         _install_interrupt_handlers()
@@ -232,7 +262,11 @@ class Orchestrator:
         )
         self.log(f"> {name}: {spec}{'  [write]' if write else ''}")
         runner = self.runners[spec.provider]
-        res = run_with_retry(runner, call, retries=1 if (retry and not write) else 0)
+        # A write role is retried only if the failed attempt left the tree as it was (e.g. API overloaded
+        # before the first edit); otherwise its partial work goes on to the gates like any other result.
+        before = self.snapshot() if write and retry and not self.opts.dry_run else None
+        res = run_with_retry(runner, call, retries=1 if retry else 0,
+                             may_retry=(lambda: self.snapshot() == before) if before is not None else None)
         self.state["cost_usd"] = round(self.state["cost_usd"] + res.cost_usd, 4)
         for k, v in (res.tokens or {}).items():
             if isinstance(v, (int, float)):
@@ -240,12 +274,25 @@ class Orchestrator:
         if res.model_mismatch:
             self.log(f"WARNING {name}: {res.model_mismatch} (model fallback/reroute?)")
             self.event("model_mismatch", agent=name, detail=res.model_mismatch)
+        if res.permission_denials:
+            # Denied silently (--permission-prompts none): each one cost the agent a turn.
+            self.log(f"WARNING {name}: {len(res.permission_denials)} denied tool call(s), e.g. "
+                     + ", ".join(res.permission_denials[:3]))
+        if res.cost_estimated:
+            self.log(f"WARNING {name}: no cost reported (timeout) - booked the role cap ${res.cost_usd:.2f}")
         self.state["agents"].append({k: v for k, v in res.to_dict().items() if k not in ("data", "text", "argv")})
         self.state["agents"][-1]["skills"] = [skill] if skill else []
         self.state["agents"][-1]["skills"] += [p.parent.name for p in call.extra_skills]
         cost = f" ${res.cost_usd:.2f}" if res.cost_usd else ""
         self.log(f"< {name}: {'ok' if res.ok else 'FAILED: ' + res.error[:300]} ({res.duration_s:.0f}s{cost})")
         return res
+
+    def _agent_failed(self, res: AgentResult, who: str) -> Abort:
+        """An agent call failed and left the tree unchanged: resumable, the phase stays as it is."""
+        self.state["failed_agent"] = {"name": res.name, "error": res.error[:500], "retryable": res.retryable}
+        hint = ("looks transient (overloaded/network) - resume when the API is healthy" if res.retryable else
+                "fix the cause first (`rustflow doctor`: CLI login, model names, flags), then resume")
+        return Abort("agent_failed", f"{who} failed without changing the tree: {res.error[:500]} - {hint}")
 
     def _extra_skills(self, role: str, provider: str) -> list[Path]:
         from rustflow import skills as sk
@@ -394,8 +441,6 @@ class Orchestrator:
             self.log(f"isolation: worktree {wt} (branch {branch}, shared target/)")
         else:
             self.log("isolation: none (working in place, no checkpoint commits)")
-        # Starting point of the work = base tree plus anything already in the tree (review mode).
-        self.state["start_tree"] = self.snapshot()
         self._check_skills()
         if self.cfg.get("project.baseline_gates", True) and not review_mode:
             # Same flags as the final gates (check-only, --locked) so failure signatures are comparable.
@@ -411,6 +456,9 @@ class Orchestrator:
                     raise Abort("baseline_red", "gates are already RED on the base. Fix the base first or "
                                                 "rerun with --accept-red-baseline.\n" + res.feedback()[:3000])
                 self.log("baseline is RED - accepted; only NEW failures will block")
+        # Starting point of the work = base tree plus anything already in the tree (review mode), taken
+        # after the baseline gates: a Cargo.lock they create is not the implementer's work.
+        self.state["start_tree"] = self.snapshot()
         self.state["phase"] = "triage"
 
     def phase_triage(self) -> None:
@@ -505,8 +553,9 @@ class Orchestrator:
         self.state["implementation"] = {"summary": res.text.strip()[:4000]} if res.ok else {"error": res.error}
         tree = self.snapshot()
         if tree == self.state["start_tree"] and not self.opts.dry_run:
-            raise Abort("no_changes", "the implementer made no changes"
-                        + (f" ({res.error[:500]})" if res.error else ""))
+            if not res.ok:
+                raise self._agent_failed(res, "the implementer")
+            raise Abort("no_changes", "the implementer made no changes")
         self._seen_tree(self.state["start_tree"])
         self._seen_tree(tree)
         self.checkpoint("implement")
@@ -556,10 +605,13 @@ class Orchestrator:
         prompt = prompts.gate_fix_prompt(self.state["task"], self.language, res.feedback(),
                                          attempts + 1, self.state.get("baseline_red"))
         before = self.snapshot()
-        self.call_agent("fixer", f"gatefix-r{self.state['round']}-a{attempts + 1}",
-                        self.spec("fixer", difficulty), prompt, write=True,
-                        schema=schemas.FIX_SCHEMA, skill="rustflow-fix")
+        # No output schema: the next gate run judges the result, a JSON report would only add turns.
+        fix = self.call_agent("fixer", f"gatefix-r{self.state['round']}-a{attempts + 1}",
+                              self.spec("fixer", difficulty), prompt, write=True, schema=None, skill="rustflow-fix")
         after = self.snapshot()
+        if not fix.ok and after == before and not self.opts.dry_run:
+            self.state["gate_fix_attempts"] = attempts      # resume repeats this attempt
+            raise self._agent_failed(fix, "the gate fixer")
         if after != before and self._seen_tree(after) and not self.opts.dry_run:
             raise Abort("stalled", "the gate fixer returned the tree to an earlier state (oscillation); "
                                    "a human has to decide between the competing versions")
@@ -594,6 +646,10 @@ class Orchestrator:
             ctx.prev_tree = prev_tree
             ctx.delta_stat = gitutil.diff(self.workdir, prev_tree, head, stat=True)
             ctx.delta_inline = delta if len(delta.encode("utf-8")) <= max_kb * 1024 else None
+            # The delta is what changed since the last review; the whole diff again only while it is small.
+            full_kb = int(self.cfg.get("review.rereview_full_diff_max_kb", 16))
+            if ctx.delta_inline is not None and len(diff_text.encode("utf-8")) > full_kb * 1024:
+                ctx.diff_inline = None
             ctx.previous = "\n".join(f.for_prompt() for f in prev_blocking if not f.mechanical)
 
         difficulty = self.state["difficulty"]
@@ -635,8 +691,11 @@ class Orchestrator:
         reviews = {name: r.data for name, r in results.items() if r.ok and r.data}
         failed = [name for name, r in results.items() if not (r.ok and r.data)]
         if not reviews:
-            raise Abort("review_failed", "all reviewers failed: " +
-                        "; ".join(f"{n}: {results[n].error[:200]}" for n in failed))
+            worst = next((results[n] for n in failed if not results[n].retryable), results[failed[0]])
+            self.state["failed_agent"] = {"name": ", ".join(failed), "retryable": worst.retryable,
+                                          "error": "; ".join(f"{n}: {results[n].error[:200]}" for n in failed)}
+            raise Abort("agent_failed", "all reviewers failed (resume re-runs this review round): "
+                        + self.state["failed_agent"]["error"])
         if failed:
             self.log(f"WARNING: degraded review - failed: {', '.join(failed)}")
 
@@ -779,6 +838,8 @@ class Orchestrator:
             self.log("the fixer returned the tree to an earlier state (oscillation) - stopping")
             self.state["phase"] = "final"
             return
+        if not res.ok and after == before and not self.opts.dry_run:
+            raise self._agent_failed(res, "the fixer")
         rejected_all = res.ok and res.data and all(
             r.get("status") == "rejected" for r in res.data.get("resolutions", [])) and res.data.get("resolutions")
         if after == before and not rejected_all and not self.opts.dry_run:

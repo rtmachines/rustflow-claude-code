@@ -38,6 +38,7 @@ DEFAULT_GATES = {
     "deny": "auto",
     "clippy_args": ["-D", "warnings"],
     "edit_check": True,
+    "edit_fmt": "file",
     "stop_max_blocks": 3,
     "log_lines": 60,
     "cargo_dir": ".",
@@ -121,8 +122,9 @@ class GateResult:
             parts.append(f"{s.name}={'SKIP' if s.skipped else ('PASS' if s.ok else 'FAIL')}")
         return ("GREEN" if self.ok else "RED") + (" (cached)" if self.cached else "") + " | " + ", ".join(parts)
 
-    def feedback(self, max_diags: int = 25, max_tail_lines: int = 60) -> str:
-        """Compact text for a model: only what failed."""
+    def feedback(self, max_diags: int = 25, max_tail_lines: int = 60, max_chars: int | None = None) -> str:
+        """Compact text for a model: only what failed. max_chars cuts the END: the first error is usually
+        the root cause and the step header says what failed; later diagnostics are often its echoes."""
         if self.ok:
             return f"All gates passed ({self.profile})."
         out: list[str] = []
@@ -142,7 +144,13 @@ class GateResult:
             if s.tail and (not s.diagnostics or s.failed_tests):
                 out.append("\n".join(s.tail.splitlines()[-max_tail_lines:]))
             out.append("")
-        return "\n".join(out).strip()
+        text = "\n".join(out).strip()
+        if max_chars and len(text) > max_chars:
+            cut = text.rfind("\n", 0, max_chars)
+            cut = cut if cut > max_chars // 2 else max_chars
+            text = (text[:cut] + f"\n... ({len(text) - cut} more characters cut - fix the first errors above, "
+                    "then rerun the gates)")
+        return text
 
 
 # ── environment ──────────────────────────────────────────────────────────────
@@ -191,6 +199,31 @@ def load_gate_config(root: Path) -> dict:
         except (OSError, ValueError) as exc:  # TOMLDecodeError subclasses ValueError
             print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
     return cfg
+
+
+def crate_edition(path: Path, root: Path) -> str:
+    """Edition of the package that owns `path` (what `cargo fmt` would pass to rustfmt); 2015 if unset."""
+    try:
+        import tomllib as toml  # Python 3.11+
+    except ImportError:
+        return "2021"
+    member = None
+    for d in [path.parent, *path.parent.parents]:
+        manifest = d / "Cargo.toml"
+        if manifest.is_file():
+            try:
+                data = toml.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            if member is None and "package" in data:
+                member = data["package"].get("edition", "2015")
+                if not isinstance(member, dict):
+                    return str(member)
+            if isinstance(member, dict) and "workspace" in data:  # edition.workspace = true
+                return str(data["workspace"].get("package", {}).get("edition", "2015"))
+        if d == root or d == d.parent:
+            break
+    return "2015" if member is None else "2021"
 
 
 def runtime_excludes(root: Path) -> list[str]:
@@ -529,6 +562,22 @@ class GateRunner:
         argv = ["cargo", "fmt", "--all"] + ([] if fix else ["--", "--check", "--color", "never"])
         rc, out, err, dur = self._exec("fmt", argv)
         return Step("fmt", rc == 0, argv, duration_s=dur, tail=self._tail(out + err) if rc else "")
+
+    def fmt_file(self, path: Path) -> Step:
+        """rustfmt one file through stdin. Input on stdin has no path, so rustfmt does not descend into
+        `mod x;` children: an edit never reformats files the agent did not touch (`cargo fmt --all` would
+        rewrite the whole workspace of an unformatted repo on the first edit). Syntax errors leave the file
+        as it is - `cargo check` reports them."""
+        argv = ["rustfmt", "--edition", crate_edition(path, self.root)]
+        try:
+            src = path.read_text(encoding="utf-8")
+            r = subprocess.run(argv, input=src, capture_output=True, text=True, encoding="utf-8",
+                               cwd=path.parent, timeout=120)   # cwd: rustfmt.toml is found from here upwards
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
+            return Step("fmt", False, argv, reason=str(exc))
+        if r.returncode == 0 and r.stdout and r.stdout != src:
+            path.write_text(r.stdout, encoding="utf-8")
+        return Step("fmt", r.returncode == 0, argv, tail=self._tail(r.stderr) if r.returncode else "")
 
     def cargo_json(self, name: str, sub: str, extra_after: list[str] | None = None,
                    keep_all: bool = False) -> Step:

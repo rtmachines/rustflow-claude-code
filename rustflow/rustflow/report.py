@@ -17,6 +17,7 @@ STATUS_TEXT = {
     "baseline_red": "BAZA CZERWONA - bramki nie przechodzą jeszcze przed zmianą",
     "no_changes": "BRAK ZMIAN",
     "review_failed": "RECENZJA NIEUDANA - żaden recenzent nie zwrócił wyniku",
+    "agent_failed": "AGENT NIEUDANY - wywołanie modelu nie powiodło się, drzewo bez zmian (można wznowić)",
     "budget": "PRZEKROCZONY BUDŻET",
     "error": "BŁĄD",
     "interrupted": "PRZERWANE (można wznowić)",
@@ -72,10 +73,19 @@ def render(state: dict, repo: Path) -> str:
 
     agents = state.get("agents") or []
     if agents:
-        rows = [[a.get("name", ""), a.get("spec", ""), "ok" if a.get("ok") else "BŁĄD",
-                 f"{a.get('duration_s', 0):.0f}s", f"${a.get('cost_usd', 0):.2f}" if a.get("cost_usd") else "-",
+        def cost(a: dict) -> str:
+            if not a.get("cost_usd"):
+                return "-"
+            return f"≤${a['cost_usd']:.2f} (limit roli, timeout)" if a.get("cost_estimated") else f"${a['cost_usd']:.2f}"
+        rows = [[a.get("name", ""), a.get("spec", ""), "ok" + (" (JSON naprawiony)" if a.get("json_repair") else "")
+                 if a.get("ok") else "BŁĄD", f"{a.get('duration_s', 0):.0f}s", cost(a),
                  (a.get("error") or "")[:80]] for a in agents]
         lines += ["## Agenci", "", _table(rows, ["wywołanie", "model", "wynik", "czas", "koszt", "błąd"]), ""]
+        denied = [(a.get("name", ""), d) for a in agents for d in a.get("permission_denials") or []]
+        if denied:
+            lines += ["Odrzucone wywołania narzędzi (bez pytania, `--permission-prompts none`; każde kosztuje agenta "
+                      "turę - rozważ dopisanie do allowlisty w `[providers.claude]`):", ""]
+            lines += [f"- `{n}`: `{d}`" for n, d in denied[:20]] + [""]
 
     plan = state.get("plan")
     if plan:

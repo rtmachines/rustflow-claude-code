@@ -8,14 +8,17 @@ quotes). Structured output: Claude `--json-schema` -> `structured_output`; Codex
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rustflow import procutil, schemas
 from rustflow.config import AgentSpec, Config, gates_command
+
+IS_WINDOWS = os.name == "nt"
 
 ROLE_SYSTEM = {
     "planner": "You are the PLANNER in an automated Rust workflow. You do not edit files.",
@@ -64,6 +67,10 @@ class AgentResult:
     retryable: bool = True            # False: retrying cannot help (auth, unknown model, bad CLI flag)
     observed_model: str = ""          # model that did most of the work, as reported by the CLI
     model_mismatch: str = ""          # non-empty when it is not the requested model
+    permission_denials: list[str] = field(default_factory=list)  # tool calls denied without a prompt
+    num_turns: int = 0
+    cost_estimated: bool = False      # cost_usd is the role's budget cap, not a reported cost (timeout)
+    json_repair: bool = False         # structured output came from a follow-up turn in the same session
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -80,6 +87,31 @@ def with_rtk_twins(tools: list[str], enabled: bool = True) -> list[str]:
                 out.append("Bash(rtk " + t[5:])
     return list(dict.fromkeys(out))
 
+
+def builtin_tools(tools: list[str], windows: bool | None = None) -> list[str]:
+    """Built-in tool set for `--tools`: PowerShell is the shell tool on Windows."""
+    out = list(tools)
+    if (IS_WINDOWS if windows is None else windows) and "Bash" in out and "PowerShell" not in out:
+        out.append("PowerShell")
+    return out
+
+
+def denial_summary(items: Any) -> list[str]:
+    """`permission_denials` of a `claude -p` result as `Tool(command or path)` strings."""
+    out = []
+    for d in items if isinstance(items, list) else []:
+        if not isinstance(d, dict):
+            continue
+        inp = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
+        detail = str(inp.get("command") or inp.get("file_path") or inp.get("pattern") or "").strip()
+        name = str(d.get("tool_name") or "?")
+        out.append(f"{name}({detail[:120]})" if detail else name)
+    return out[:50]
+
+
+JSON_REPAIR_PROMPT = ("Your last answer did not produce the required structured output. Do not use tools and do not "
+                      "change files: reply now with ONLY the final JSON object described by the schema, for the "
+                      "work you already did in this session.")
 
 ORCHESTRATED_NOTE = (" You were launched by the rustflow orchestrator: this prompt and its skill take precedence "
                      "over interactive-session rules in CLAUDE.md/AGENTS.md (e.g. 'use /rustflow-pr-review').")
@@ -219,6 +251,15 @@ class ClaudeRunner(BaseRunner):
                                                                p.get("rtk_compat", True)))]
             if p.get("disallowed_tools_read"):
                 argv += ["--disallowedTools", ",".join(p["disallowed_tools_read"])]
+        if call.allowed_tools is None:
+            # --allowedTools only pre-approves; --tools takes every other built-in tool definition out of the
+            # prompt (measured on 2.1.308: 27 -> 5 tools, ~4x fewer input tokens on a cold start). The role
+            # skill still loads: `/skill` in the prompt expands without the Skill tool.
+            builtin = p.get("tools_write" if call.write else "tools_read", [])
+            if builtin:
+                argv += ["--tools", ",".join(builtin_tools(builtin))]
+        if p.get("fallback_model"):
+            argv += ["--fallback-model", str(p["fallback_model"]).replace(" ", "")]  # overloaded -> fallback
         if call.schema is not None:
             argv += ["--json-schema", json.dumps(call.schema, separators=(",", ":"))]
         if call.max_budget_usd:
@@ -237,6 +278,28 @@ class ClaudeRunner(BaseRunner):
         argv = self.build_argv(call)
         prompt = compose_prompt(call, self.pcfg.get("skill_invocation", "slash"),
                                 extras_inline=self.pcfg.get("extra_skills_via", "system") == "inline")
+        res = self._attempt(call, argv, prompt)
+        if (call.schema is not None and not res.ok and res.session_id and "structured" in res.error
+                and self.pcfg.get("repair_structured_output", True)):
+            # One more turn in the SAME session with the SAME argv (tools, system prompt, schema): the
+            # cached prefix holds, and a long write session is not redone just to get its JSON report.
+            rep = AgentCall(**{**call.__dict__, "name": f"{call.name}-json", "timeout_s": min(call.timeout_s, 600)})
+            fixed = self._attempt(rep, argv + ["--resume", res.session_id], JSON_REPAIR_PROMPT)
+            fixed.name, fixed.json_repair = call.name, True
+            fixed.cost_usd = round(res.cost_usd + fixed.cost_usd, 6)
+            fixed.duration_s += res.duration_s
+            fixed.permission_denials = res.permission_denials + fixed.permission_denials
+            fixed.num_turns += res.num_turns
+            for k, v in res.tokens.items():
+                if isinstance(v, (int, float)):
+                    fixed.tokens[k] = fixed.tokens.get(k, 0) + v
+            if not fixed.ok:
+                fixed.error = f"{res.error} | JSON repair failed: {fixed.error}"
+            self._write(call, "result.json", json.dumps(fixed.to_dict(), indent=2, ensure_ascii=False))
+            res = fixed
+        return res
+
+    def _attempt(self, call: AgentCall, argv: list[str], prompt: str) -> AgentResult:
         self._write(call, "prompt.md", prompt)
         self._write(call, "argv.json", json.dumps(argv, indent=2))
         env = {"RUSTFLOW_ROLE": call.role, **call.env}
@@ -248,6 +311,10 @@ class ClaudeRunner(BaseRunner):
         res = AgentResult(call.name, call.role, str(call.spec), ok=False, duration_s=proc.duration_s, argv=argv)
         if proc.timed_out:
             res.error = f"timeout after {call.timeout_s:.0f}s"
+            if call.max_budget_usd:
+                # A killed `claude -p` prints nothing, and even an interrupted one reports $0: book the
+                # role's cap so [budget].max_total_usd stays an upper bound instead of silently undercounting.
+                res.cost_usd, res.cost_estimated = float(call.max_budget_usd), True
             return self._finish(call, res)
         payload = _last_json_object(proc.stdout)
         if payload is None:
@@ -262,6 +329,8 @@ class ClaudeRunner(BaseRunner):
         res.session_id = str(payload.get("session_id") or "")
         res.tokens = payload.get("usage") or {}
         res.data = payload.get("structured_output")
+        res.permission_denials = denial_summary(payload.get("permission_denials"))
+        res.num_turns = int(payload.get("num_turns") or 0)
         subtype = payload.get("subtype", "success")
         if payload.get("is_error") or subtype != "success" or proc.returncode != 0:
             detail = "; ".join(str(e) for e in payload.get("errors") or []) or res.text[-1500:]
@@ -425,13 +494,16 @@ def make_runners(cfg: Config, dry_run: bool = False) -> dict[str, BaseRunner]:
     return real
 
 
-def run_with_retry(runner: BaseRunner, call: AgentCall, retries: int = 1) -> AgentResult:
+def run_with_retry(runner: BaseRunner, call: AgentCall, retries: int = 1,
+                   may_retry: Callable[[], bool] | None = None) -> AgentResult:
     """Retry once on infrastructure failures (no output, crash, invalid structured output); never on
-    timeouts, budget stops or permanent errors (auth, unknown model, CLI flag the installed version lacks)."""
+    timeouts, budget stops or permanent errors (auth, unknown model, CLI flag the installed version lacks).
+    may_retry: extra condition checked after a failure (write roles: only if the tree is unchanged)."""
     res = runner.run(call)
     attempt = 0
     while (not res.ok and attempt < retries and res.retryable and "timeout" not in res.error
-           and "max_budget" not in res.error and "error_max" not in res.error):
+           and "max_budget" not in res.error and "error_max_budget" not in res.error
+           and "error_max_turns" not in res.error and (may_retry is None or may_retry())):
         attempt += 1
         time.sleep(5 * attempt)
         call.name = f"{call.name}-retry{attempt}"

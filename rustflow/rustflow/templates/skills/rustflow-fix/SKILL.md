@@ -28,4 +28,5 @@ description: Procedure for resolving Rust review findings or red quality gates -
 ```
 python .rustflow/gates.py run --profile stop     # python3 on Linux
 ```
-Do not commit. Return the JSON object: summary, resolutions (one per finding id), tests_added.
+Do not commit. Review findings: return the JSON object (summary, resolutions - one per finding id,
+tests_added). Red gates only: a short plain-text summary of the fix is enough.

@@ -55,13 +55,19 @@ Each summary ends with `next_actions`. Do the ones without `needs_user`; for `as
   offer merge (`git merge --squash`, user decides), PR comment (`rustflow comment`), and the soundness
   audit if `escalate` is true.
 - `criteria_unmet` -> reviewers approved but a required test did not pass on the final tree; show which
-  (`T-<id>` findings / `mechanical` in the summary) and ask: fix round, fix by hand, or drop the criterion.
+  (`T-<id>` findings / `mechanical` in the summary) and ask: fix round (`rustflow resume <id> --extra-rounds 2
+  --detach`), fix by hand, or drop the criterion.
 - `tree_changed` -> files changed while reviewers worked (someone edited the checkout); make sure nobody
   edits it, then `rustflow resume <id> --detach` (re-runs gates and review).
-- `max_rounds` / `stalled` -> list the blocking findings; ask: another fix round
-  (`rustflow review --fix --base <base> --max-rounds 2 --detach`), fix by hand, or stop.
+- `max_rounds` / `stalled` / `final_gates_red` -> list the blocking findings; ask: another fix round of the
+  same run (`rustflow resume <id> --extra-rounds 2 --detach`; MCP: `rustflow_resume {run, extra_rounds: 2}` -
+  same branch or worktree), fix by hand, or stop.
+- `agent_failed` -> a model call failed and changed nothing (overloaded, network, login): if the note says
+  transient, `rustflow resume <id> --detach`; otherwise run `rustflow doctor` and tell the user what to fix.
 - `gates_red`, `baseline_red`, `budget`, `crashed`, `interrupted` -> follow the action (inspect gates,
   ask about the base, raise budget then `rustflow resume <id> --detach`).
+- `approved` with isolation `worktree` -> the merge command runs in the main checkout; afterwards
+  `git worktree remove <workdir>` (both need the user).
 
 ## Never
 - Merge, push, or delete the run branch without the user.

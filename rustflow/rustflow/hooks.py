@@ -92,14 +92,29 @@ def post_edit(data: dict) -> int:
     if not (root / cfg.get("cargo_dir", ".") / "Cargo.toml").is_file():
         return 0
     runner = gates.GateRunner(root, cfg)
-    if norm.endswith(".rs"):
-        runner.fmt(fix=True)  # syntax errors are reported by cargo check below
+    if norm.endswith(".rs"):  # syntax errors are reported by cargo check below
+        mode = cfg.get("edit_fmt", "file")
+        if mode == "all":
+            runner.fmt(fix=True)
+        elif mode == "file":
+            runner.fmt_file(Path(file_path) if Path(file_path).is_absolute() else root / file_path)
     if not cfg.get("edit_check", True) or os.environ.get("RUST_EDIT_CHECK") == "0":
         return 0
     step = runner.check()
+    session = re.sub(r"[^A-Za-z0-9_-]", "_", str(data.get("session_id") or "nosession"))
+    memo = _state_dir(root) / f"check-{session}"
     if step.ok:
+        memo.unlink(missing_ok=True)
         return 0
     errors = [d for d in step.diagnostics if d.level == "error"]
+    # Mid-refactor every edit fails the same way: repeat a known error set in one line, not 15 snippets.
+    sig = json.dumps(sorted(f"{d.file}|{d.code}|{d.message}" for d in errors))
+    if errors and memo.is_file() and memo.read_text(encoding="utf-8") == sig:
+        sys.stderr.write(f"cargo check: still the same {len(errors)} compile error(s) as after the previous edit "
+                         f"(first: {errors[0].short()[:200]}). Finish the change, then fix them.\n")
+        return 2
+    if errors:
+        memo.write_text(sig, encoding="utf-8")
     lines = [d.rendered.rstrip() or d.short() for d in errors[:15]]
     if not lines:
         lines = step.tail.splitlines()[-25:]
@@ -192,7 +207,7 @@ def stop(data: dict) -> int:
         return _emit({"systemMessage": f"rustflow: gates still RED after {max_blocks} attempts - "
                                        "review manually (logs: .rustflow/cache/logs/)."})
     reason = (f"rustflow gates failed (attempt {n}/{max_blocks}). Fix them before finishing. Do not "
-              "silence lints with #[allow] or skip/weaken tests.\n\n" + res.feedback()[-8000:])
+              "silence lints with #[allow] or skip/weaken tests.\n\n" + res.feedback(max_diags=10, max_chars=8000))
     return _emit({"decision": "block", "reason": reason})
 
 
@@ -300,7 +315,7 @@ def guard_bash(data: dict) -> int:
             res = gates.run_gates(root, "stop", cfg=cfg)
             if not res.ok:
                 return _decide("deny", "Commit blocked: rustflow gates are RED. Fix them, then commit.\n\n"
-                                       + res.feedback()[-6000:])
+                                       + res.feedback(max_diags=10, max_chars=6000))
     return 0
 
 
