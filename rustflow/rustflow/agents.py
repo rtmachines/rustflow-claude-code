@@ -76,6 +76,16 @@ class AgentResult:
         return asdict(self)
 
 
+# Read-only shell commands for write roles. Measured live: without them `ls`, `wc` and `rtk read` were
+# denied to the implementer (each denial costs it a turn); no `find` (`-delete`) and no `echo` (redirects).
+READONLY_SHELL = ["ls", "wc", "cat", "head", "tail", "grep", "rg", "sort", "uniq", "cut", "diff", "tree", "pwd"]
+RTK_ALIASES = {"cat": "read"}   # `rtk read FILE` is rtk's `cat`
+
+
+def readonly_shell_rules() -> list[str]:
+    return [r for c in READONLY_SHELL for r in (f"Bash({c} *)", f"Bash({c})")]
+
+
 def with_rtk_twins(tools: list[str], enabled: bool = True) -> list[str]:
     """Output optimizers such as rtk rewrite Bash commands in a PreToolUse hook (`git status` ->
     `rtk git status`) and, for rules they cannot see (CLI --allowedTools), leave the permission check
@@ -85,6 +95,10 @@ def with_rtk_twins(tools: list[str], enabled: bool = True) -> list[str]:
         for t in tools:
             if t.startswith("Bash(") and not t.startswith("Bash(rtk "):
                 out.append("Bash(rtk " + t[5:])
+                cmd, _, rest = t[5:].partition(" ")
+                cmd = cmd.rstrip(")")
+                if cmd in RTK_ALIASES:
+                    out.append(f"Bash(rtk {RTK_ALIASES[cmd]}" + (f" {rest}" if rest else ")"))
     return list(dict.fromkeys(out))
 
 
@@ -243,6 +257,8 @@ class ClaudeRunner(BaseRunner):
             gates_cmd = gates_command(self.cfg)
             tools = list(call.allowed_tools if call.allowed_tools is not None else p.get("allowed_tools_write", []))
             tools += [f"Bash({gates_cmd} *)", f"PowerShell({gates_cmd} *)", "PowerShell(cargo *)"]
+            if call.allowed_tools is None and p.get("readonly_shell", True):
+                tools += readonly_shell_rules()
             argv += ["--permission-mode", p.get("permission_mode_write", "acceptEdits"),
                      "--allowedTools", ",".join(with_rtk_twins(tools, p.get("rtk_compat", True)))]
         else:

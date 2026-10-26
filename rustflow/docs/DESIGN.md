@@ -313,3 +313,20 @@ plików bez zmian, ale dwa dotknięte pliki przeformatowane w całości - diff +
 na sformatowanej bazie. Po poprawce: +205/-0, samo zadanie. Dlatego `changed` pomija też pliki, które w bazie nie były sformatowane (sprawdzane przez
 sformatowanie wersji z bazy ze stdin i porównanie; `rustfmt --check` na stdin zawsze zwraca 0) - dotyczy bramek
 i hooka po edycji. Zasada „formatuj to, czego dotykasz” zostaje jako `fmt_fix_scope = "touched"`.
+
+### Komendy tylko do odczytu dla ról piszących (zmierzone)
+
+W trzech runach na żywo implementer dostał tę samą odmowę: `rtk ls && rtk read Cargo.toml && …`. Test uprawnień
+na argv implementera (Claude Code 2.1.308, haiku) pokazał, że przyczyną nie jest łączenie komend:
+
+| komenda | przed | po (`readonly_shell = true`) |
+|---|---|---|
+| `cargo check && cargo test`, `cargo test 2>&1 \| tail -5` | dozwolone | dozwolone |
+| `ls` (hook rtk -> `rtk ls`), `wc -l …`, `rtk read Cargo.toml`, `rtk ls && rtk wc …` | **odmowa** | dozwolone |
+| `find . -name …` | odmowa | odmowa (celowo: `find -delete`; jest narzędzie Glob) |
+| `rm -rf <katalog w repo>` | dozwolone | dozwolone - to `acceptEdits` Claude Code, nie allowlista |
+| `rm -rf .git` | odmowa | odmowa (chroni sam Claude Code) |
+
+Claude Code sprawdza każdą część łańcucha osobno, więc `&&` działa, gdy każda komenda ma regułę. Role piszące nie
+miały żadnej komendy tylko do odczytu. Reguły dokłada kod (nie szablon), bo `allowed_tools_write` z `rustflow.toml`
+istniejących projektów nie jest nadpisywane przez `init`; `rtk read` dostaje bliźniaka `cat`.

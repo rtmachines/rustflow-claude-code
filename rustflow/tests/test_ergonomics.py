@@ -279,3 +279,22 @@ def test_failed_json_repair_is_not_retried_a_second_time(tmp_path, fake_bin, mon
     assert len(calls) == 2 and "--resume" in calls[1]["argv"]
     assert not res.ok and res.json_repair and "JSON repair failed" in res.error
     assert res.cost_usd == pytest.approx(0.2)
+
+
+# ── read-only shell for write roles ─────────────────────────────────────────
+def test_write_roles_may_run_read_only_shell_commands(tmp_path):
+    """Measured live: `ls` / `wc` / `rtk read` were denied to the implementer (each denial costs a turn);
+    chained `cargo check && cargo test` was fine - every part of a chain is matched on its own."""
+    d = load_defaults()
+    write = _arg(agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path, "implementer", write=True)),
+                 "--allowedTools").split(",")
+    for rule in ("Bash(ls *)", "Bash(ls)", "Bash(wc *)", "Bash(cat *)", "Bash(head *)", "Bash(grep *)",
+                 "Bash(rtk ls *)", "Bash(rtk read *)"):
+        assert rule in write, rule
+    assert not any(r.startswith(("Bash(find", "Bash(rm", "Bash(echo")) for r in write)
+    read = _arg(agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path)), "--allowedTools").split(",")
+    assert "Bash(ls *)" not in read                              # reviewers: the guard allowlist decides
+    d["providers"]["claude"]["readonly_shell"] = False
+    off = _arg(agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path, "implementer", write=True)),
+               "--allowedTools").split(",")
+    assert "Bash(ls *)" not in off

@@ -117,6 +117,9 @@ disallowed_tools_read = ["Edit", "Write", "NotebookEdit", "Agent"]   # Agent: no
 # zimnym starcie). Skill roli działa bez narzędzia Skill (/skill w prompcie). Na Windows dochodzi PowerShell.
 # [] = nie przekazuj flagi. Wywołania z własną listą narzędzi (audyt ToB) zawsze mają pełny zestaw.
 tools_read = ["Read", "Glob", "Grep", "LSP", "Bash"]
+# Role piszące mogą też wołać komendy tylko do odczytu (ls, wc, cat, head, tail, grep, rg, sort, uniq, cut, diff,
+# tree, pwd + bliźniaki rtk, w tym `rtk read`). Bez nich każda taka komenda była odmawiana i kosztowała agenta turę.
+readonly_shell = true
 tools_write = ["Read", "Edit", "Write", "Glob", "Grep", "LSP", "Bash"]
 # Model zapasowy przy przeciążeniu/niedostępności modelu głównego (--fallback-model), np. "sonnet";
 # musi być na allowliście [models].claude. Raport pokaże model_mismatch, gdy zadziałał. "" = wyłączone.
