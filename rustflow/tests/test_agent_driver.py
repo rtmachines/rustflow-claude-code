@@ -39,10 +39,11 @@ def _hook(repo, sub, payload, role=None):
 
 def test_detached_run_lock_hooks_cancel_resume(rust_repo, monkeypatch):
     monkeypatch.setenv("FAKE_SCENARIO", "happy")
-    monkeypatch.setenv("FAKE_SLEEP", "6")
+    monkeypatch.setenv("FAKE_SLEEP", "60")
     info = runs.spawn_detached(rust_repo, ["run"], TASK)
     assert info["status"] == "started", info
     rid = info["run_id"]
+    run_dir = runs.find_run(rust_repo, rid)
     assert _wait_for(lambda: gates.read_active(rust_repo) is not None)
     act = gates.read_active(rust_repo)
     assert act["run_id"] == rid
@@ -50,7 +51,8 @@ def test_detached_run_lock_hooks_cancel_resume(rust_repo, monkeypatch):
     with pytest.raises(runs.RunLocked):
         runs.spawn_detached(rust_repo, ["run"], "another task")
     # the driving session (no role) may not edit the run's checkout, nor change git state there
-    assert _wait_for(lambda: (gates.read_active(rust_repo) or {}).get("phase") == "implement", 20)
+    assert _wait_for(lambda: (gates.read_active(rust_repo) or {}).get("phase") == "implement", 90), (
+        (run_dir / "console.log").read_text(encoding="utf-8", errors="replace")[-4000:])
     r = _hook(rust_repo, "guard-edit", {"tool_input": {"file_path": str(rust_repo / "src" / "lib.rs")}})
     assert json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny" and rid in r.stdout
     r = _hook(rust_repo, "guard-bash", {"tool_input": {"command": "git switch main"}})
@@ -67,11 +69,12 @@ def test_detached_run_lock_hooks_cancel_resume(rust_repo, monkeypatch):
     s = runs.wait(runs.find_run(rust_repo, rid), 0.5, out=lambda *_: None)
     assert s["status"] == "running" and runs.exit_code(s["status"]) == 75
     assert s["next_actions"][0]["action"] == "wait"
-    run_dir = runs.find_run(rust_repo, rid)
     assert _wait_for(lambda: bool(list((run_dir / "attempts").glob("*.json"))))
     # cancel -> interrupted, lock released, resumable
     res = runs.cancel(rust_repo, runs.find_run(rust_repo, rid))
     assert res["status"] == "interrupted", res
+    if os.name == "nt":
+        assert res["forced"] is False
     assert gates.read_active(rust_repo) is None
     interrupted = {p.name: json.loads(p.read_text(encoding="utf-8")) for p in (run_dir / "attempts").glob("*.json")}
     assert len(interrupted) == 1

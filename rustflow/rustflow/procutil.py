@@ -130,6 +130,21 @@ def kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+def _communicate_polled(proc: subprocess.Popen, stdin_text: str | None,
+                        timeout_s: float | None) -> tuple[str | None, str | None]:
+    """Let Python handle interrupts between Windows pipe-reader joins (Python 3.11/3.13)."""
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+    while True:
+        remaining = max(0, deadline - time.monotonic()) if deadline is not None else 0.2
+        try:
+            return proc.communicate(input=stdin_text, timeout=min(0.2, remaining))
+        except subprocess.TimeoutExpired:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
+            # communicate retains its buffers across timeouts; input must be sent only once.
+            stdin_text = None
+
+
 def run(
     argv: list[str],
     *,
@@ -174,7 +189,10 @@ def run(
     with _ACTIVE_LOCK:
         _ACTIVE.add(proc)
     try:
-        stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
+        if IS_WINDOWS:
+            stdout, stderr = _communicate_polled(proc, stdin_text, timeout_s)
+        else:
+            stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
         kill_tree(proc)

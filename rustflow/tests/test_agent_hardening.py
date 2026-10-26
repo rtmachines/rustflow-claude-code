@@ -1,6 +1,9 @@
 """Permanent vs transient agent failures, observed model, duplicate evidence, review lenses."""
 
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -10,6 +13,26 @@ from rustflow.config import Config, ConfigError
 from rustflow.orchestrator import Options, Orchestrator, find_run
 
 TASK = "Add `parse_kv(input: &str) -> Vec<(String, String)>` to src/lib.rs. Trim whitespace. Add tests."
+
+
+def test_fake_agent_log_records_concurrent_invocations(tmp_path, fake_bin):
+    env = {**os.environ, "FAKE_LOG": str(tmp_path / "fake.log"), "FAKE_SCENARIO": "codex_auth"}
+    procs = [subprocess.Popen([sys.executable, str(fake_bin / "codex.py"), str(i), "x" * 20000],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=env) for i in range(12)]
+    try:
+        for proc in procs:
+            proc.communicate(timeout=30)
+            assert proc.returncode == 1
+        calls = read_log(tmp_path / "demo")
+        assert len(calls) == 12
+        assert {c["argv"][0] for c in calls} == {str(i) for i in range(12)}
+        assert all(c["argv"][1] == "x" * 20000 for c in calls)
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 @pytest.mark.parametrize("text,status,permanent", [

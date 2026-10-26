@@ -211,15 +211,30 @@ def overloaded():
     return 1
 
 
+def record_call(prompt):
+    # Windows append mode seeks before writing, so concurrent CLI processes need a lock.
+    with open(LOG + ".lock", "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            with open(LOG, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"provider": PROVIDER, "role": ROLE, "argv": ARGS,
+                                     "prompt_head": prompt[:200], "cwd": os.getcwd()}) + "\n")
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def main():
     if "--version" in ARGS:
         print(f"fake-{PROVIDER} 9.9.9")
         return 0
     prompt = sys.stdin.read()
     if LOG:
-        with open(LOG, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"provider": PROVIDER, "role": ROLE, "argv": ARGS,
-                                 "prompt_head": prompt[:200], "cwd": os.getcwd()}) + "\n")
+        record_call(prompt)
     if SCENARIO == "codex_down" and PROVIDER == "codex":
         print("boom", file=sys.stderr)
         return 1

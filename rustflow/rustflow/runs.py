@@ -96,8 +96,13 @@ def spawn_detached(repo: Path, cli_args: list[str], task: str | None = None, run
     log = (run_dir / "console.log").open("a", encoding="utf-8")
     kwargs: dict = {}
     if os.name == "nt":
-        kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-                                   | subprocess.DETACHED_PROCESS)      # type: ignore[attr-defined]
+        # A private, hidden console survives the caller and can receive cancellation signals.
+        # DETACHED_PROCESS has no console, so CTRL_BREAK cannot reach the orchestrator.
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+        startup = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+        startup.wShowWindow = subprocess.SW_HIDE  # type: ignore[attr-defined]
+        kwargs["startupinfo"] = startup
     else:
         kwargs["start_new_session"] = True
     env = os.environ.copy()
@@ -366,6 +371,19 @@ def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channe
         time.sleep(poll_s)
 
 
+def _windows_interrupt(pid: int) -> None:
+    """Run in a helper process: attach to the target console without detaching the caller's console."""
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.FreeConsole()
+    if not kernel.AttachConsole(pid):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+    finally:
+        kernel.FreeConsole()
+
+
 def cancel(repo: Path, run_dir: Path, grace_s: float = 20.0) -> dict:
     """Graceful stop: the orchestrator gets an interrupt, kills its agents, saves state (resumable)."""
     state = load_state(run_dir)
@@ -374,10 +392,14 @@ def cancel(repo: Path, run_dir: Path, grace_s: float = 20.0) -> dict:
         return {"run_id": state.get("run_id"), "status": effective_status(state), "note": "not running"}
     try:
         if os.name == "nt":
-            os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+            subprocess.run([sys.executable, "-c",
+                            "import sys; from rustflow.runs import _windows_interrupt; "
+                            "_windows_interrupt(int(sys.argv[1]))", str(pid)],
+                           creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+                           capture_output=True, timeout=5)
         else:
             os.kill(pid, signal.SIGINT)
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline and gates.pid_alive(pid):

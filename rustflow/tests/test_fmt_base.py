@@ -3,7 +3,9 @@ itemized per file (so a red baseline can accept them), and a preflight stop leav
 
 import json
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+
+import pytest
 
 from conftest import git
 from rustflow import gates, runs
@@ -37,6 +39,15 @@ def test_fmt_check_output_is_itemized_per_file(tmp_path):
     step = gates.Step("fmt", False, diagnostics=diags)
     sigs = gates.GateResult("full", False, None, steps=[step]).signatures()
     assert sigs == {"fmt|src/a.rs|fmt|not rustfmt-formatted", "fmt|tests/b.rs|fmt|not rustfmt-formatted"}
+
+
+@pytest.mark.parametrize("root,file", [
+    (r"C:\repo", r"\\?\C:\repo\src\lib.rs"),
+    (r"\\server\share\repo", r"\\?\UNC\server\share\repo\src\lib.rs"),
+])
+def test_fmt_check_windows_verbatim_paths(root, file):
+    diags = gates.parse_fmt_check(f"Diff in {file}:3:\n-x\n+y\n", PureWindowsPath(root))
+    assert [d.file for d in diags] == ["src/lib.rs"]
 
 
 def test_check_mode_reports_files_and_fix_mode_touches_only_changed_files(rust_repo, monkeypatch):

@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 PROFILES = ("edit", "stop", "full")
 PROFILE_RANK = {p: i for i, p in enumerate(PROFILES)}
@@ -206,14 +206,29 @@ def load_gate_config(root: Path) -> dict:
 _FMT_DIFF = re.compile(r"^Diff in (.+?)(?::\d+:| at line \d+:)\s*$", re.M)
 
 
+def _fmt_windows_path(path: PureWindowsPath) -> PureWindowsPath:
+    # rustfmt canonicalizes to \\?\ paths; pathlib keeps that prefix during resolve().
+    text = path.as_posix()
+    text = "//" + text[8:] if text.startswith("//?/UNC/") else text.removeprefix("//?/")
+    return PureWindowsPath(text)
+
+
 def parse_fmt_check(out: str, root: Path) -> list[Diagnostic]:
     """`cargo fmt -- --check` output -> one diagnostic per unformatted file (no line numbers, so the
     failure has a stable signature that a red baseline can accept)."""
     seen: dict[str, Diagnostic] = {}
     for m in _FMT_DIFF.finditer(out):
-        p = Path(m.group(1).strip())
+        p = type(root)(m.group(1).strip())
         try:
-            rel = p.resolve().relative_to(root.resolve()).as_posix() if p.is_absolute() else p.as_posix()
+            base = root
+            if p.is_absolute():
+                if isinstance(p, Path):
+                    p, base = p.resolve(), root.resolve()
+                if isinstance(p, PureWindowsPath):
+                    p, base = _fmt_windows_path(p), _fmt_windows_path(base)
+                rel = p.relative_to(base).as_posix()
+            else:
+                rel = p.as_posix()
         except ValueError:
             rel = p.as_posix()
         seen.setdefault(rel, Diagnostic("error", "not rustfmt-formatted", code="fmt", file=rel,

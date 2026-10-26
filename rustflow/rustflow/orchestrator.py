@@ -812,6 +812,9 @@ class Orchestrator:
             futures = {name: pool.submit(self.call_agent, name, f"r{rnd}-{name}", spec, prompt, write=False,
                                          schema=schemas.REVIEW_SCHEMA, skill="rustflow-review")
                        for name, spec, prompt in jobs}
+            # Windows 3.11/3.13 cannot interrupt an unbounded Future.result() lock wait.
+            while os.name == "nt" and not all(fut.done() for fut in futures.values()):
+                time.sleep(0.2)
             results = {name: fut.result() for name, fut in futures.items()}
         except BaseException:
             # Reviewers run in their own process groups and do not see Ctrl+C: kill them now instead

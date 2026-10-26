@@ -298,6 +298,20 @@ def test_installer_idempotent_and_preserves_user_settings(tmp_path):
 
 
 # ── procutil / agents ────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("timeout_s", [None, 5])
+def test_polled_communication_preserves_stdin_and_output(timeout_s):
+    import subprocess
+    import sys
+    text = "input " * 20000
+    with subprocess.Popen([sys.executable, "-c",
+                           "import sys,time; data=sys.stdin.read(); time.sleep(0.6); "
+                           "sys.stdout.write(data); sys.stderr.write('done')"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, encoding="utf-8") as proc:
+        out, err = procutil._communicate_polled(proc, text, timeout_s)
+    assert out == text and err == "done" and proc.returncode == 0
+
 def test_unwrap_npm_cmd_shim(tmp_path):
     shim = tmp_path / "codex.cmd"
     script = tmp_path / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
