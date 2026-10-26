@@ -1,0 +1,11 @@
+# cargo-nextest (installed by `rustflow init` only if you have no .config/nextest.toml).
+[profile.default]
+# Short reports: the model and you see only what failed.
+status-level = "fail"
+final-status-level = "fail"
+failure-output = "final"
+# A hung test is killed after 4 x 60 s instead of holding the gate until its 1 h timeout.
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[profile.ci]
+fail-fast = false

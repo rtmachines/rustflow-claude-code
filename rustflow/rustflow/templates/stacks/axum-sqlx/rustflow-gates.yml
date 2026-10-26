@@ -1,0 +1,40 @@
+name: rustflow-gates
+# Axum + SQLx stack: the same gates as hooks/orchestrator, with a real Postgres so `query!` and
+# `#[sqlx::test]` work and `sqlx prepare --check` is mandatory.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/app_test
+  REQUIRE_SQLX_CHECK: "1"
+  NEXTEST_PROFILE: ci
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,sqlx-cli,cargo-deny
+      - run: sqlx migrate run
+      - run: python .rustflow/gates.py ci

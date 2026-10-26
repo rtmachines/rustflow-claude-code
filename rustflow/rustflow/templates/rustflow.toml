@@ -1,0 +1,186 @@
+# rustflow.toml - konfiguracja workflow (Claude Code + Codex) dla projektu Rust.
+# Każdy brakujący klucz bierze wartość domyślną z pakietu rustflow.
+#
+# Spec agenta: "provider:model:effort"
+#   provider: claude | codex
+#   model:    musi być na allowliście [models]
+#   effort:   musi być na allowliście [efforts]
+
+[project]
+base = "HEAD"              # baza do diffów (gałąź/sha); domyślnie stan przy starcie
+language = "pl"            # język prozy w raportach recenzji
+isolation = "branch"       # branch | worktree | none
+checkpoint_commits = true  # commit po każdej fazie na gałęzi rustflow/<run>
+baseline_gates = true      # bramki na bazie przed startem (czy baza już jest czerwona?)
+python = ""                # interpreter dla promptów/allowedTools; "" = auto (py -3 na Windows, python3 na Linux)
+
+# ── Allowlista: orkiestrator odrzuci wszystko spoza niej ─────────────────────
+[models]
+claude = ["haiku", "sonnet", "opus", "fable"]
+codex  = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra"]
+
+[efforts]
+claude = ["low", "medium", "high", "xhigh", "max"]
+codex  = ["low", "medium", "high", "xhigh", "max"]
+
+# ── Triage: jak ustalić trudność zadania ─────────────────────────────────────
+[triage]
+mode = "heuristic"          # heuristic | llm | hybrid (hybrid = max z obu)
+model = "claude:haiku:low"  # używany dla llm/hybrid
+easy_max = 1                # wynik heurystyki <= easy_max  -> easy
+medium_max = 4              # wynik heurystyki <= medium_max -> medium, wyżej hard
+
+# ── Routing ról: trudność -> spec agenta ─────────────────────────────────────
+[roles.planner]
+when = "hard"               # hard | always | never
+easy   = "claude:sonnet:high"
+medium = "claude:opus:high"
+hard   = "claude:opus:xhigh"
+timeout_min = 20
+max_budget_usd = 3.0
+
+[roles.implementer]
+easy   = "claude:sonnet:medium"
+medium = "claude:opus:high"
+hard   = "claude:opus:xhigh"
+timeout_min = 60
+max_budget_usd = 15.0
+
+[roles.reviewer_a]
+lens = "correctness"        # poprawność, soundness, async/współbieżność, błędy, testy
+easy   = "claude:sonnet:high"
+medium = "claude:opus:high"
+hard   = "claude:opus:xhigh"
+timeout_min = 30
+max_budget_usd = 5.0
+
+[roles.reviewer_b]
+lens = "regressions"        # regresje dla istniejących wywołań, przypadki brzegowe, słabe/brakujące testy,
+                            # zasoby, API/semver; "design" = idiomy, API, wydajność z dowodem, dokumentacja
+easy   = "codex:gpt-6.1-sol:medium"
+medium = "codex:gpt-6-astra:high"
+hard   = "codex:gpt-6-astra:xhigh"
+timeout_min = 30
+
+[roles.fixer]
+easy   = "claude:sonnet:high"
+medium = "claude:opus:high"
+hard   = "claude:opus:xhigh"
+timeout_min = 45
+max_budget_usd = 10.0
+escalate_on_repeat = true   # finding wraca w kolejnej rundzie -> fixer o poziom wyżej
+
+# Opcjonalny trzeci recenzent, dołączany tylko gdy diff ma sygnały unsafe/FFI/atomics.
+# Pusty string = tylko flaga ESCALATE w raporcie (audyt /rust-review:rust-review ręcznie).
+[roles.auditor]
+mode = "llm"                # llm: trzeci recenzent (spec) w rundzie 1 | tob: plugin Trail of Bits rust-review
+spec = ""                   # llm: np. "claude:fable:max"; tob: model sesji ToB, musi być claude, np. "claude:opus:high"
+timeout_min = 40
+max_budget_usd = 10.0
+# tylko mode = "tob" (wymaga `rustflow init --with-plugins`); ToB uruchamia 13-23 workerów - drogo
+tob_args = "threat model REMOTE, use sonnet, high severity only"
+tob_allowed_tools = ["Agent", "Read", "Write", "Edit", "Glob", "Grep", "TaskCreate", "TaskUpdate", "TaskList",
+  "Bash(rg *)", "Bash(grep *)", "Bash(find *)", "Bash(test *)", "Bash(ls *)", "Bash(wc *)", "Bash(mkdir *)",
+  "Bash(date *)", "Bash(python3 *)", "Bash(python *)", "Bash(uv *)", "Bash(git diff *)", "Bash(git log *)",
+  "Bash(git show *)", "Bash(git rev-parse *)", "Bash(cargo metadata *)", "Bash(cargo tree *)"]
+
+# ── Pętla ────────────────────────────────────────────────────────────────────
+[loop]
+max_review_rounds = 3       # ile razy maksymalnie: review -> fix -> review
+max_gate_fix_attempts = 2   # ile razy fixer naprawia czerwone bramki zanim przerwiemy
+block_on = ["P0", "P1"]     # które severity blokują (dodaj "P2" dla surowszego trybu)
+rereview = "both"           # both | first  (kto robi re-recenzję w rundach >= 2)
+allow_reject = true         # fixer może odrzucić finding z uzasadnieniem
+min_confidence_single = "medium"  # finding zgłoszony przez 1 recenzenta poniżej progu -> doradczy
+
+[budget]
+max_total_usd = 60.0        # suma kosztu wywołań Claude (Codex raportuje tylko tokeny)
+
+# ── Narzędzia dostawców ──────────────────────────────────────────────────────
+[providers.claude]
+bin = "claude"
+permission_mode_write = "acceptEdits"
+permission_mode_read = "dontAsk"
+allowed_tools_write = [
+  "Read", "Edit", "Write", "Glob", "Grep", "LSP",
+  "Bash(cargo *)", "Bash(git diff *)", "Bash(git status *)", "Bash(git log *)", "Bash(git show *)",
+  "Bash(python .rustflow/gates.py *)", "Bash(python3 .rustflow/gates.py *)", "Bash(py -3 .rustflow/gates.py *)",
+]
+allowed_tools_read = [
+  "Read", "Glob", "Grep", "LSP",
+  "Bash(git diff *)", "Bash(git log *)", "Bash(git show *)", "Bash(git blame *)",
+  "Bash(cargo tree *)", "Bash(cargo metadata *)",
+]
+disallowed_tools_read = ["Edit", "Write", "NotebookEdit", "Agent"]   # Agent: no delegation to the interactive reviewer
+skill_invocation = "slash"  # slash (/skill w prompcie) | inline (treść SKILL.md w prompcie)
+extra_skills_via = "system" # system (--append-system-prompt-file, cache-friendly) | inline (w prompcie)
+# cwd/git status/env do pierwszej wiadomości zamiast system promptu: gałąź rustflow/<run> i ścieżka
+# worktree są unikalne per run, więc w system prompcie psułyby współdzielenie cache między runami.
+exclude_dynamic_system_prompt = true
+# Zgodność z optymalizatorami wyjścia (rtk): do każdej reguły Bash(X) dodaj Bash(rtk X), bo hook rtk
+# przepisuje komendę, a Claude Code sprawdza uprawnienia na wersji przepisanej.
+rtk_compat = true
+# Agenci orkiestratora nie ładują projektowych serwerów MCP (.mcp.json, w tym samego rustflow):
+# mniej tokenów na definicje narzędzi i brak rekurencyjnego uruchamiania rustflow.
+strict_mcp = true
+# Izolacja agentów od Twojej konfiguracji użytkownika (~/.claude/settings.json, ~/.claude/CLAUDE.md):
+# "project,local" = bez globalnych hooków (np. rtk) i osobistych instrukcji; hooki i CLAUDE.md projektu
+# (w tym bramki rustflow) działają dalej. Nie ustawiaj, jeśli logujesz się przez apiKeyHelper/env
+# w ~/.claude/settings.json. "" = nie przekazuj flagi (Claude Code ładuje wszystko).
+setting_sources = ""
+extra_args = []
+
+[providers.codex]
+bin = "codex"
+network = false             # sieć w sandboxie workspace-write (np. cargo fetch nowych crate'ów)
+add_dirs = []               # dodatkowe zapisywalne katalogi, np. ["~/.cargo"]
+skill_invocation = "mention" # mention ($skill w prompcie) | inline
+extra_args = []
+
+# ── Skille dołączane NA PEWNO (nie "jeśli model zechce") ─────────────────────
+# Oprócz skilla roli (rustflow-implement/-review/-fix/-plan). "auto" = wszystkie zainstalowane
+# rustflow-stack-* oraz rust-best-practices (Apollo). Claude: --append-system-prompt-file,
+# Codex: początek promptu, interaktywny rustflow-reviewer: preload `skills:` (rustflow init).
+# Brakujący jawnie wymieniony skill = błąd na starcie runu.
+[skills]
+all = ["auto"]
+planner = []
+implementer = []
+reviewer = []               # reviewer_a, reviewer_b, auditor, interaktywny rustflow-reviewer
+fixer = []
+max_kb = 32                 # limit łącznego rozmiaru na rolę (trafia do każdego wywołania)
+
+# ── Recenzja: dodatkowe sygnały dla recenzentów ──────────────────────────────
+[review]
+inline_diff_max_kb = 80     # większy diff -> recenzent sam robi git diff
+advisory_clippy = ["clippy::pedantic"]   # lints doradcze, filtrowane do zmienionych linii; [] = wyłącz
+
+# Dowolne narzędzia doradcze (wynik doklejany do promptu recenzenta, nie blokuje).
+[[review.advisory]]
+name = "rust-analyzer diagnostics"
+cmd = ["rust-analyzer", "diagnostics", "."]
+enabled = false
+timeout_s = 600
+
+# ── Bramki deterministyczne (te same w hookach, orkiestratorze i CI) ─────────
+[gates]
+features = ["--all-features"]   # [] gdy features się wykluczają
+tests = "auto"              # auto (nextest jeśli jest) | nextest | test | off
+doc_tests = true
+deny = "auto"               # auto (gdy deny.toml + zmiana manifestów) | always | off
+clippy_args = ["-D", "warnings"]
+edit_check = true           # hook po edycji: cargo check
+stop_max_blocks = 3         # hook Stop: ile razy z rzędu może zablokować koniec tury
+tree_stable = true          # pełne bramki: zmiana plików źródłowych W TRAKCIE bramek (build.rs/test piszący
+                            # do drzewa) = czerwone; Cargo.lock może się zmienić tylko bez --locked
+log_lines = 60
+
+semver = "auto"             # cargo semver-checks dla publikowalnych crate'ów lib (auto | always | off)
+sqlx = "auto"               # cargo sqlx prepare --check gdy kod ma query!() i jest DATABASE_URL (auto | require | off)
+
+# Własne bramki:
+# [[gates.extra]]
+# name = "migracje się stosują"
+# cmd = ["sqlx", "migrate", "run"]
+# profiles = ["full"]
+# when_env = "DATABASE_URL"

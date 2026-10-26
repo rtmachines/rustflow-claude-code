@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rustflow"
+version = "0.1.0"
+description = "Orchestrator for Rust development with Claude Code and Codex: triage -> plan -> implement -> gates -> 2x review -> fix loop -> final gates."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []          # stdlib only - works the same on Windows and Linux
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+rustflow = "rustflow.cli:main"
+
+[tool.setuptools]
+packages = ["rustflow"]
+
+[tool.setuptools.package-data]
+rustflow = ["templates/**/*", "templates/*", "templates/*/*", "templates/*/*/*", "templates/*/*/*/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
