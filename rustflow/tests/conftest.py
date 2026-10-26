@@ -29,6 +29,16 @@ def fake_bin(tmp_path):
 
 
 @pytest.fixture
+def fake_defaults(fake_bin):
+    """Default configuration with only the provider executables replaced by local fakes."""
+    from rustflow.config import load_defaults
+    data = load_defaults()
+    for provider in ("claude", "codex"):
+        data["providers"][provider]["bin"] = str(fake_bin / f"{provider}.py")
+    return data
+
+
+@pytest.fixture
 def rust_repo(tmp_path, shared_target, monkeypatch, fake_bin):
     if shutil.which("cargo") is None:
         pytest.skip("cargo not available")

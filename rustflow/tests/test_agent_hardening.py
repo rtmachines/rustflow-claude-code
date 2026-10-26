@@ -116,9 +116,9 @@ def test_model_mismatch_is_reported(rust_repo, monkeypatch):
     assert any(e["kind"] == "model_mismatch" for e in st["events"])
 
 
-def test_setting_sources_option(tmp_path):
-    from rustflow.config import AgentSpec, load_defaults
-    d = load_defaults()
+def test_setting_sources_option(tmp_path, fake_defaults):
+    from rustflow.config import AgentSpec
+    d = fake_defaults
     call = agents.AgentCall("reviewer_a", "x", AgentSpec.parse("claude:opus:high"), "p", False, None, tmp_path,
                             tmp_path / "logs")
     assert "--setting-sources" not in agents.ClaudeRunner(Config(d)).build_argv(call)
