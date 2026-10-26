@@ -152,7 +152,7 @@ def t_wait(a: dict) -> tuple[str, dict]:
     repo = _repo()
     lines: list[str] = []
     s = runs.wait(runs.find_run(repo, a.get("run")), min(float(a.get("timeout_s") or 600), float(MAX_WAIT_S)),
-                  out=lines.append)
+                  out=lines.append, channel="mcp")
     s["progress"] = lines[-40:]
     return ("\n".join(lines[-40:]) + "\n\n" if lines else "") + runs.brief_markdown(s, mcp=True), s
 

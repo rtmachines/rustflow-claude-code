@@ -225,10 +225,10 @@ def test_worktree_run_continues_in_its_worktree_and_offers_merge(rust_repo, monk
     assert st["status"] == "stalled"
     rc2, st2 = _resume(rust_repo, monkeypatch, "happy", extra_rounds=2)
     assert st2["status"].startswith("approved"), st2.get("stop_reason")
-    assert ".trim()" in (Path(st2["workdir"]) / "src" / "lib.rs").read_text()
+    assert ".trim()" in git(rust_repo, "show", f"{st2['branch']}:src/lib.rs")
     merge = next(a for a in runs.next_actions(st2) if a["action"] == "merge")
     assert merge["command"] == f"git merge --squash {st2['branch']}" and merge["needs_user"]
-    assert "git worktree remove" in merge["note"]
+    assert "main checkout" in merge["note"]
 
 
 def test_cli_and_mcp_forward_extra_rounds(monkeypatch, tmp_path):

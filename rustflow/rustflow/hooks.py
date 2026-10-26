@@ -177,23 +177,43 @@ def _rust_changes_pending(root: Path) -> bool:
     return False
 
 
+def _config_notice(root: Path, cfg: dict, session: str) -> str:
+    """Once per session: rustflow.toml does not parse, so the hooks run with default [gates] settings."""
+    err = cfg.get("_config_error")
+    if not err:
+        return ""
+    memo = _state_dir(root) / f"config-warned-{session}"
+    if memo.is_file():
+        return ""
+    memo.write_text(err, encoding="utf-8")
+    return (f"rustflow: rustflow.toml is invalid ({err[:200]}) - hooks and gates use the default [gates] "
+            "settings until it is fixed (`rustflow doctor`).")
+
+
 def stop(data: dict) -> int:
     role = _role()
     if role in READ_ONLY_ROLES | AUDIT_ROLES or os.environ.get("RUSTFLOW_HOOKS") == "0":
         return 0
     root = gates.find_root()
     cfg = gates.load_gate_config(root)
+    session = re.sub(r"[^A-Za-z0-9_-]", "_", str(data.get("session_id") or "nosession"))
+    notice = _config_notice(root, cfg, session)
+
+    def finish(obj: dict | None = None) -> int:
+        if notice:
+            obj = {**(obj or {}), "systemMessage": " ".join(x for x in (notice, (obj or {}).get("systemMessage")) if x)}
+        return _emit(obj) if obj else 0
+
     if not (root / cfg.get("cargo_dir", ".") / "Cargo.toml").is_file():
-        return 0
+        return finish()
     # Interactive sessions: only when Rust-relevant files differ from HEAD. Orchestrated: always
     # (the orchestrator commits checkpoints, so "no diff vs HEAD" does not mean "nothing to check").
     if not role:
         act = gates.find_active_for(root)
         if act and _same_dir(act.get("workdir", ""), root):
-            return 0  # a rustflow run owns this checkout; its own gates decide, not the driving session's
+            return finish()  # a rustflow run owns this checkout; its own gates decide, not the driving session's
     if role not in ORCHESTRATED_WRITE_ROLES and not _rust_changes_pending(root):
-        return 0
-    session = re.sub(r"[^A-Za-z0-9_-]", "_", str(data.get("session_id") or "nosession"))
+        return finish()
     counter = _state_dir(root) / f"stop-blocks-{session}"
     max_blocks = int(cfg.get("stop_max_blocks", 3))
     res = gates.run_gates(root, "stop", cfg=cfg)
@@ -201,7 +221,7 @@ def stop(data: dict) -> int:
     baseline = _baseline_signatures(root)
     if res.ok or (baseline and sigs <= baseline and not any(x.endswith("|*") for x in sigs)):
         counter.unlink(missing_ok=True)
-        return 0
+        return finish()
     try:
         n = int(counter.read_text(encoding="utf-8")) + 1
     except (OSError, ValueError):
@@ -209,11 +229,11 @@ def stop(data: dict) -> int:
     counter.write_text(str(n), encoding="utf-8")
     if n > max_blocks:
         counter.unlink(missing_ok=True)
-        return _emit({"systemMessage": f"rustflow: gates still RED after {max_blocks} attempts - "
-                                       "review manually (logs: .rustflow/cache/logs/)."})
+        return finish({"systemMessage": f"rustflow: gates still RED after {max_blocks} attempts - "
+                                        "review manually (logs: .rustflow/cache/logs/)."})
     reason = (f"rustflow gates failed (attempt {n}/{max_blocks}). Fix them before finishing. Do not "
               "silence lints with #[allow] or skip/weaken tests.\n\n" + res.feedback(max_diags=10, max_chars=8000))
-    return _emit({"decision": "block", "reason": reason})
+    return finish({"decision": "block", "reason": reason})
 
 
 # ── guard-bash ───────────────────────────────────────────────────────────────

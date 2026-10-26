@@ -77,6 +77,11 @@ def add_worktree(root: Path, path: Path, branch: str, base: str) -> None:
     git(root, "worktree", "add", "-b", branch, str(path), base)
 
 
+def checkout_worktree(root: Path, path: Path, branch: str) -> None:
+    """A worktree for an EXISTING branch (re-created after cleanup, e.g. for `resume --extra-rounds`)."""
+    git(root, "worktree", "add", str(path), branch)
+
+
 def remove_worktree(root: Path, path: Path) -> None:
     git(root, "worktree", "remove", "--force", str(path), check=False)
 

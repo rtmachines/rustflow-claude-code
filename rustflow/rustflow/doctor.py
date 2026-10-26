@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -122,6 +123,7 @@ class Doctor:
                     pass
         self.line("OK" if found else "WARN", "Claude Code hooks registered", "" if found else "run `rustflow init`")
         self.check_hook_interpreter(settings, local)
+        self.check_trust()
         self.check_foreign_gates(settings, local)
         for rel in (".claude/skills/rustflow-pr-review/SKILL.md", ".claude/agents/rustflow-reviewer.md"):
             if not (self.repo / rel).is_file():
@@ -150,6 +152,29 @@ class Doctor:
             self.line("INFO", "user-level Claude config", f"{what} also apply to rustflow agents; to isolate them set "
                       "[providers.claude] setting_sources = \"project,local\" (not with apiKeyHelper/env auth in "
                       "~/.claude/settings.json)")
+
+    def check_trust(self) -> None:
+        """Until the folder is trusted, Claude Code ignores the project's permissions.allow (it says so on
+        stderr: "this workspace has not been trusted") and agent-frontmatter hooks - `claude -p` then denies
+        mcp__rustflow / Skill(rustflow-*) with nobody to ask."""
+        cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        path = Path(cfg_dir) / ".claude.json" if cfg_dir else Path.home() / ".claude.json"
+        try:
+            projects = json.loads(path.read_text(encoding="utf-8")).get("projects") or {}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            self.line("INFO", "folder trust", f"cannot read {path}")
+            return
+        repo = self.repo.resolve()
+        if (projects.get(str(repo)) or {}).get("hasTrustDialogAccepted"):
+            self.line("OK", "folder trust", "Claude Code trusts this folder")
+            return
+        parent = next((d for d in repo.parents if (projects.get(str(d)) or {}).get("hasTrustDialogAccepted")), None)
+        if parent is not None:
+            self.line("INFO", "folder trust", f"not recorded for this folder, but {parent} is trusted")
+            return
+        self.line("WARN", "folder trust", "Claude Code has not trusted this folder: it ignores the project's "
+                  "permissions.allow (mcp__rustflow, Skill(rustflow-*), ...) and agent-frontmatter hooks, so "
+                  "`claude -p` denies them. Open Claude Code here once and accept the trust dialog.")
 
     def check_foreign_gates(self, *paths: Path) -> None:
         """Other Stop-hook gates (e.g. rust-review-kit's rust-gate.sh) double cargo runs per turn."""

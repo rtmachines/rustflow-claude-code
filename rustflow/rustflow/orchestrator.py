@@ -160,8 +160,13 @@ class Orchestrator:
                          f"'{self.state['branch']}'. Run: git switch {self.state['branch']}")
                 return 2
         if self.state.get("isolation") == "worktree" and not self.workdir.is_dir():
-            self.log(f"refusing to resume: worktree {self.workdir} no longer exists")
-            return 2
+            if not (self.state.get("worktree_removed") and self.state.get("branch")):
+                self.log(f"refusing to resume: worktree {self.workdir} no longer exists")
+                return 2
+            # Removed by rustflow after the run finished clean: the work is on the branch, check it out again.
+            gitutil.checkout_worktree(self.repo, self.workdir, self.state["branch"])
+            self.state["worktree_removed"] = False
+            self.log(f"worktree re-created from {self.state['branch']}: {self.workdir}")
         try:
             runs.acquire(self.repo, self.state)
         except runs.RunLocked as exc:
@@ -200,7 +205,27 @@ class Orchestrator:
         try:
             return self._loop()
         finally:
+            if self.state.get("status") not in ("running", *RESUMABLE):
+                self._remove_finished_worktree()
             runs.release(self.repo, self.state["run_id"])
+
+    def _remove_finished_worktree(self) -> None:
+        """A finished worktree run leaves its work on the branch (checkpoint commits), so the checkout under
+        .rustflow/wt/ is only clutter - unless it holds uncommitted work (checkpoint_commits = false)."""
+        wt = self.workdir
+        if self.state.get("isolation") != "worktree" or self.opts.dry_run or not wt.is_dir() or wt == self.repo:
+            return
+        try:
+            if gitutil.git(wt, "status", "--porcelain").strip():
+                return
+            gitutil.remove_worktree(self.repo, wt)
+        except gitutil.GitError as exc:
+            self.log(f"worktree kept ({exc})")
+            return
+        if not wt.is_dir():
+            self.state["worktree_removed"] = True
+            self.log(f"worktree removed (work is on {self.state.get('branch')}): {wt}")
+            self.save()
 
     def _loop(self) -> int:
         try:

@@ -162,7 +162,8 @@ def test_worktree_isolation_keeps_main_checkout_untouched(rust_repo, monkeypatch
     assert wt.replace("\\", "/").endswith(f".rustflow/wt/{st['run_id']}")
     assert (rust_repo / "src" / "lib.rs").read_text() == before          # main checkout untouched
     from pathlib import Path
-    assert ".trim()" in (Path(wt) / "src" / "lib.rs").read_text()
+    assert ".trim()" in git(rust_repo, "show", f"{st['branch']}:src/lib.rs")   # work is on the run branch
+    assert st["worktree_removed"] and not Path(wt).exists()                    # clean worktree cleaned up
     assert git(rust_repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
     assert git(rust_repo, "status", "--porcelain").strip() == ""          # wt/ and runs/ are ignored
     assert all(c["cwd"] == wt for c in read_log(rust_repo))
