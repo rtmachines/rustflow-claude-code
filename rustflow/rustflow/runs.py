@@ -167,6 +167,11 @@ def degraded(state: dict) -> list[str]:
     return list(rounds[-1].get("failed_reviewers") or []) if rounds else []
 
 
+def _mcp(tool: str, **arguments) -> dict:
+    """The same step as the action's CLI `command`, as an MCP tool call for a driver on `mcp__rustflow__*`."""
+    return {"tool": tool, "arguments": arguments}
+
+
 def next_actions(state: dict) -> list[dict]:
     st = effective_status(state)
     rid = state.get("run_id", "?")
@@ -177,8 +182,10 @@ def next_actions(state: dict) -> list[dict]:
     acts: list[dict] = []
     # Another fix round continues THIS run: same branch/worktree, checkpoints and finding ids.
     more = f"rustflow resume {rid} --extra-rounds 2 --detach"
+    more_mcp = _mcp("rustflow_resume", run=rid, extra_rounds=2)
     if st == "running":
         return [{"action": "wait", "command": f"rustflow wait {rid} --timeout 540",
+                 "mcp": _mcp("rustflow_wait", run=rid, timeout_s=600),
                  "note": "do not edit files or change git state in this checkout meanwhile"}]
     if st in APPROVED:
         acts.append({"action": "present_result", "note": "summarize the change and the report for the user"})
@@ -187,6 +194,7 @@ def next_actions(state: dict) -> list[dict]:
             why = "; ".join(f"{n}: {errors[n][:120]}" for n in failed_reviewers if errors.get(n))
             hint = (" Raise its [roles.<reviewer>].max_budget_usd first." if "max_budget" in why else "")
             acts.append({"action": "ask_user", "command": f"rustflow resume {rid} --extra-rounds 1 --detach",
+                         "mcp": _mcp("rustflow_resume", run=rid, extra_rounds=1),
                          "question": f"Approved by fewer reviewers than planned - {', '.join(failed_reviewers)} "
                                      f"returned no result{f' ({why})' if why else ''}. Review again with all "
                                      f"reviewers before merging?{hint}"})
@@ -208,19 +216,21 @@ def next_actions(state: dict) -> list[dict]:
         return acts
     if st == "changes_requested":
         return [{"action": "ask_user", "question": f"{len(open_)} blocking finding(s). Run the fix loop?",
-                 "command": f"rustflow review --fix --base {base} --detach"}]
+                 "command": f"rustflow review --fix --base {base} --detach",
+                 "mcp": _mcp("rustflow_start", mode="review", fix=True, base=base)}]
     if st == "criteria_unmet":
         missing = [m for m in state.get("mechanical", []) if m.get("status") != "met"]
         return [{"action": "ask_user", "question": "Review approved, but required tests are not proven: "
                  + "; ".join(f"`{m['test']}` ({m.get('detail', '')})" for m in missing[:5])
                  + ". Add/fix them in another fix round, fix by hand, or drop the criterion?",
-                 "command": more}]
+                 "command": more, "mcp": more_mcp}]
     if st in ("max_rounds", "stalled", "final_gates_red"):
         return [{"action": "ask_user", "question": (f"Run ended '{st}' with {len(open_)} blocking finding(s): "
                  + "; ".join(f"[{f['id']}] {f['title']}" for f in open_[:5]) + ". Another fix round, fix by "
-                 "hand, or stop?"), "command": more}]
+                 "hand, or stop?"), "command": more, "mcp": more_mcp}]
     if st == "gates_red":
         return [{"action": "inspect", "command": "rustflow gates --profile full",
+                 "mcp": _mcp("rustflow_gates", profile="full", check_only=True),
                  "note": "the code does not pass the gates even after gate-fix attempts"},
                 {"action": "ask_user", "question": "Gates stay red - fix manually, or retry with a stronger model "
                  "(--difficulty hard)?"}]
@@ -243,7 +253,8 @@ def next_actions(state: dict) -> list[dict]:
                                  "(overloaded/network); retry" if failed.get("retryable", True) else
                                  f"{failed.get('name', 'an agent')} failed permanently - fix it first "
                                  "(`rustflow doctor`: login, model names), then")}[st]
-        return [{"action": "resume", "command": f"rustflow resume {rid} --detach", "note": hint.strip()}]
+        return [{"action": "resume", "command": f"rustflow resume {rid} --detach",
+                 "mcp": _mcp("rustflow_resume", run=rid), "note": hint.strip()}]
     if st == "review_failed":
         return [{"action": "inspect", "command": "rustflow doctor", "note": "no reviewer returned a result - "
                  "CLI auth/model names?"}]
@@ -273,7 +284,8 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
     }
 
 
-def brief_markdown(s: dict) -> str:
+def brief_markdown(s: dict, mcp: bool = False) -> str:
+    """Compact run summary for a model. mcp=True: next steps as MCP tool calls instead of CLI commands."""
     lines = [f"rustflow {s['run_id']}: **{s['status']}** (phase {s['phase']}, round {s['round']}, "
              f"{s['difficulty']}, ${s['cost_usd']:.2f})"]
     if s.get("branch"):
@@ -296,7 +308,9 @@ def brief_markdown(s: dict) -> str:
         lines.append("reason: " + s["stop_reason"].splitlines()[0][:300])
     lines.append("next:")
     for a in s["next_actions"]:
-        lines.append("  - " + a["action"] + (f": {a['command']}" if a.get("command") else "")
+        step = (f"{a['mcp']['tool']} {json.dumps(a['mcp']['arguments'], ensure_ascii=False)}" if mcp and a.get("mcp")
+                else a.get("command", ""))
+        lines.append("  - " + a["action"] + (f": {step}" if step else "")
                      + (f" - {a['question']}" if a.get("question") else "")
                      + (f" ({a['note']})" if a.get("note") else "") + (" [needs user]" if a.get("needs_user") else ""))
     lines.append(f"full report: {s['report']}")

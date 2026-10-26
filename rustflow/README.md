@@ -225,6 +225,10 @@ Narzędzia MCP: `rustflow_triage`, `rustflow_start`, `rustflow_wait`, `rustflow_
 `rustflow_cancel`, `rustflow_resume` (z `extra_rounds`: kolejne rundy fix tego samego runu), `rustflow_gates`
 (w Claude Code: `mcp__rustflow__…`).
 
+Każdy krok w `next_actions` ma obok komendy CLI pole `mcp` (`{tool, arguments}`), a odpowiedzi MCP pokazują
+kroki właśnie w tej formie. `rustflow_wait` czeka do 1800 s (wywołanie MCP nie ma 10-minutowego limitu Basha),
+a `rustflow_report` mieści się w limicie wyjścia MCP (zwięzłe findingi, przycięcie z informacją, jak dostać resztę).
+
 Bezpieczniki: jeden aktywny run na repo (`ACTIVE.json` + sprawdzanie PID); dopóki run pracuje w checkoucie,
 hooki odmawiają agentowi sterującemu edycji i zmian w gicie, a jego hook Stop nie odpala bramek na
 niedokończonej pracy; agenci runu nie mogą uruchomić rustflow rekurencyjnie (`--strict-mcp-config` + guard).
