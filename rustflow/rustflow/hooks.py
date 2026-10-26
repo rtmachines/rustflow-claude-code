@@ -97,7 +97,12 @@ def post_edit(data: dict) -> int:
         if mode == "all":
             runner.fmt(fix=True)
         elif mode == "file":
-            runner.fmt_file(Path(file_path) if Path(file_path).is_absolute() else root / file_path)
+            path = Path(file_path) if Path(file_path).is_absolute() else root / file_path
+            # A file that was not rustfmt-clean at the base stays as written: formatting it would put a
+            # reformat of the whole file into the diff (see [gates].fmt_fix_scope).
+            if cfg.get("fmt_fix_scope", "changed") != "changed" or runner.clean_at(
+                    path, os.environ.get("RUSTFLOW_BASE") or "HEAD"):
+                runner.fmt_file(path)
     if not cfg.get("edit_check", True) or os.environ.get("RUST_EDIT_CHECK") == "0":
         return 0
     step = runner.check()

@@ -441,6 +441,34 @@ class Orchestrator:
             self.log(f"isolation: worktree {wt} (branch {branch}, shared target/)")
         else:
             self.log("isolation: none (working in place, no checkpoint commits)")
+        try:
+            self._preflight_checks(review_mode)
+        except Abort:
+            self._undo_isolation()
+            raise
+        # Starting point of the work = base tree plus anything already in the tree (review mode), taken
+        # after the baseline gates: a Cargo.lock they create is not the implementer's work.
+        self.state["start_tree"] = self.snapshot()
+        self.state["phase"] = "triage"
+
+    def _undo_isolation(self) -> None:
+        """A stop before any work: leave the checkout as it was, not on an empty `rustflow/<run>` branch."""
+        branch = self.state.pop("branch", None)
+        if not branch or self.opts.dry_run:
+            return
+        try:
+            if self.state.get("isolation") == "worktree":
+                gitutil.remove_worktree(self.repo, self.workdir)
+                self.state["workdir"] = str(self.repo)
+            else:
+                orig = self.state.get("original_branch", "HEAD")
+                gitutil.git(self.repo, "switch", *(["--detach", self.state["base_sha"]] if orig == "HEAD" else [orig]))
+            gitutil.git(self.repo, "branch", "-D", branch)
+            self.log(f"isolation undone: {branch} removed, checkout unchanged")
+        except gitutil.GitError as exc:
+            self.log(f"could not undo isolation ({exc}); remove {branch} by hand")
+
+    def _preflight_checks(self, review_mode: bool) -> None:
         self._check_skills()
         if self.cfg.get("project.baseline_gates", True) and not review_mode:
             # Same flags as the final gates (check-only, --locked) so failure signatures are comparable.
@@ -456,10 +484,6 @@ class Orchestrator:
                     raise Abort("baseline_red", "gates are already RED on the base. Fix the base first or "
                                                 "rerun with --accept-red-baseline.\n" + res.feedback()[:3000])
                 self.log("baseline is RED - accepted; only NEW failures will block")
-        # Starting point of the work = base tree plus anything already in the tree (review mode), taken
-        # after the baseline gates: a Cargo.lock they create is not the implementer's work.
-        self.state["start_tree"] = self.snapshot()
-        self.state["phase"] = "triage"
 
     def phase_triage(self) -> None:
         task = self.state["task"]

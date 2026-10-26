@@ -114,7 +114,9 @@ Pełny, skomentowany plik tworzy `rustflow init`. Najważniejsze przełączniki:
 i `~/.claude/CLAUDE.md`; zostają hooki i CLAUDE.md projektu), `[providers.claude].tools_read/tools_write`
 (wbudowane narzędzia w prompcie agentów, `--tools`), `[providers.claude].fallback_model`,
 `[review].rereview_full_diff_max_kb` (runda >= 2: delta zamiast całego diffu), `[gates].edit_fmt`
-(hook po edycji formatuje tylko edytowany plik).
+(hook po edycji formatuje tylko edytowany plik), `[gates].fmt_fix_scope` (bramki formatują tylko pliki zmienione
+względem bazy; repo, które nie jest sformatowane rustfmt, działa z `--accept-red-baseline` - błędy fmt są
+rozpisane per plik i nie trafiają do diffu).
 
 Soczewka `regressions` (domyślna dla reviewer_b) szuka tego, co zmiana psuje istniejącym wywołaniom,
 przypadków brzegowych i testów, które przeszłyby i bez zmiany; idiomy tylko jako P3. Wcześniejsza

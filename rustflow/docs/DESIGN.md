@@ -293,3 +293,23 @@ Zmiany:
 - **Feedback bramek w hookach** obcinany od końca (dawniej `[-8000:]` gubił nagłówek i pierwsze błędy).
 - **Runda >= 2**: delta inline, pełny diff tylko do `rereview_full_diff_max_kb` (domyślnie 16 KB).
 - `start_tree` po bramkach bazowych: `Cargo.lock` utworzony przez bramki nie jest pracą implementera.
+
+### Repo, które nie jest sformatowane rustfmt (run na żywo)
+
+Pierwszy run na prawdziwej bibliotece (~5k linii) skończył się `baseline_red`: 8 plików niesformatowanych.
+Poprawka w hooku po edycji nie wystarczała:
+- bramki bez `--check` (po implementacji, hook Stop) uruchamiały `cargo fmt --all` -> z `--accept-red-baseline`
+  diff dostawał przeformatowanie całego repo;
+- błąd fmt nie był rozpisany (sygnatura `fmt|*`), więc nigdy nie liczył się jako istniejący wcześniej;
+- stop w preflight zostawiał checkout na pustej gałęzi `rustflow/<run>`.
+
+Teraz: `fmt_fix_scope = "changed"` formatuje tylko pliki `.rs` zmienione względem `$RUSTFLOW_BASE` (interaktywnie:
+HEAD) + nieśledzone; tryb `--check` daje jedną diagnostykę na plik (`fmt|<plik>|fmt|not rustfmt-formatted`), więc
+czerwona baza z samym fmt jest akceptowalna; stop w preflight cofa gałąź/worktree; `next_actions` dla bazy
+czerwonej tylko przez fmt podsuwa `cargo fmt --all` na bazie albo `--accept-red-baseline`.
+
+Drugi run na żywo (ta sama biblioteka, niesformatowana baza, `--accept-red-baseline`): approved, 6 nietkniętych
+plików bez zmian, ale dwa dotknięte pliki przeformatowane w całości - diff +712/-140 zamiast +240/-0
+na sformatowanej bazie. Po poprawce: +205/-0, samo zadanie. Dlatego `changed` pomija też pliki, które w bazie nie były sformatowane (sprawdzane przez
+sformatowanie wersji z bazy ze stdin i porównanie; `rustfmt --check` na stdin zawsze zwraca 0) - dotyczy bramek
+i hooka po edycji. Zasada „formatuj to, czego dotykasz” zostaje jako `fmt_fix_scope = "touched"`.

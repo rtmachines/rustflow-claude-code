@@ -185,6 +185,9 @@ deny = "auto"               # auto (gdy deny.toml + zmiana manifestów) | always
 clippy_args = ["-D", "warnings"]
 edit_check = true           # hook po edycji: cargo check
 edit_fmt = "file"           # hook po edycji: file (tylko edytowany plik, rustfmt) | all (cargo fmt --all) | off
+fmt_fix_scope = "changed"   # bramki bez --check i hook po edycji formatują: changed (pliki .rs zmienione względem
+                            # bazy runu / HEAD, które w bazie były sformatowane, i nowe) | touched (każdy zmieniony
+                            # plik w całości) | all (cargo fmt --all - w niesformatowanym repo cały workspace w diffie)
 stop_max_blocks = 3         # hook Stop: ile razy z rzędu może zablokować koniec tury
 tree_stable = true          # pełne bramki: zmiana plików źródłowych W TRAKCIE bramek (build.rs/test piszący
                             # do drzewa) = czerwone; Cargo.lock może się zmienić tylko bez --locked
