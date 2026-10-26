@@ -210,6 +210,13 @@ def next_actions(state: dict) -> list[dict]:
                 {"action": "ask_user", "question": "Gates stay red - fix manually, or retry with a stronger model "
                  "(--difficulty hard)?"}]
     if st == "baseline_red":
+        sigs = state.get("baseline_signatures") or []
+        if sigs and all(s.startswith("fmt|") and not s.endswith("|*") for s in sigs):
+            files = [s.split("|")[1] for s in sigs]
+            return [{"action": "ask_user", "question": (
+                f"The base is only not rustfmt-clean ({len(files)} file(s), e.g. {', '.join(files[:3])}). Commit "
+                "`cargo fmt --all` on the base first, or continue with --accept-red-baseline (rustflow then "
+                "formats only the files the change touches)?")}]
         return [{"action": "ask_user", "question": "The base branch is already red. Fix it first, or continue "
                  "with --accept-red-baseline (only new failures block)?"}]
     if st in ("budget", "interrupted", "crashed", "tree_changed", "agent_failed"):

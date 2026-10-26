@@ -39,6 +39,7 @@ DEFAULT_GATES = {
     "clippy_args": ["-D", "warnings"],
     "edit_check": True,
     "edit_fmt": "file",
+    "fmt_fix_scope": "changed",
     "stop_max_blocks": 3,
     "log_lines": 60,
     "cargo_dir": ".",
@@ -199,6 +200,36 @@ def load_gate_config(root: Path) -> dict:
         except (OSError, ValueError) as exc:  # TOMLDecodeError subclasses ValueError
             print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
     return cfg
+
+
+_FMT_DIFF = re.compile(r"^Diff in (.+?)(?::\d+:| at line \d+:)\s*$", re.M)
+
+
+def parse_fmt_check(out: str, root: Path) -> list[Diagnostic]:
+    """`cargo fmt -- --check` output -> one diagnostic per unformatted file (no line numbers, so the
+    failure has a stable signature that a red baseline can accept)."""
+    seen: dict[str, Diagnostic] = {}
+    for m in _FMT_DIFF.finditer(out):
+        p = Path(m.group(1).strip())
+        try:
+            rel = p.resolve().relative_to(root.resolve()).as_posix() if p.is_absolute() else p.as_posix()
+        except ValueError:
+            rel = p.as_posix()
+        seen.setdefault(rel, Diagnostic("error", "not rustfmt-formatted", code="fmt", file=rel,
+                                        rendered=f"{rel}: not rustfmt-formatted (run `cargo fmt`)"))
+    return list(seen.values())
+
+
+def changed_rust_files(root: Path, base: str) -> list[Path]:
+    """Existing .rs files that differ from `base` in the working tree, plus untracked ones."""
+    names: set[str] = set()
+    for args in (("diff", "--name-only", "--no-renames", base, "--", "*.rs"),
+                 ("ls-files", "--others", "--exclude-standard", "--", "*.rs")):
+        r = _git(root, *args)
+        if r.returncode == 0:
+            names.update(l.strip() for l in r.stdout.splitlines() if l.strip())
+    excluded = tuple(p + "/" for p in RUNTIME_PATHS)
+    return [root / n for n in sorted(names) if not n.startswith(excluded) and (root / n).is_file()]
 
 
 def crate_edition(path: Path, root: Path) -> str:
@@ -559,9 +590,24 @@ class GateRunner:
 
     # individual steps
     def fmt(self, fix: bool) -> Step:
+        if fix and self.cfg.get("fmt_fix_scope", "changed") == "changed":
+            return self.fmt_changed()
         argv = ["cargo", "fmt", "--all"] + ([] if fix else ["--", "--check", "--color", "never"])
         rc, out, err, dur = self._exec("fmt", argv)
-        return Step("fmt", rc == 0, argv, duration_s=dur, tail=self._tail(out + err) if rc else "")
+        diags = [] if fix or rc == 0 else parse_fmt_check(out, self.root)
+        return Step("fmt", rc == 0, argv, duration_s=dur, diagnostics=diags,
+                    tail=self._tail(out + err) if rc and not diags else "")
+
+    def fmt_changed(self) -> Step:
+        """Format only the .rs files this change touched (vs $RUSTFLOW_BASE, else HEAD; untracked
+        included). In a repo that is not rustfmt-clean, `cargo fmt --all` would put a reformat of every
+        file into the diff; check mode still reports the untouched ones, itemized per file."""
+        start = time.monotonic()
+        files = changed_rust_files(self.root, os.environ.get("RUSTFLOW_BASE") or "HEAD")
+        failed = [s for s in (self.fmt_file(f) for f in files) if not s.ok]
+        argv = ["rustfmt", "<changed files>", *[f.relative_to(self.root).as_posix() for f in files][:20]]
+        return Step("fmt", not failed, argv, duration_s=time.monotonic() - start,
+                    tail="\n".join(s.tail or s.reason for s in failed))
 
     def fmt_file(self, path: Path) -> Step:
         """rustfmt one file through stdin. Input on stdin has no path, so rustfmt does not descend into
