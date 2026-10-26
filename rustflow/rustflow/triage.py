@@ -124,9 +124,11 @@ def estimate_cost(repo: Path, routing: dict[str, str], difficulty: str | None = 
     """Cost estimate from this repo's own run history (Claude USD only; Codex reports tokens).
     Honest by design: without history it says so instead of inventing a number."""
     import json
+    from rustflow import usage
     runs_dir = repo / ".rustflow" / "runs"
     per_spec: dict[str, list[float]] = {}
     per_diff: dict[str, list[float]] = {}
+    legacy_runs = excluded_incomplete_runs = 0
     for st_file in runs_dir.glob("*/state.json"):
         try:
             st = json.loads(st_file.read_text(encoding="utf-8"))
@@ -134,13 +136,37 @@ def estimate_cost(repo: Path, routing: dict[str, str], difficulty: str | None = 
             continue
         if st.get("dry_run") or st.get("status") in ("running", "error", "baseline_red"):
             continue
-        per_diff.setdefault(st.get("difficulty", "?"), []).append(float(st.get("cost_usd") or 0))
+        summary = st.get("usage_summary")
+        legacy = summary is None or not summary.get("history_complete", False)
+        if legacy:
+            legacy_runs += 1
+        if summary is None:
+            measured = usage.number(st.get("cost_usd"))
+        else:
+            claude = summary.get("providers", {}).get("claude", {})
+            measured = claude.get("cost_usd", {}).get("total")
+            if legacy:
+                baseline = usage.number(st.get("usage_baseline", {}).get("cost_usd"))
+                cost = claude.get("cost_usd", {"known": 0, "missing_attempts": 0})
+                # Keep old history as explicitly limited data. Only add new costs
+                # when measured; a timeout/unknown must not become a legacy sample.
+                measured = (baseline + cost["known"] if baseline is not None and not cost["missing_attempts"]
+                            else None)
+        if measured is not None:
+            per_diff.setdefault(st.get("difficulty", "?"), []).append(float(measured))
+        else:
+            excluded_incomplete_runs += 1
         for a in st.get("agents", []):
-            if a.get("cost_usd"):
-                per_spec.setdefault(a.get("spec", "?"), []).append(float(a["cost_usd"]))
+            if not a.get("spec", "").startswith("claude:"):
+                continue
+            legacy_sample = legacy and "attempt_ids" not in a
+            cost = usage.number(a.get("cost_usd")) if legacy_sample else usage.number(a.get("measured_cost_usd"))
+            if cost is not None and (legacy_sample or a.get("attempt_ids")):
+                per_spec.setdefault(a.get("spec", "?"), []).append(float(cost))
     roles = {r: (sum(per_spec[s]) / len(per_spec[s]) if per_spec.get(s) else None) for r, s in routing.items()}
     hist = per_diff.get(difficulty or "", []) if difficulty else []
     out = {"runs_in_history": sum(len(v) for v in per_diff.values()), "per_call_usd": roles,
+           "legacy_runs": legacy_runs, "excluded_incomplete_runs": excluded_incomplete_runs,
            "same_difficulty": {"n": len(hist), "mean_usd": round(sum(hist) / len(hist), 2) if hist else None,
                                "max_usd": round(max(hist), 2) if hist else None}}
     if hist:
@@ -151,4 +177,8 @@ def estimate_cost(repo: Path, routing: dict[str, str], difficulty: str | None = 
         out["text"] = f"no past {difficulty} runs; per-call history: {known} (Claude only)"
     else:
         out["text"] = "no run history yet - cost unknown (see [budget].max_total_usd for the cap)"
+    if legacy_runs:
+        out["text"] += f"; {legacy_runs} legacy run(s): measurement completeness unknown"
+    if excluded_incomplete_runs:
+        out["text"] += f"; {excluded_incomplete_runs} run(s) excluded from totals: incomplete measurements"
     return out

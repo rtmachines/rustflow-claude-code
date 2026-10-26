@@ -67,10 +67,16 @@ def test_detached_run_lock_hooks_cancel_resume(rust_repo, monkeypatch):
     s = runs.wait(runs.find_run(rust_repo, rid), 0.5, out=lambda *_: None)
     assert s["status"] == "running" and runs.exit_code(s["status"]) == 75
     assert s["next_actions"][0]["action"] == "wait"
+    run_dir = runs.find_run(rust_repo, rid)
+    assert _wait_for(lambda: bool(list((run_dir / "attempts").glob("*.json"))))
     # cancel -> interrupted, lock released, resumable
     res = runs.cancel(rust_repo, runs.find_run(rust_repo, rid))
     assert res["status"] == "interrupted", res
     assert gates.read_active(rust_repo) is None
+    interrupted = {p.name: json.loads(p.read_text(encoding="utf-8")) for p in (run_dir / "attempts").glob("*.json")}
+    assert len(interrupted) == 1
+    assert all(a["measured_cost_usd"] is None and a["measurement_status"] == "unknown"
+               for a in interrupted.values())
     monkeypatch.delenv("FAKE_SLEEP")
     info2 = runs.spawn_detached(rust_repo, ["resume", rid], None, run_id=rid)
     assert info2["status"] in ("started", "finished_immediately"), info2
@@ -78,6 +84,14 @@ def test_detached_run_lock_hooks_cancel_resume(rust_repo, monkeypatch):
     assert s["status"] == "approved_with_advisories", s
     assert gates.read_active(rust_repo) is None
     assert any(a["action"] == "merge" and a.get("needs_user") for a in s["next_actions"])
+    attempts = [json.loads(p.read_text(encoding="utf-8")) for p in (run_dir / "attempts").glob("*.json")]
+    assert len(attempts) == 7  # interrupted implementer + implement/review x2/fix/review x2
+    assert s["usage_summary"]["attempt_count"] == 7 and s["cost_usd"] == 1
+    assert s["usage_summary"]["cost_usd"]["known"] == 1
+    for name, original in interrupted.items():
+        preserved = json.loads((run_dir / "attempts" / name).read_text(encoding="utf-8"))
+        assert preserved["attempt_id"] == original["attempt_id"] and preserved["status"] == "interrupted"
+    assert len({a["attempt_id"] for a in attempts}) == 7
 
 
 def test_cli_detach_and_wait_json(rust_repo, monkeypatch, capsys):

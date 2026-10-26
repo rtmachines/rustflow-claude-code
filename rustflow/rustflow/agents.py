@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
-from rustflow import procutil, schemas
+from rustflow import procutil, schemas, usage
 from rustflow.config import AgentSpec, Config, gates_command
 
 IS_WINDOWS = os.name == "nt"
@@ -48,6 +50,10 @@ class AgentCall:
     env: dict[str, str] = field(default_factory=dict)
     allowed_tools: list[str] | None = None   # overrides the provider's write/read tool set
     extra_skills: list[Path] = field(default_factory=list)  # always-on skills (SKILL.md paths)
+    logical_call_id: str = field(default_factory=lambda: uuid4().hex)
+    attempt_kind: str = "initial"
+    attempt_ids: list[str] = field(default_factory=list)
+    on_attempt: Callable[[dict], None] | None = None
 
 
 @dataclass
@@ -71,6 +77,11 @@ class AgentResult:
     num_turns: int = 0
     cost_estimated: bool = False      # cost_usd is the role's budget cap, not a reported cost (timeout)
     json_repair: bool = False         # structured output came from a follow-up turn in the same session
+    logical_call_id: str = ""
+    attempt_ids: list[str] = field(default_factory=list)
+    raw_usage: Any = None
+    measured_cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -221,6 +232,53 @@ class BaseRunner:
     def run(self, call: AgentCall) -> AgentResult:
         raise NotImplementedError
 
+    def _tracked_attempt(self, call: AgentCall,
+                         prepare: Callable[[AgentCall], Callable[[], AgentResult]]) -> AgentResult:
+        attempt_id = uuid4().hex
+        # Names may repeat after resume. Each attempt owns immutable artifact paths.
+        logged_call = replace(call, name=f"{call.name}-{attempt_id}")
+        # Resolve the CLI and prepare input artifacts first: configuration errors
+        # are not provider invocations and must not create unknown usage records.
+        invoke = prepare(logged_call)
+        call.attempt_ids.append(attempt_id)
+        record = {"schema_version": 1, "attempt_id": attempt_id, "logical_call_id": call.logical_call_id,
+                  "attempt_number": len(call.attempt_ids), "name": call.name, "role": call.role,
+                  "provider": call.spec.provider, "requested_model": call.spec.model, "spec": str(call.spec),
+                  "kind": call.attempt_kind, "status": "started", "started_at": usage.timestamp(),
+                  "finished_at": None, "duration_s": None, "estimated_cost_usd": None, "artifacts": {},
+                  **usage.normalize(self.provider, None, None)}
+        directory = call.log_dir.parent / "attempts"
+
+        def persist():
+            usage.write_attempt(directory, record)
+            if call.on_attempt:
+                call.on_attempt(record)
+
+        persist()
+        started = time.monotonic()
+        try:
+            res = invoke()
+            res.name, res.logical_call_id, res.attempt_ids = call.name, call.logical_call_id, [attempt_id]
+            record.update(status="succeeded" if res.ok else "timed_out" if "timeout" in res.error else "failed",
+                          duration_s=res.duration_s, error=res.error, estimated_cost_usd=res.estimated_cost_usd,
+                          **usage.normalize(self.provider, res.raw_usage, res.measured_cost_usd))
+            self._write(logged_call, "result.json", json.dumps(usage.json_safe(res.to_dict()), indent=2,
+                                                              ensure_ascii=False, allow_nan=False))
+            return res
+        except BaseException as exc:
+            record.update(status="interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed",
+                          error=f"{type(exc).__name__}: {exc}", duration_s=time.monotonic() - started)
+            raise
+        finally:
+            record["finished_at"] = usage.timestamp()
+            record["artifacts"] = {p.name[len(logged_call.name) + 1:]: p.relative_to(call.log_dir.parent).as_posix()
+                                   for p in call.log_dir.glob(f"{logged_call.name}.*") if p.is_file()}
+            persist()
+            # Keep the existing human-facing paths as latest-result views. The ledger
+            # always references the unique files above, so resume cannot overwrite evidence.
+            for suffix, path in record["artifacts"].items():
+                shutil.copyfile(call.log_dir.parent / path, call.log_dir / f"{call.name}.{suffix}")
+
     def _finish(self, call: AgentCall, res: AgentResult) -> AgentResult:
         if res.ok and call.schema is not None:
             try:
@@ -229,7 +287,7 @@ class BaseRunner:
             except schemas.SchemaError as exc:
                 res.ok = False
                 res.error = f"invalid structured output: {exc}"
-        self._write(call, "result.json", json.dumps(res.to_dict(), indent=2, ensure_ascii=False))
+        self._write(call, "result.json", json.dumps(usage.json_safe(res.to_dict()), indent=2, ensure_ascii=False))
         return res
 
 
@@ -294,30 +352,28 @@ class ClaudeRunner(BaseRunner):
         argv = self.build_argv(call)
         prompt = compose_prompt(call, self.pcfg.get("skill_invocation", "slash"),
                                 extras_inline=self.pcfg.get("extra_skills_via", "system") == "inline")
-        res = self._attempt(call, argv, prompt)
+        res = self._tracked_attempt(call, lambda c: self._prepare_attempt(c, argv, prompt))
         if (call.schema is not None and not res.ok and res.session_id and "structured" in res.error
                 and self.pcfg.get("repair_structured_output", True)):
             # One more turn in the SAME session with the SAME argv (tools, system prompt, schema): the
             # cached prefix holds, and a long write session is not redone just to get its JSON report.
-            rep = AgentCall(**{**call.__dict__, "name": f"{call.name}-json", "timeout_s": min(call.timeout_s, 600)})
-            fixed = self._attempt(rep, argv + ["--resume", res.session_id], JSON_REPAIR_PROMPT)
+            rep = replace(call, name=f"{call.name}-json", timeout_s=min(call.timeout_s, 600), attempt_kind="json_repair")
+            fixed = self._tracked_attempt(rep, lambda c: self._prepare_attempt(c, argv + ["--resume", res.session_id],
+                                                                             JSON_REPAIR_PROMPT))
             fixed.name, fixed.json_repair = call.name, True
-            fixed.cost_usd = round(res.cost_usd + fixed.cost_usd, 6)
-            fixed.duration_s += res.duration_s
-            fixed.permission_denials = res.permission_denials + fixed.permission_denials
-            fixed.num_turns += res.num_turns
-            for k, v in res.tokens.items():
-                if isinstance(v, (int, float)):
-                    fixed.tokens[k] = fixed.tokens.get(k, 0) + v
+            _merge_usage(res, fixed)
             if not fixed.ok:
                 fixed.error = f"{res.error} | JSON repair failed: {fixed.error}"
-            self._write(call, "result.json", json.dumps(fixed.to_dict(), indent=2, ensure_ascii=False))
+            self._write(call, "result.json", json.dumps(usage.json_safe(fixed.to_dict()), indent=2, ensure_ascii=False))
             res = fixed
         return res
 
-    def _attempt(self, call: AgentCall, argv: list[str], prompt: str) -> AgentResult:
+    def _prepare_attempt(self, call: AgentCall, argv: list[str], prompt: str) -> Callable[[], AgentResult]:
         self._write(call, "prompt.md", prompt)
         self._write(call, "argv.json", json.dumps(argv, indent=2))
+        return lambda: self._attempt(call, argv, prompt)
+
+    def _attempt(self, call: AgentCall, argv: list[str], prompt: str) -> AgentResult:
         env = {"RUSTFLOW_ROLE": call.role, **call.env}
         proc = procutil.run(argv, cwd=call.cwd, stdin_text=prompt, env=env, timeout_s=call.timeout_s,
                             isolate_session=True)
@@ -331,6 +387,7 @@ class ClaudeRunner(BaseRunner):
                 # A killed `claude -p` prints nothing, and even an interrupted one reports $0: book the
                 # role's cap so [budget].max_total_usd stays an upper bound instead of silently undercounting.
                 res.cost_usd, res.cost_estimated = float(call.max_budget_usd), True
+                res.estimated_cost_usd = res.cost_usd
             return self._finish(call, res)
         payload = _last_json_object(proc.stdout)
         if payload is None:
@@ -341,9 +398,11 @@ class ClaudeRunner(BaseRunner):
         if not model_matches(call.spec.model, res.observed_model):
             res.model_mismatch = f"requested {call.spec.model}, CLI reports {res.observed_model}"
         res.text = str(payload.get("result") or "")
-        res.cost_usd = float(payload.get("total_cost_usd") or 0.0)
+        res.measured_cost_usd = usage.number(payload.get("total_cost_usd"))
+        res.cost_usd = res.measured_cost_usd if res.measured_cost_usd is not None else 0.0
         res.session_id = str(payload.get("session_id") or "")
-        res.tokens = payload.get("usage") or {}
+        res.raw_usage = payload.get("usage")
+        res.tokens = usage.raw_tokens(res.raw_usage)
         res.data = payload.get("structured_output")
         res.permission_denials = denial_summary(payload.get("permission_denials"))
         res.num_turns = int(payload.get("num_turns") or 0)
@@ -383,6 +442,9 @@ class CodexRunner(BaseRunner):
         return argv
 
     def run(self, call: AgentCall) -> AgentResult:
+        return self._tracked_attempt(call, self._prepare_attempt)
+
+    def _prepare_attempt(self, call: AgentCall) -> Callable[[], AgentResult]:
         last_msg = call.log_dir / f"{call.name}.last.txt"
         schema_path = None
         if call.schema is not None:
@@ -391,6 +453,9 @@ class CodexRunner(BaseRunner):
         prompt = compose_prompt(call, self.pcfg.get("skill_invocation", "mention"), extras_inline=True)
         self._write(call, "prompt.md", prompt)
         self._write(call, "argv.json", json.dumps(argv, indent=2))
+        return lambda: self._attempt(call, argv, prompt, last_msg)
+
+    def _attempt(self, call: AgentCall, argv: list[str], prompt: str, last_msg: Path) -> AgentResult:
         env = {"RUSTFLOW_ROLE": call.role, **call.env}
         proc = procutil.run(argv, cwd=call.cwd, stdin_text=prompt, env=env, timeout_s=call.timeout_s,
                             isolate_session=True)
@@ -398,7 +463,7 @@ class CodexRunner(BaseRunner):
         if proc.stderr.strip():
             self._write(call, "stderr.log", proc.stderr)
         res = AgentResult(call.name, call.role, str(call.spec), ok=False, duration_s=proc.duration_s, argv=argv)
-        tokens: dict[str, int] = {}
+        raw_usage: list[Any] = []
         errors: list[str] = []
         for line in proc.stdout.splitlines():
             try:
@@ -411,9 +476,7 @@ class CodexRunner(BaseRunner):
             if etype == "thread.started":
                 res.session_id = str(ev.get("thread_id", ""))
             elif etype == "turn.completed":
-                for k, v in (ev.get("usage") or {}).items():
-                    if isinstance(v, int):
-                        tokens[k] = tokens.get(k, 0) + v
+                raw_usage.append(ev.get("usage"))
             elif etype in ("error", "turn.failed"):
                 errors.append(json.dumps(ev.get("error") or ev.get("message") or ev)[:500])
             item = ev.get("item")
@@ -422,7 +485,8 @@ class CodexRunner(BaseRunner):
                 res.observed_model = model
         if res.observed_model and not model_matches(call.spec.model, res.observed_model):
             res.model_mismatch = f"requested {call.spec.model}, CLI reports {res.observed_model}"
-        res.tokens = tokens
+        res.raw_usage = raw_usage
+        res.tokens = usage.raw_tokens(raw_usage)
         if proc.timed_out:
             res.error = f"timeout after {call.timeout_s:.0f}s"
             return self._finish(call, res)
@@ -524,5 +588,26 @@ def run_with_retry(runner: BaseRunner, call: AgentCall, retries: int = 1,
         attempt += 1
         time.sleep(5 * attempt)
         call.name = f"{call.name}-retry{attempt}"
+        call.attempt_kind = "retry"
+        previous = res
         res = runner.run(call)
+        _merge_usage(previous, res)
     return res
+
+
+def _merge_usage(previous: AgentResult, current: AgentResult) -> None:
+    """Only usage is additive; the last attempt still decides the logical outcome."""
+    current.cost_usd = round(previous.cost_usd + current.cost_usd, 6)
+    current.measured_cost_usd = (round(previous.measured_cost_usd + current.measured_cost_usd, 10)
+                                 if previous.measured_cost_usd is not None and current.measured_cost_usd is not None
+                                 else None)
+    if previous.estimated_cost_usd is not None or current.estimated_cost_usd is not None:
+        current.estimated_cost_usd = (previous.estimated_cost_usd or 0) + (current.estimated_cost_usd or 0)
+    current.cost_estimated = previous.cost_estimated or current.cost_estimated
+    current.duration_s += previous.duration_s
+    current.permission_denials = previous.permission_denials + current.permission_denials
+    current.num_turns += previous.num_turns
+    current.attempt_ids = previous.attempt_ids + current.attempt_ids
+    for key, value in previous.tokens.items():
+        if usage.number(value, integer=True) is not None:
+            current.tokens[key] = current.tokens.get(key, 0) + value

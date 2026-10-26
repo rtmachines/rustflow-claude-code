@@ -15,6 +15,8 @@ import shutil
 import sys
 import time
 import traceback
+import threading
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +24,7 @@ from typing import Any
 
 from rustflow import criteria as crit_mod
 from rustflow import findings as fnd
-from rustflow import gates, gitutil, procutil, prompts, report, runs, schemas, triage
+from rustflow import gates, gitutil, procutil, prompts, report, runs, schemas, triage, usage
 from rustflow.agents import AgentCall, AgentResult, make_runners, run_with_retry
 from rustflow.config import AgentSpec, Config, bump, gates_command, max_difficulty
 
@@ -75,6 +77,8 @@ class Orchestrator:
         prompts.GATES = gates_command(cfg)
         self.state: dict[str, Any] = {}
         self.run_dir: Path = Path()
+        self._state_lock = threading.RLock()
+        self._attempts: dict[str, dict] = {}
 
     # ── logging / state ──────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -88,13 +92,46 @@ class Orchestrator:
             pass
 
     def event(self, kind: str, **data: Any) -> None:
-        self.state.setdefault("events", []).append({"at": _now(), "kind": kind, **data})
+        with self._state_lock:
+            self.state.setdefault("events", []).append({"at": _now(), "kind": kind, **data})
 
     def save(self) -> None:
-        tmp = self.run_dir / "state.json.tmp"
-        tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.run_dir / "state.json")
-        runs.update_lock(self.repo, self.state)
+        with self._state_lock:
+            tmp = self.run_dir / "state.json.tmp"
+            tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.run_dir / "state.json")
+            runs.update_lock(self.repo, self.state)
+
+    def _prepare_usage(self, *, resume: bool = False) -> None:
+        with self._state_lock:
+            self.state.setdefault("usage_baseline", {"cost_usd": self.state.get("cost_usd", 0.0),
+                                                     "tokens": deepcopy(self.state.get("tokens", {})),
+                                                     "history_complete": False})
+            self._attempts = {r["attempt_id"]: r for r in usage.load_attempts(self.run_dir / "attempts",
+                                                                           interrupt_started=resume)}
+            self._refresh_usage()
+
+    def _refresh_usage(self) -> None:
+        """Recompute from the ledger, making replay after a crash/resume idempotent. Lock held by caller."""
+        baseline = self.state["usage_baseline"]
+        rows = list(self._attempts.values())
+        self.state["usage_summary"] = usage.summarize(rows, history_complete=baseline["history_complete"])
+        if not baseline["history_complete"]:
+            self.state["usage_summary"]["legacy_baseline"] = deepcopy(baseline)
+        self.state["cost_usd"] = round(baseline["cost_usd"] + sum(
+            (r.get("measured_cost_usd") or 0) + (r.get("estimated_cost_usd") or 0)
+            for r in rows if r["provider"] == "claude"), 4)
+        tokens = deepcopy(baseline["tokens"])
+        for row in rows:
+            for key, value in usage.raw_tokens(row["raw_usage"]).items():
+                tokens[key] = tokens.get(key, 0) + value
+        self.state["tokens"] = tokens
+
+    def _record_attempt(self, record: dict) -> None:
+        with self._state_lock:
+            self._attempts[record["attempt_id"]] = deepcopy(record)
+            self._refresh_usage()
+            self.save()
 
     @property
     def workdir(self) -> Path:
@@ -124,6 +161,7 @@ class Orchestrator:
             "cost_usd": 0.0, "tokens": {}, "status": "running", "dry_run": self.opts.dry_run,
             "options": self.opts.__dict__.copy(), "pid": os.getpid(),
             "criteria": [c.to_dict() for c in criteria], "mechanical": [], "seen_trees": [],
+            "usage_baseline": {"cost_usd": 0.0, "tokens": {}, "history_complete": True},
         }
         try:
             runs.acquire(self.repo, self.state)
@@ -132,6 +170,7 @@ class Orchestrator:
             return 2
         (self.run_dir / "task.md").write_text(task, encoding="utf-8")
         (self.repo / RUNS_DIR / "LATEST").write_text(run_id, encoding="utf-8")
+        self._prepare_usage()
         self.save()
         self.log(f"run {run_id}  ({self.run_dir.relative_to(self.repo).as_posix()})")
         return self.loop()
@@ -175,6 +214,7 @@ class Orchestrator:
             return 2
         try:
             # A failed previous resume may already have re-created this checkout.
+            self._prepare_usage(resume=True)
             if self.state.get("isolation") == "worktree":
                 self.state["worktree_removed"] = False
             try:
@@ -327,8 +367,11 @@ class Orchestrator:
                    schema: dict | None, skill: str | None, retry: bool = True,
                    tools: list[str] | None = None) -> AgentResult:
         budget_total = float(self.cfg.get("budget.max_total_usd", 0) or 0)
-        if budget_total and self.state["cost_usd"] >= budget_total:
-            raise Abort("budget", f"total budget ${budget_total:.2f} exhausted")
+        with self._state_lock:
+            if "usage_baseline" not in self.state:
+                self._prepare_usage()
+            if budget_total and self.state["cost_usd"] >= budget_total:
+                raise Abort("budget", f"total budget ${budget_total:.2f} exhausted")
         self.cfg.check_spec(spec, f"{role}")
         cfg_role = "auditor" if role in ("auditor", "tob_audit") else role
         call = AgentCall(
@@ -337,6 +380,7 @@ class Orchestrator:
             timeout_s=float(self.cfg.role_opt(cfg_role, "timeout_min", 30)) * 60,
             max_budget_usd=self.cfg.role_opt(cfg_role, "max_budget_usd") if spec.provider == "claude" else None,
             env=self._agent_env(), allowed_tools=tools, extra_skills=self._extra_skills(role, spec.provider),
+            on_attempt=self._record_attempt,
         )
         self.log(f"> {name}: {spec}{'  [write]' if write else ''}")
         runner = self.runners[spec.provider]
@@ -345,10 +389,6 @@ class Orchestrator:
         before = self.snapshot() if write and retry and not self.opts.dry_run else None
         res = run_with_retry(runner, call, retries=1 if retry else 0,
                              may_retry=(lambda: self.snapshot() == before) if before is not None else None)
-        self.state["cost_usd"] = round(self.state["cost_usd"] + res.cost_usd, 4)
-        for k, v in (res.tokens or {}).items():
-            if isinstance(v, (int, float)):
-                self.state["tokens"][k] = self.state["tokens"].get(k, 0) + v
         if res.model_mismatch:
             self.log(f"WARNING {name}: {res.model_mismatch} (model fallback/reroute?)")
             self.event("model_mismatch", agent=name, detail=res.model_mismatch)
@@ -357,10 +397,12 @@ class Orchestrator:
             self.log(f"WARNING {name}: {len(res.permission_denials)} denied tool call(s), e.g. "
                      + ", ".join(res.permission_denials[:3]))
         if res.cost_estimated:
-            self.log(f"WARNING {name}: no cost reported (timeout) - booked the role cap ${res.cost_usd:.2f}")
-        self.state["agents"].append({k: v for k, v in res.to_dict().items() if k not in ("data", "text", "argv")})
-        self.state["agents"][-1]["skills"] = [skill] if skill else []
-        self.state["agents"][-1]["skills"] += [p.parent.name for p in call.extra_skills]
+            self.log(f"WARNING {name}: no cost reported (timeout) - booked the role cap ${res.estimated_cost_usd:.2f}")
+        entry = {k: v for k, v in res.to_dict().items() if k not in ("data", "text", "argv", "raw_usage")}
+        entry["skills"] = ([skill] if skill else []) + [p.parent.name for p in call.extra_skills]
+        with self._state_lock:
+            self.state["agents"].append(entry)
+            self.save()
         cost = f" ${res.cost_usd:.2f}" if res.cost_usd else ""
         self.log(f"< {name}: {'ok' if res.ok else 'FAILED: ' + res.error[:300]} ({res.duration_s:.0f}s{cost})")
         return res

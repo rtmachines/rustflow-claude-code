@@ -47,7 +47,48 @@ rustflow init --stack axum-sqlx                           # skill stacku Axum/SQ
 
 Wynik runu: `.rustflow/runs/<id>/report.md` (status, routing, koszty, findingi z każdej rundy,
 sporne punkty do decyzji, ESCALATE, komendy merge), plus `state.json`, prompty, argv i surowe
-wyjścia każdego agenta w `agents/`, wyniki bramek w `gates/`.
+wyjścia każdego agenta w `agents/`, wyniki bramek w `gates/` oraz rejestr prób w `attempts/`.
+
+### Koszty i próby agentów
+
+Jedno wywołanie logiczne (np. recenzja) pozostaje jednym wpisem `agents` w stanie runu.
+Każde uruchomienie CLI providera ma osobny rekord `attempts/<id>.json`: `initial`, `retry`
+lub `json_repair`. Rekord powstaje atomowo przed wywołaniem i otrzymuje wynik po zakończeniu;
+zawiera identyfikator wywołania logicznego, rolę, żądany model, czas, surowe usage,
+znormalizowane tokeny, pomiar kosztu, osobną estymację i ścieżki artefaktów.
+Wpis `agents` odsyła do tych rekordów przez `attempt_ids`. Wynik merytoryczny pochodzi
+z ostatniej próby; czas, koszty i tokeny obejmują wszystkie próby, także nieudane.
+
+`cost_usd` zachowuje dotychczasowe znaczenie kwoty księgowanej do budżetu Claude:
+znane koszty **wszystkich** prób Claude plus limit roli zastosowany po timeout.
+To nie zawsze całkowity zmierzony koszt. Codex obecnie raportuje tokeny bez pomiaru USD.
+Budżet nadal jest sprawdzany przed wywołaniem logicznym; retry i naprawa JSON nie otrzymują
+nowego limitu ani rezerwacji budżetu.
+
+`usage_summary` (wersja `schema_version = 1`) w stanie, JSON CLI i MCP podaje liczbę prób,
+kompletność pomiarów i agregaty per provider. `cost_usd.known` jest znaną częścią pomiarów,
+`cost_usd.total` jest `null`, jeżeli brakuje choć jednego kosztu albo kompletność historii
+jest nieznana; `missing_attempts` liczy brakujące pomiary w zarejestrowanych próbach.
+`estimated_cost_usd` obejmuje wyłącznie estymacje timeoutów. Zestawienia tokenów stosują
+te same pola `known`, `total`, `missing_attempts`. Pomiary `complete` mają koszt i wszystkie
+liczniki danego providera; `partial` mają część danych, a `unknown` nie mają pomiaru.
+Jawne zero jest pomiarem; brak, błędny typ, liczba ujemna, NaN i nieskończoność nim nie są.
+Cache Codex mieści się w `input_tokens`; Claude ma oddzielne liczniki wejścia z cache,
+które wchodzą do sumy tokenów. Brak licznika cache Claude oznacza niepełną sumę tokenów.
+Dotychczasowe `tokens` pozostają dostępne; do porównań providerów używaj `usage_summary`.
+
+Pełny raport pokazuje poszczególne próby, pomiary i estymacje. Brief oraz MCP status/JSON
+pokazują agregaty. Przy resume zakończone próby zachowują swoje identyfikatory i artefakty;
+niezakończone próby poprzedniego procesu stają się `interrupted` z nieznanym pomiarem.
+Sam rejestr nie odtwarza wywołań; o dalszej pracy decyduje istniejący mechanizm resume.
+Stare runy można czytać bez migracji; przy wznowieniu ich kwoty i tokeny są zachowane
+w `usage_baseline`, a kompletność historii pozostaje nieznana. Dry-run nie tworzy prób providera.
+W `agents/` dotychczasowe nazwy plików nadal pokazują ostatni wynik; rejestr wskazuje
+unikalne pliki z identyfikatorem próby, których kolejne wywołanie nie nadpisuje.
+
+Estymator `triage` dla nowych runów używa tylko kompletnych **pomiarów kosztu Claude**,
+uwzględnia też jawne zero. Pomija nieznane koszty i estymacje timeoutów. Starsza historia
+pozostaje dostępna z oznaczeniem nieznanej kompletności danych.
 
 Statusy: `approved`, `approved_with_advisories`, `max_rounds`, `stalled`, `gates_red`,
 `final_gates_red`, `criteria_unmet`, `baseline_red`, `changes_requested` (review bez `--fix`), `budget`,
@@ -261,14 +302,29 @@ Szczegóły i pomiary: [docs/DESIGN.md](docs/DESIGN.md#7-optymalizatory-wyjścia
 ## Testy
 
 ```bash
-pip install -e ".[test]" && pytest      # 157 testów: jednostkowe, hooki jako procesy, e2e na prawdziwym cargo
+cd rustflow
+pip install -e ".[dev]"
+pytest
+ruff check .
 ```
 
-E2E używają atrap `claude`/`codex` (`tests/fake_agents/`), ale prawdziwego `git` i `cargo`.
+Wszystkie testy używają atrap `claude`/`codex` (`tests/fake_agents/`) lub kontrolowanych
+odpowiedzi procesów. E2E uruchamiają prawdziwy `git` i `cargo`, bez płatnych sesji agentów.
+Workflow w głównym [`.github/workflows/test.yml`](../.github/workflows/test.yml) testuje
+Ubuntu/Windows × Python 3.11/3.13. Buduje wheel, instaluje go razem z pytest i uruchamia
+cały zestaw z katalogu tymczasowego bez odziedziczonego `PYTHONPATH`, w tym detached,
+start/wait/cancel/resume i MCP. Sprawdza CLI, zasoby szablonów i obecność narzędzi Rust.
+Ruff blokuje tylko `E9,F63,F7,F82`; jest zależnością deweloperską. Lokalny raport reviewdog
+można otrzymać z katalogu głównego repozytorium:
+
+```bash
+set -o pipefail
+rtk bypass ruff check rustflow --output-format=rdjson | reviewdog -f=rdjson -reporter=local -filter-mode=nofilter -fail-level=warning
+```
+
 Dodatkowo zweryfikowane na żywo z Claude Code 2.1.310 (haiku): dwa pełne `run` (implement → hooki → review → approve),
 `review` (raport) i `review --fix` (4 blokujące → fix z resolutions per ID → re-review przyrostowa → approve).
 Kod przeszedł też niezależny przegląd (19 uwag, m.in. Windows: kodowanie stdin hooków, ubijanie drzew procesów,
 Ctrl+C przy równoległych recenzentach) - wszystkie naniesione i pokryte testami regresyjnymi.
 Codex 0.164: argv zaakceptowany (`thread.started`), wywołanie modelu niezweryfikowane (brak sieci do OpenAI
-w środowisku testowym). Windows: zaprojektowane i obsłużone w kodzie, ale nie uruchomione - workflow CI
-`.github/workflows/test.yml` odpala testy na `windows-latest`.
+w środowisku testowym). Aktualny wynik sprawdzenia obu systemów jest dostępny w GitHub Actions.

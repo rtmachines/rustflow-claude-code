@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from rustflow import gates
+from rustflow import gates, usage
 
 RUNS = Path(".rustflow") / "runs"
 APPROVED = ("approved", "approved_with_advisories")
@@ -279,6 +279,7 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
     return {
         "run_id": state.get("run_id"), "status": st, "phase": state.get("phase"), "round": state.get("round"),
         "difficulty": state.get("difficulty"), "cost_usd": state.get("cost_usd", 0.0),
+        "usage_summary": usage.summary_for_state(state),
         "isolation": state.get("isolation"), "branch": state.get("branch"), "workdir": state.get("workdir"),
         "blocking": [brief(f) for f in fs if f.get("status") == "open"][:findings_limit],
         "disputed": [brief(f) for f in fs if f.get("status") == "disputed"][:findings_limit],
@@ -294,7 +295,8 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
 def brief_markdown(s: dict, mcp: bool = False) -> str:
     """Compact run summary for a model. mcp=True: next steps as MCP tool calls instead of CLI commands."""
     lines = [f"rustflow {s['run_id']}: **{s['status']}** (phase {s['phase']}, round {s['round']}, "
-             f"{s['difficulty']}, ${s['cost_usd']:.2f})"]
+             f"{s['difficulty']}, booked ${s['cost_usd']:.2f})"]
+    lines.append(usage.brief(s.get("usage_summary") or usage.summarize([], history_complete=False)))
     if s.get("branch"):
         lines.append(f"branch: {s['branch']} ({s['isolation']})")
     if s.get("final_gates"):
