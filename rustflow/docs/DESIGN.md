@@ -330,3 +330,18 @@ na argv implementera (Claude Code 2.1.308, haiku) pokazał, że przyczyną nie j
 Claude Code sprawdza każdą część łańcucha osobno, więc `&&` działa, gdy każda komenda ma regułę. Role piszące nie
 miały żadnej komendy tylko do odczytu. Reguły dokłada kod (nie szablon), bo `allowed_tools_write` z `rustflow.toml`
 istniejących projektów nie jest nadpisywane przez `init`; `rtk read` dostaje bliźniaka `cat`.
+
+### Dyspozytor przez MCP (zmierzone)
+
+Run na żywo z haiku jako dyspozytorem (Claude Code 2.1.308, `claude -p` w repo z `rustflow init --with-mcp`):
+- **Model widzi `structuredContent`, nie tekst `content`.** Brief w `content` jest dla innych klientów MCP;
+  wszystko, co dyspozytor musi przeczytać, musi być w części strukturalnej. Wcześniej `rustflow_report format=full`
+  oddawał w `structuredContent` samo podsumowanie, więc raport nigdy nie docierał do modelu - teraz jest tam
+  (`report`), z tym samym limitem rozmiaru.
+- Kroki `next_actions` mają pole `mcp` (`{tool, arguments}`); `rustflow_wait` do 1800 s - dyspozytor czekał jednym
+  wywołaniem (`timeout_s: 1800`) zamiast kilku.
+- Odpowiedzi trzymają się poniżej 40k znaków (Claude Code ostrzega od 10k tokenów, tnie na 25k, a tekst powyżej
+  50k znaków zapisuje do pliku): zwięzłe findingi w `format=json`, przycięcie z informacją, jak dostać resztę.
+- W katalogu bez zaakceptowanego dialogu zaufania Claude Code pomija `permissions.allow` z `.claude/settings.json`
+  (komunikat na stderr), więc `mcp__rustflow` jest odrzucane w `-p`. W prawdziwym repo wystarczy raz otworzyć
+  Claude Code interaktywnie i zaakceptować zaufanie.

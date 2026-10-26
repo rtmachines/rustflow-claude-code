@@ -41,15 +41,16 @@ rustflow then requires that exact test to run and pass - a reviewer's "met" is n
 - One run per repo: if a run is active, wait for it or ask the user before `rustflow cancel`.
 
 ## 4. Wait correctly
-- MCP: `mcp__rustflow__rustflow_wait {run, timeout_s: 240..540}`; CLI: `rustflow wait <run_id> --timeout 540`
-  (stays under the 10-minute Bash limit). Exit code / status: 0 approved, 2 finished not approved,
+- MCP: `mcp__rustflow__rustflow_wait {run, timeout_s: 600..1800}` (an MCP call has no 10-minute limit; fewer
+  waits = fewer turns); CLI: `rustflow wait <run_id> --timeout 540` (stays under the 10-minute Bash limit). Exit code / status: 0 approved, 2 finished not approved,
   3 crashed, **75 still running -> call wait again**.
 - While it runs: no edits and no git commands in the run's checkout (hooks will deny them anyway).
   Answer the user, plan, read code - fine.
 - Read `rustflow status` / `mcp__rustflow__rustflow_status` (brief) first; open the full report only if needed.
 
 ## 5. Act on the outcome - follow `next_actions`
-Each summary ends with `next_actions`. Do the ones without `needs_user`; for `ask_user` and
+Each summary ends with `next_actions`. On MCP, call the step's `mcp` (`{tool, arguments}`) - the MCP answers
+already show it - instead of translating the CLI `command`. Do the ones without `needs_user`; for `ask_user` and
 `needs_user` items ask the user with the given question/command. Typical outcomes:
 - `approved` / `approved_with_advisories` -> summarize: what changed, tests, cost, branch, advisories;
   offer merge (`git merge --squash`, user decides), PR comment (`rustflow comment`), and the soundness
