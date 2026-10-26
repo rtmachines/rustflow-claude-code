@@ -231,6 +231,10 @@ def main():
     if SCENARIO == "reviewers_down" and ROLE in ("reviewer_a", "reviewer_b"):
         return overloaded()
     gate_fix = "gates are RED" in prompt
+    if SCENARIO == "json_always" and ROLE == "reviewer_a":  # structured output never validates, repair included
+        print(json.dumps({"type": "result", "subtype": "error_max_structured_output_retries", "is_error": True,
+                          "total_cost_usd": 0.1, "session_id": "sess-rev", "usage": {}}))
+        return 1
     if ROLE == "fixer" and "--resume" in ARGS:  # structured-output repair turn: answer only, touch nothing
         assert ARGS[ARGS.index("--resume") + 1] == "sess-fix" and "--json-schema" in ARGS
         data = {"summary": "repaired", "resolutions": [{"id": "F1", "status": "fixed", "note": "trim + test"}],

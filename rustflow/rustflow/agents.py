@@ -498,10 +498,11 @@ def run_with_retry(runner: BaseRunner, call: AgentCall, retries: int = 1,
                    may_retry: Callable[[], bool] | None = None) -> AgentResult:
     """Retry once on infrastructure failures (no output, crash, invalid structured output); never on
     timeouts, budget stops or permanent errors (auth, unknown model, CLI flag the installed version lacks).
-    may_retry: extra condition checked after a failure (write roles: only if the tree is unchanged)."""
+    may_retry: extra condition checked after a failure (write roles: only if the tree is unchanged).
+    A failed structured-output repair is not retried again: the repair turn already was the retry."""
     res = runner.run(call)
     attempt = 0
-    while (not res.ok and attempt < retries and res.retryable and "timeout" not in res.error
+    while (not res.ok and attempt < retries and res.retryable and not res.json_repair and "timeout" not in res.error
            and "max_budget" not in res.error and "error_max_budget" not in res.error
            and "error_max_turns" not in res.error and (may_retry is None or may_retry())):
         attempt += 1

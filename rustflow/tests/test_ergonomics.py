@@ -261,3 +261,21 @@ def test_rereview_inlines_the_delta_not_the_whole_diff(rust_repo, monkeypatch, t
     assert "## DIFF\n\n```diff" in r1
     assert "## DIFF\n\n```diff" not in r2 and "## DELTA SINCE PREVIOUS REVIEW" in r2
     assert "```diff" in r2.split("## DELTA SINCE PREVIOUS REVIEW")[1].split("## DIFF")[0]
+
+
+def test_failed_json_repair_is_not_retried_a_second_time(tmp_path, fake_bin, monkeypatch):
+    """Repair IS the retry for a structured-output failure: no full rerun (+ another repair) on top of it."""
+    d = load_defaults()
+    d["providers"]["claude"]["bin"] = str(fake_bin / "claude.py")
+    log = tmp_path / "fake.log"
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("FAKE_SCENARIO", "json_always")
+    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    from rustflow import schemas
+    call = agents.AgentCall("reviewer_a", "r1-reviewer_a", AgentSpec.parse("claude:opus:high"), "p", False,
+                            schemas.REVIEW_SCHEMA, tmp_path, tmp_path / "logs")
+    res = agents.run_with_retry(agents.ClaudeRunner(Config(d)), call, retries=1)
+    calls = [json.loads(l) for l in log.read_text().splitlines()]
+    assert len(calls) == 2 and "--resume" in calls[1]["argv"]
+    assert not res.ok and res.json_repair and "JSON repair failed" in res.error
+    assert res.cost_usd == pytest.approx(0.2)
