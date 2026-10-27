@@ -745,3 +745,32 @@ def test_reviewer_diff_shows_text_despite_attributes(repo):
     git(repo, "add", "-A")
     out = gitutil.diff(repo, "HEAD", gates.tree_fingerprint(repo))
     assert "pub fn changed" in out and "Binary files" not in out
+
+
+# ── I1: the tests-removed digest covers how many tests were removed ─────────
+def test_tests_removed_digest_changes_with_more_removals(repo):
+    write(repo, "src/lib.rs", "pub fn a() {}\n\n#[test]\nfn t() {}\n#[test]\nfn t2() {}\n#[test]\nfn t3() {}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "three tests")
+    write(repo, "src/lib.rs", "pub fn a() {}\n\n#[test]\nfn t() {}\nfn t2() {}\n#[test]\nfn t3() {}\n")
+    one = only(run(repo))
+    assert run(repo) == [one]                       # stable for the same change
+    write(repo, "src/lib.rs", "pub fn a() {}\n\nfn t() {}\nfn t2() {}\nfn t3() {}\n")
+    two = only(run(repo))
+    assert (one.id, one.kind) == (two.id, two.kind) and one.digest != two.digest
+
+
+def test_tests_removed_votes_reset_by_more_removals(repo):
+    write(repo, "src/lib.rs", "pub fn a() {}\n\n#[test]\nfn t() {}\n#[test]\nfn t2() {}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "two tests")
+    write(repo, "src/lib.rs", "pub fn a() {}\n\n#[test]\nfn t() {}\nfn t2() {}\n")
+    entries = integrity.reconcile([], run(repo))
+    for r in integrity.REVIEWERS:
+        integrity.apply_votes(entries, r, [{"id": entries[0]["id"], "decision": "accept"}])
+    integrity.decide(entries)
+    assert entries[0]["accepted_by"] == "reviewers"
+    write(repo, "src/lib.rs", "pub fn a() {}\n\nfn t() {}\nfn t2() {}\n")
+    entries = integrity.reconcile(entries, run(repo))
+    integrity.decide(entries)
+    assert entries[0]["status"] == "pending" and entries[0]["votes"] == {}

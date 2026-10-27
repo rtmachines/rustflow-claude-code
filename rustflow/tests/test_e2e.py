@@ -406,3 +406,29 @@ def test_resume_after_manual_revert_of_gate_change(rust_repo, monkeypatch):
     assert rc == 0 and st["gate_changes"] == []
     # the stale G-finding must not reach the fixer: the resume re-gates and re-reviews
     assert sum(1 for c in read_log(rust_repo) if c["role"] == "fixer") == fixers_before
+
+
+def _commit_old_tests(repo):
+    (repo / "tests").mkdir(exist_ok=True)
+    for n in ("old_a", "old_b"):
+        body = "".join(f"#[test]\nfn {n}_{i}() {{}}\n" for i in range(3))   # more than the run adds back
+        (repo / "tests" / f"{n}.rs").write_text(body, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "old tests")
+
+
+def test_tests_removed_both_accept(rust_repo, monkeypatch):
+    _commit_old_tests(rust_repo)
+    rc, st = run(rust_repo, "tests_removed_accept", monkeypatch, difficulty="easy")
+    assert st["status"] == "approved_with_advisories", st.get("stop_reason")
+    e = st["gate_changes"][0]
+    assert (e["kind"], e["status"], e["accepted_by"]) == ("tests-removed", "accepted", "reviewers")
+
+
+def test_more_removals_after_consent_reset_the_votes(rust_repo, monkeypatch):
+    _commit_old_tests(rust_repo)
+    rc, st = run(rust_repo, "tests_removed_more", monkeypatch, difficulty="easy")
+    assert st["status"] == "gate_changes_pending" and rc == 2, st.get("stop_reason")
+    e = st["gate_changes"][0]
+    assert e["kind"] == "tests-removed" and e["accepted_by"] == "" and e["status"] == "pending"
+    assert "old_b.rs" in e["detail"]

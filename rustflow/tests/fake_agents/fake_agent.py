@@ -80,7 +80,8 @@ mod tests {
 
 
 LINTS_SCENARIOS = ("lints_both_accept", "lints_one_reject", "lints_degraded")
-GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change") + LINTS_SCENARIOS
+TR_SCENARIOS = ("tests_removed_accept", "tests_removed_more")   # the base holds tests/old_a.rs (+ old_b.rs)
+GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change") + LINTS_SCENARIOS + TR_SCENARIOS
 CAP_LINTS = '[build]\nrustflags = ["--cap-lints", "allow"]\n'
 NEEDLESS_RETURN = "\npub fn answer() -> i32 {\n    return 1;\n}\n"
 MANY_ARGS = ("\npub fn many(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32) -> i32 {\n"
@@ -142,6 +143,8 @@ def review(prompt):
     if SCENARIO in LINTS_SCENARIOS:
         reject = SCENARIO == "lints_one_reject" and ROLE == "reviewer_b"
         votes = [{"id": g, "decision": "reject" if reject else "accept", "reason": "vote"} for g in gate_ids(prompt)]
+    if SCENARIO in TR_SCENARIOS and not (SCENARIO == "tests_removed_more" and earlier_calls(ROLE) > 0):  # consent in the first review only
+        votes = [{"id": g, "decision": "accept", "reason": "obsolete test"} for g in gate_ids(prompt)]
     return {"summary": f"{ROLE} review", "verdict": verdict, "gate_changes": votes, "findings": findings, "disputes": disputes,
             "acceptance": [{"criterion": "trim whitespace",
                             "status": "met" if fixed or SCENARIO == "dispute" else "not_met", "note": ""}],
@@ -205,6 +208,11 @@ def act(prompt):
             return {"summary": "implemented parse_kv; relaxed needless_return as the task requires",
                     "files_changed": ["src/lib.rs", "Cargo.toml"], "tests_added": ["parses_pairs"],
                     "gates_green": True, "notes": ""}
+        if SCENARIO in TR_SCENARIOS:  # an obsolete integration test is deleted along with the implementation
+            lib().write_text(BUGGY)
+            Path("tests/old_a.rs").unlink()
+            return {"summary": "implemented parse_kv; removed the obsolete test old_a", "files_changed": ["src/lib.rs"],
+                    "tests_added": ["parses_pairs"], "gates_green": True, "notes": ""}
         if SCENARIO == "digest_change":  # a harmless clippy.toml now, a hiding one after the fixer
             lib().write_text(BUGGY)
             Path("clippy.toml").write_text("# nothing configured\n")
@@ -219,7 +227,7 @@ def act(prompt):
                 return {"summary": "nothing changed", "resolutions": [], "tests_added": []}
             lib().write_text(BUGGY)
             return {"summary": "removed needless return / collect", "resolutions": [], "tests_added": []}
-        if SCENARIO in ("weaken", "weaken_revert", "digest_change") + LINTS_SCENARIOS and gate_ids(prompt):
+        if SCENARIO in ("weaken", "weaken_revert", "digest_change", "tests_removed_more") + LINTS_SCENARIOS and gate_ids(prompt):
             if SCENARIO == "weaken_revert":
                 Path(".cargo/config.toml").unlink()
                 lib().write_text(FIXED)
@@ -250,6 +258,8 @@ def act(prompt):
             return {"summary": "could not fix", "resolutions": [{"id": "F1", "status": "partial", "note": "tried"}],
                     "tests_added": []}
         lib().write_text(with_unsafe(FIXED) if SCENARIO == "escalate" else FIXED)
+        if SCENARIO == "tests_removed_more":  # more tests of an already voted file go away after the consent
+            Path("tests/old_b.rs").unlink(missing_ok=True)
         return {"summary": "trimmed", "resolutions": [{"id": "F1", "status": "fixed", "note": "trim + test"}],
                 "tests_added": ["trims_whitespace"]}
     if ROLE in ("reviewer_a", "reviewer_b", "auditor"):

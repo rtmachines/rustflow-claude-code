@@ -198,10 +198,11 @@ HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
 
 
 def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None,
-                   all_added: dict[str, set[int]] | None = None) -> tuple[dict[str, list[str]], dict[str, int]]:
+                   all_added: dict[str, set[int]] | None = None,
+                   removed_lines: dict[str, list[str]] | None = None) -> tuple[dict[str, list[str]], dict[str, int]]:
     """Added silencing attributes per file and net removed test attributes per file (comment lines ignored).
     When `positions` is given it receives, per file, the head line numbers (1-based) of the added silencing lines;
-    `all_added` receives every added head line number per file."""
+    `all_added` receives every added head line number per file; `removed_lines` the removed test-attribute lines per file."""
     silence: dict[str, list[str]] = {}
     removed: dict[str, int] = {}
     path, in_header, new_no = None, False, 0
@@ -239,6 +240,8 @@ def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None,
                     positions.setdefault(path, []).append(here)
             if TEST_RE.search(body):
                 removed[path] = removed.get(path, 0) + (1 if line[0] == "-" else -1)
+                if line[0] == "-" and removed_lines is not None:
+                    removed_lines.setdefault(path, []).append(body)
     return silence, removed
 
 
@@ -288,13 +291,16 @@ def _scan(root: Path, base_rev: str, head_tree: str, cfg: dict) -> list[GateChan
     d = _diff_u0(root, base_rev, head_tree)
     if d.returncode != 0:
         return out + [_unknown("*.rs", (d.stderr or "").strip() or "git diff -U0 failed")]
-    silence, removed = _parse_rs_diff(d.stdout)
+    removed_lines: dict[str, list[str]] = {}
+    silence, removed = _parse_rs_diff(d.stdout, removed_lines=removed_lines)
     for path, lines in silence.items():
         if not _is_runtime(path):
             out.append(_change("silence", path, "added: " + "; ".join(lines), _sha("\n".join(sorted(lines)))))
     files = sorted(p for p, n in removed.items() if n > 0 and not _is_runtime(p))
     if sum(n for p, n in removed.items() if not _is_runtime(p)) > 0:
-        out.append(_change("tests-removed", "*", "test attributes removed in: " + ", ".join(files), _sha("\n".join(files))))
+        # the digest covers how many tests went from which file: more removals later = another change = new consent
+        digest = _sha("\n".join(f"{p}\t{removed[p]}\t" + "\t".join(sorted(removed_lines.get(p, []))) for p in files))
+        out.append(_change("tests-removed", "*", "test attributes removed in: " + ", ".join(files), digest))
     return out
 
 
