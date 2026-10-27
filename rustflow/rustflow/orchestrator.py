@@ -17,6 +17,7 @@ import sys
 import time
 import traceback
 import threading
+from collections import Counter
 from copy import deepcopy
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
@@ -273,6 +274,12 @@ class Orchestrator:
                 return 2
             self.state.pop("termination_reason", None)
             self.state.pop("output_complete", None)
+            if "gates_cfg" not in self.state and self.state.get("base_sha"):
+                try:
+                    self._gate_cfg()
+                except gates.GateConfigError as exc:
+                    self.log(f"refusing to resume: cannot read the gate configuration from the base commit ({exc})")
+                    return 2
             if self.state.get("isolation") == "worktree":
                 self.state["worktree_removed"] = False
             try:
@@ -545,6 +552,15 @@ class Orchestrator:
     def spec(self, role: str, difficulty: str | None = None) -> AgentSpec:
         return self.cfg.spec_for(role, difficulty or self.state["difficulty"])
 
+    def _gate_cfg(self) -> dict:
+        """Gate configuration frozen from the base commit (never the work tree the agents edit)."""
+        if "gates_cfg" not in self.state:
+            self.state["gates_cfg"] = gates.load_gate_config_at(self.repo, self.state["base_sha"])
+        cfg = dict(self.state["gates_cfg"])
+        cfg["max_output_bytes"] = (self.budget.limits["max_output_bytes"] if self.budget
+                                   else self.cfg.get("process.max_output_bytes", 16777216))
+        return cfg
+
     def run_gates(self, label: str, *, strict: bool = False, fix_fmt: bool | None = None,
                   use_cache: bool = True) -> gates.GateResult:
         self._check_budget()
@@ -557,8 +573,7 @@ class Orchestrator:
             overrides["CARGO_TARGET_DIR"] = self.state["cargo_target_dir"]
         saved = {k: os.environ.get(k) for k in overrides}
         os.environ.update(overrides)
-        gate_cfg = gates.load_gate_config(self.workdir)
-        gate_cfg["max_output_bytes"] = self.budget.limits["max_output_bytes"] if self.budget else self.cfg.get("process.max_output_bytes", 16777216)
+        gate_cfg = self._gate_cfg()
         try:
             res = gates.run_gates(self.workdir, "full", cfg=gate_cfg, strict=strict, use_cache=use_cache and not strict,
                                   log_dir=self.run_dir / "gates" / label, fix_fmt=fix_fmt)
@@ -650,6 +665,10 @@ class Orchestrator:
         self.state.update(base_ref=base_ref, base_sha=base_sha, base_tree=gitutil.tree_of(repo, base_sha),
                           original_branch=gitutil.head_branch(repo), isolation=isolation,
                           checkpoints=bool(self.cfg.get("project.checkpoint_commits", True)) and isolation != "none")
+        try:
+            self.state["gates_cfg"] = gates.load_gate_config_at(repo, base_sha)
+        except gates.GateConfigError as exc:
+            raise Abort("error", f"cannot read the gate configuration from the base commit: {exc}") from exc
         branch = f"rustflow/{self.state['run_id']}"
         if not self.opts.dry_run and isolation in ("branch", "worktree"):
             # Never roll back a branch that existed before this preflight.
@@ -717,7 +736,7 @@ class Orchestrator:
             res = self.run_gates("baseline", strict=True, fix_fmt=False)
             if not res.ok:
                 self.state["baseline_red"] = res.feedback()
-                self.state["baseline_signatures"] = sorted(res.signatures())
+                self.state["baseline_signatures"] = sorted(res.signature_counts().elements())
                 self._write_baseline()
                 if not self.opts.accept_red_baseline:
                     raise Abort("baseline_red", "gates are already RED on the base. Fix the base first or "
@@ -829,10 +848,9 @@ class Orchestrator:
     def _gates_ok(self, res: gates.GateResult) -> bool:
         if res.ok:
             return True
-        base = set(self.state.get("baseline_signatures") or [])
-        sigs = res.signatures()
-        # "step|*" = a failure we could not itemize; it can never be proven pre-existing.
-        if base and sigs <= base and not any(x.endswith("|*") for x in sigs):
+        base = Counter(self.state.get("baseline_signatures") or [])
+        # Occurrences are counted; "step|*" (an unitemized failure) can never be proven pre-existing.
+        if base and not gates.new_failures(res.signature_counts(), base):
             self.log("gates: only pre-existing baseline failures remain - treated as green")
             return True
         return False
@@ -1084,7 +1102,7 @@ class Orchestrator:
         lints = list(self.cfg.get("review.advisory_clippy", []) or [])
         if lints:
             try:
-                diags = gates.advisory_clippy(self.workdir, lints, ranges, cfg=gates.load_gate_config(self.workdir))
+                diags = gates.advisory_clippy(self.workdir, lints, ranges, cfg=self._gate_cfg())
                 out += [d.short() for d in diags]
             except gates.IncompleteGate as exc:
                 self._incomplete(exc.step.termination_reason, gate="advisory")

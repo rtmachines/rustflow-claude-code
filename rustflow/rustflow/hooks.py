@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # no .rustflow/__pycache__ littering the working tree
@@ -52,16 +53,19 @@ def _read_input() -> dict:
         return {}
 
 
-def _baseline_signatures(root: Path) -> set[str]:
-    """Failures accepted by the orchestrator on a red base (--accept-red-baseline) for this run."""
+def _baseline_signatures(root: Path) -> Counter:
+    """Failures accepted by the orchestrator on a red base (--accept-red-baseline) for this run.
+
+    Stored as a list with duplicates (one entry per occurrence); a duplicate-free list counts each once.
+    """
     run = os.environ.get("RUSTFLOW_RUN")
     if not run:
-        return set()
+        return Counter()
     try:
         data = json.loads((root / ".rustflow" / "cache" / "baseline.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return set()
-    return set(data.get("signatures", [])) if data.get("run") == run else set()
+        return Counter()
+    return Counter(data.get("signatures", [])) if data.get("run") == run else Counter()
 
 
 def _emit(obj: dict) -> int:
@@ -217,9 +221,8 @@ def stop(data: dict) -> int:
     counter = _state_dir(root) / f"stop-blocks-{session}"
     max_blocks = int(cfg.get("stop_max_blocks", 3))
     res = gates.run_gates(root, "stop", cfg=cfg)
-    sigs = res.signatures()
     baseline = _baseline_signatures(root)
-    if res.ok or (baseline and sigs <= baseline and not any(x.endswith("|*") for x in sigs)):
+    if res.ok or (baseline and not gates.new_failures(res.signature_counts(), baseline)):
         counter.unlink(missing_ok=True)
         return finish()
     try:

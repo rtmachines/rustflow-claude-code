@@ -255,7 +255,7 @@ def load_gate_config_at(root: Path, rev: str) -> dict:
     try:
         if _git(root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").returncode != 0:
             raise GateConfigError(f"cannot resolve revision {rev!r}")
-        ls = _git(root, "ls-tree", rev, "--", "rustflow.toml")
+        ls = _git(root, "ls-tree", "--full-tree", rev, "--", "rustflow.toml")
         if ls.returncode != 0:
             raise GateConfigError(f"git ls-tree {rev} failed: {(ls.stderr or '').strip()}")
         if not ls.stdout.strip():

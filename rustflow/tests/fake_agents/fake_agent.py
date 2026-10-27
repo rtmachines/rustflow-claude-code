@@ -155,11 +155,24 @@ def act(prompt):
         if SCENARIO in ("escalate", "tamper"):
             lib().write_text(with_unsafe(BUGGY))
             return {"summary": "with unsafe"}
+        if SCENARIO == "weaken_gates":  # failing test + switch the tests gate off in the work tree
+            lib().write_text("//! demo crate\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn fails() {\n"
+                             "        assert_eq!(1, 2);\n    }\n}\n")
+            toml = Path("rustflow.toml")
+            toml.write_text(toml.read_text().replace('tests = "auto"', 'tests = "off"'))
+            return {"summary": "weakened", "files_changed": ["src/lib.rs"], "tests_added": [],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO == "red_baseline_multiset":  # a second identical needless_return on top of the red base
+            lib().write_text(lib().read_text() + "pub fn b() -> i32 { return 2; }\n")
+            return {"summary": "added b", "files_changed": ["src/lib.rs"], "tests_added": [],
+                    "gates_green": True, "notes": ""}
         lib().write_text(CLIPPY_RED if SCENARIO == "gatefix" else BUGGY)
         return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
                 "gates_green": True, "notes": ""}
     if ROLE == "fixer":
         if "gates are RED" in prompt:
+            if SCENARIO in ("weaken_gates", "red_baseline_multiset"):
+                return {"summary": "nothing changed", "resolutions": [], "tests_added": []}
             lib().write_text(BUGGY)
             return {"summary": "removed needless return / collect", "resolutions": [], "tests_added": []}
         if SCENARIO == "dispute":

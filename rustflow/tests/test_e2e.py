@@ -103,6 +103,31 @@ def test_red_baseline_stops(rust_repo, monkeypatch):
     assert read_log(rust_repo) == []
 
 
+def test_gates_use_base_config(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "weaken_gates", monkeypatch, difficulty="easy")
+    assert st["status"] == "gates_red" and st["gates_cfg"]["tests"] == "auto"
+
+
+def test_red_baseline_counts_occurrences(rust_repo, monkeypatch):
+    (rust_repo / "src" / "lib.rs").write_text("pub fn a() -> i32 { return 1; }\n")
+    git(rust_repo, "commit", "-qam", "red")
+    rc, st = run(rust_repo, "red_baseline_multiset", monkeypatch, difficulty="easy", accept_red_baseline=True)
+    assert st["status"] == "gates_red"
+    # the second identical diagnostic is NEW: the code never reaches review
+    assert not any(c["role"].startswith("reviewer") for c in read_log(rust_repo))
+    assert st["baseline_signatures"].count("clippy|src/lib.rs|clippy::needless_return|unneeded `return` statement") == 1
+
+
+def test_resume_without_gates_cfg(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "happy", monkeypatch, max_rounds=1)
+    path = find_run(rust_repo, "latest") / "state.json"
+    st.pop("gates_cfg")
+    path.write_text(json.dumps(st), encoding="utf-8")
+    Orchestrator(rust_repo, Config.load(rust_repo), Options()).resume(find_run(rust_repo, "latest"), extra_rounds=1)
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert "gates_cfg" in after
+
+
 def test_dirty_tree_refused(rust_repo, monkeypatch):
     (rust_repo / "notes.txt").write_text("wip")
     rc, st = run(rust_repo, "happy", monkeypatch)
