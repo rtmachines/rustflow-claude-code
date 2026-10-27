@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from conftest import read_log
+from conftest import read_log, skip_agent_sleep
 from rustflow import agents, findings as fnd
 from rustflow.config import Config, ConfigError
 from rustflow.orchestrator import Options, Orchestrator, find_run
@@ -65,7 +65,7 @@ def _call(tmp_path):
 
 
 def test_run_with_retry_skips_permanent_failures(tmp_path, monkeypatch):
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     perm = agents.AgentResult("x", "reviewer_a", "s", ok=False, error="not logged in", retryable=False)
     r = _Runner([perm])
     assert agents.run_with_retry(r, _call(tmp_path), retries=1) is perm and r.calls == 1

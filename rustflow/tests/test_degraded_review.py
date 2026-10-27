@@ -3,6 +3,7 @@ brief, report and next_actions - not only a log line."""
 
 import json
 
+from conftest import skip_agent_sleep
 from rustflow import agents, runs
 from rustflow.config import Config
 from rustflow.orchestrator import Options, Orchestrator, find_run
@@ -12,7 +13,7 @@ TASK = "Add `parse_kv(input: &str) -> Vec<(String, String)>` to src/lib.rs. Trim
 
 def _run(repo, scenario, monkeypatch, config=None, **opts):
     monkeypatch.setenv("FAKE_SCENARIO", scenario)
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     rc = Orchestrator(repo, Config.load(repo, config), Options(**opts)).start(TASK)
     return rc, _state(repo)
 

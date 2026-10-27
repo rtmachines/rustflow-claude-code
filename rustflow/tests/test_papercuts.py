@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import git
+from conftest import git, skip_agent_sleep
 from rustflow import agents, gates, gitutil, hooks, runs
 from rustflow.config import Config, load_defaults
 from rustflow.orchestrator import Options, Orchestrator, find_run
@@ -20,7 +20,7 @@ TASK = "Add `parse_kv(input: &str) -> Vec<(String, String)>` to src/lib.rs. Trim
 
 def _run(repo, scenario, monkeypatch, config=None, **opts):
     monkeypatch.setenv("FAKE_SCENARIO", scenario)
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     Orchestrator(repo, Config.load(repo, config), Options(**opts)).start(TASK)
     return json.loads((find_run(repo, "latest") / "state.json").read_text(encoding="utf-8"))
 

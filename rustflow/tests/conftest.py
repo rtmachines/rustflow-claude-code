@@ -2,12 +2,20 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 HERE = Path(__file__).resolve().parent
 FAKE = HERE / "fake_agents" / "fake_agent.py"
+
+
+def skip_agent_sleep(monkeypatch):
+    """Skip unbudgeted retry backoff without changing other modules' polling."""
+    from rustflow import agents
+    monkeypatch.setattr(agents, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None))
 
 
 def git(cwd, *args):

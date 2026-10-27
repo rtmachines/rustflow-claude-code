@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import skip_agent_sleep
 from rustflow import agents, procutil, schemas
 from rustflow.config import AgentSpec, Config, load_defaults
 
@@ -14,7 +15,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def call_and_runner(tmp_path, monkeypatch, provider="claude", **kwargs):
     runner = (agents.ClaudeRunner if provider == "claude" else agents.CodexRunner)(Config(load_defaults()))
     monkeypatch.setattr(runner, "binary", lambda: ["fake-provider"])
-    monkeypatch.setattr(agents.time, "sleep", lambda _: None)
+    skip_agent_sleep(monkeypatch)
     spec = "claude:opus:high" if provider == "claude" else "codex:gpt-6.1-sol:high"
     call = agents.AgentCall("reviewer_a", "review", AgentSpec.parse(spec), "p", False,
                             kwargs.pop("schema", None), tmp_path, tmp_path / "agents", **kwargs)

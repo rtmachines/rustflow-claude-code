@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import git, read_log
+from conftest import git, read_log, skip_agent_sleep
 from rustflow import agents, gates, hooks, runs
 from rustflow.config import AgentSpec, Config, ConfigError, load_defaults
 from rustflow.orchestrator import Options, Orchestrator, find_run
@@ -18,7 +18,7 @@ TASK = "Add `parse_kv(input: &str) -> Vec<(String, String)>` to src/lib.rs. Trim
 
 def _run(repo, scenario, monkeypatch, **opts):
     monkeypatch.setenv("FAKE_SCENARIO", scenario)
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     cfg = Config.load(repo, opts.pop("config", None))
     rc = Orchestrator(repo, cfg, Options(**opts)).start(TASK)
     return rc, _state(repo)
@@ -270,7 +270,7 @@ def test_failed_json_repair_is_not_retried_a_second_time(tmp_path, fake_bin, mon
     log = tmp_path / "fake.log"
     monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("FAKE_SCENARIO", "json_always")
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     from rustflow import schemas
     call = agents.AgentCall("reviewer_a", "r1-reviewer_a", AgentSpec.parse("claude:opus:high"), "p", False,
                             schemas.REVIEW_SCHEMA, tmp_path, tmp_path / "logs")

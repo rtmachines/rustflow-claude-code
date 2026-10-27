@@ -8,6 +8,16 @@ import pytest
 from rustflow import gates, procutil
 
 
+def test_skipping_agent_backoff_preserves_process_polling(monkeypatch):
+    from conftest import skip_agent_sleep
+    from rustflow import agents, process
+    real_sleep = time.sleep
+    skip_agent_sleep(monkeypatch)
+    agents.time.sleep(5)
+    assert process.time.sleep is real_sleep
+    assert time.sleep is real_sleep
+
+
 @pytest.mark.parametrize('extra', [0, 1])
 @pytest.mark.parametrize('adapter', ['proc', 'gates'])
 def test_shared_raw_byte_boundary(tmp_path, adapter, extra):

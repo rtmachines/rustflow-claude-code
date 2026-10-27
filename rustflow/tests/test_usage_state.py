@@ -8,6 +8,7 @@ import threading
 
 import pytest
 
+from conftest import skip_agent_sleep
 from rustflow import agents, procutil, report, runs, triage
 from rustflow.config import AgentSpec, Config, load_defaults
 from rustflow.orchestrator import Options, Orchestrator
@@ -22,7 +23,7 @@ def orchestrator(tmp_path, monkeypatch, *, dry_run=False):
     assert o.start("usage test", run_id="usage-test") == 0
     for runner in o.runners.values():
         monkeypatch.setattr(runner, "binary", lambda: ["fake-provider"])
-    monkeypatch.setattr(agents.time, "sleep", lambda _: None)
+    skip_agent_sleep(monkeypatch)
     return o
 
 
