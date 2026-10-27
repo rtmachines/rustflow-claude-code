@@ -643,3 +643,49 @@ def test_decide_rules():
     assert by["b.toml"]["status"] == "blocked" and by["c.toml"]["status"] == "pending"
     assert by["u"]["status"] == "blocked" and by["d"]["status"] == "pending"
     assert {e["path"] for e in integrity.pending(ents)} == {"b.toml", "c.toml", "u", "d"}
+
+
+def _entry(kind="cargo-lints", provable=False, digest="d1"):
+    return {"id": f"G-{kind}-Cargo.toml", "path": "Cargo.toml", "kind": kind, "detail": "", "digest": digest,
+            "provable": provable, "status": "pending", "accepted_by": "", "proof": "", "proof_tree": "",
+            "votes": {}, "justification": "", "fix_rounds": 0}
+
+
+def _vote(e, decision="accept"):
+    return [{"id": e["id"], "decision": decision, "reason": "r"}]
+
+
+def test_apply_votes_and_decide():
+    e = _entry()
+    integrity.apply_votes([e], "reviewer_a", _vote(e))
+    integrity.decide([e])
+    assert e["status"] == "pending"                       # one vote is not consent
+    integrity.apply_votes([e], "reviewer_b", _vote(e))
+    integrity.decide([e])
+    assert (e["status"], e["accepted_by"]) == ("accepted", "reviewers")
+    integrity.apply_votes([e], "reviewer_b", _vote(e, "reject"))   # a new vote replaces the old one
+    integrity.decide([e])
+    assert (e["status"], e["accepted_by"]) == ("pending", "")
+    # a vote for an old digest does not count; reconcile drops it when the content changes
+    e2 = _entry()
+    integrity.apply_votes([e2], "reviewer_a", _vote(e2))
+    integrity.apply_votes([e2], "reviewer_b", _vote(e2))
+    e2["digest"] = "d2"
+    integrity.decide([e2])
+    assert e2["status"] == "pending"
+    # a review without the field casts no vote
+    e3 = _entry()
+    integrity.apply_votes([e3], "reviewer_a", _vote(e3))
+    integrity.apply_votes([e3], "reviewer_b", [])
+    integrity.decide([e3])
+    assert e3["status"] == "pending" and "reviewer_b" not in e3["votes"]
+
+
+def test_votes_ignored_for_provable_and_unknown():
+    p, u = _entry("config", True), _entry("unknown")
+    for r in ("reviewer_a", "reviewer_b"):
+        integrity.apply_votes([p, u], r, _vote(p) + _vote(u))
+    integrity.decide([p, u])
+    assert p["votes"] == {} and u["votes"] == {}
+    assert p["status"] == "pending" and u["status"] == "blocked"
+    integrity.apply_votes([p], "reviewer_a", [{"id": "G-none", "decision": "accept", "reason": ""}])

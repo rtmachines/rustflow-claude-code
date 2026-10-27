@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import git, read_log
+from conftest import git, read_log, skip_agent_sleep
 from rustflow.config import Config
 from rustflow.orchestrator import Options, Orchestrator, find_run
 
@@ -362,3 +362,44 @@ def test_digest_change_requires_new_proof(rust_repo, monkeypatch):
 def test_gate_changes_pending_is_continuable():
     from rustflow.orchestrator import CONTINUABLE
     assert "gate_changes_pending" in CONTINUABLE
+
+
+def test_lints_both_accept(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "lints_both_accept", monkeypatch, difficulty="easy")
+    assert st["status"] == "approved_with_advisories", st.get("stop_reason")
+    e = st["gate_changes"][0]
+    assert (e["kind"], e["status"], e["accepted_by"]) == ("cargo-lints", "accepted", "reviewers")
+    assert set(e["votes"]) == {"reviewer_a", "reviewer_b"}
+    assert any(f["status"] == "accepted_gate_change" for f in st["findings"])
+
+
+def test_lints_one_reject(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "lints_one_reject", monkeypatch, difficulty="easy")
+    assert st["status"] == "gate_changes_pending" and rc == 2, st.get("stop_reason")
+    e = st["gate_changes"][0]
+    assert e["votes"]["reviewer_b"]["decision"] == "reject" and e["accepted_by"] == ""
+
+
+def test_lints_degraded_no_consent(rust_repo, monkeypatch):
+    skip_agent_sleep(monkeypatch)
+    rc, st = run(rust_repo, "lints_degraded", monkeypatch, difficulty="easy")
+    assert st["status"] == "gate_changes_pending" and rc == 2, st.get("stop_reason")
+    e = st["gate_changes"][0]
+    assert list(e["votes"]) == ["reviewer_a"] and e["accepted_by"] == ""
+
+
+def test_resume_after_manual_revert_of_gate_change(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "weaken", monkeypatch, difficulty="easy")
+    assert st["status"] == "gate_changes_pending"
+    wt = Path(st["workdir"]) if st.get("workdir") else rust_repo
+    cfg = wt / ".cargo" / "config.toml"
+    assert cfg.exists()
+    cfg.unlink()
+    lib = wt / "src" / "lib.rs"
+    text = lib.read_text(encoding="utf-8")
+    assert "return 1;" in text
+    lib.write_text(text.replace("return 1;", "1").replace("    1\n}", "    1\n}"), encoding="utf-8")
+    rc = Orchestrator(rust_repo, Config.load(rust_repo), Options()).resume(find_run(rust_repo, "latest"), extra_rounds=1)
+    st = json.loads((find_run(rust_repo, "latest") / "state.json").read_text(encoding="utf-8"))
+    assert st["status"] in ("approved", "approved_with_advisories"), st.get("stop_reason")
+    assert rc == 0 and st["gate_changes"] == []

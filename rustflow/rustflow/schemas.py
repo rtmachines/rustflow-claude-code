@@ -47,6 +47,12 @@ REVIEW_SCHEMA = _obj({
         "note": STR,
     })},
     "residual_risks": STR_LIST,
+    # votes on gate-affecting changes listed in the prompt; absent = no vote (the validator defaults it to [])
+    "gate_changes": {"type": "array", "items": _obj({
+        "id": STR,
+        "decision": {"type": "string", "enum": ["accept", "reject"]},
+        "reason": STR,
+    })},
 })
 
 FIX_SCHEMA = _obj({

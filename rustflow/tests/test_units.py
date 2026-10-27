@@ -613,3 +613,24 @@ def test_load_gate_config_at_missing_blob_fails_closed(git_repo):
     obj.unlink()
     with pytest.raises(gates.GateConfigError):
         gates.load_gate_config_at(git_repo, "HEAD")
+
+
+def test_review_schema_gate_changes_optional():
+    base = {"summary": "s", "verdict": "APPROVE", "findings": []}
+    assert schemas.validate(dict(base), schemas.REVIEW_SCHEMA)["gate_changes"] == []
+    ok = schemas.validate({**base, "gate_changes": [{"id": "G-x", "decision": "accept", "reason": "r"}]},
+                          schemas.REVIEW_SCHEMA)
+    assert ok["gate_changes"][0]["decision"] == "accept"
+    with pytest.raises(schemas.SchemaError):
+        schemas.validate({**base, "gate_changes": [{"id": "G-x", "decision": "maybe", "reason": ""}]},
+                         schemas.REVIEW_SCHEMA)
+
+
+def test_review_prompt_lists_pending_changes():
+    from rustflow import prompts
+    ctx = prompts.ReviewContext(task="t", base="b", head_tree="h", diff_stat="", diff_inline="", gates_summary="",
+                                gate_changes="- [G-cargo-lints-Cargo.toml] cargo-lints in `Cargo.toml`: x")
+    p = prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")
+    assert "GATE-AFFECTING CHANGES NEEDING YOUR VOTE" in p and "[G-cargo-lints-Cargo.toml]" in p
+    ctx.gate_changes = ""
+    assert "NEEDING YOUR VOTE" not in prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")

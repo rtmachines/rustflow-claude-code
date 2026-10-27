@@ -588,6 +588,27 @@ def apply_proof(entries: list[dict], result: ProofResult, tree: str = "") -> Non
             e["proof_tree"] = tree
 
 
+REVIEWERS = ("reviewer_a", "reviewer_b")
+
+
+def apply_votes(entries: list[dict], reviewer: str, votes: list[dict]) -> None:
+    """Record `reviewer`'s votes on existing entries that are neither provable nor unknown, bound to the
+    entry's current digest. A new vote of the same role replaces the old one; a missing vote is no vote."""
+    by_id = {e.get("id"): e for e in entries if not e.get("provable") and e.get("kind") != "unknown"}
+    for v in votes or []:
+        e = by_id.get(v.get("id"))
+        if e is None or v.get("decision") not in ("accept", "reject"):
+            continue
+        e.setdefault("votes", {})[reviewer] = {"digest": e.get("digest", ""), "decision": v["decision"],
+                                                "reason": str(v.get("reason", ""))}
+
+
+def _consent(e: dict) -> bool:
+    votes = e.get("votes") or {}
+    return all((votes.get(r) or {}).get("digest") == e.get("digest")
+               and (votes.get(r) or {}).get("decision") == "accept" for r in REVIEWERS)
+
+
 def decide(entries: list[dict]) -> None:
     for e in entries:
         if e["kind"] == "unknown":
@@ -599,8 +620,10 @@ def decide(entries: list[dict]) -> None:
                 e["status"], e["accepted_by"] = "blocked", ""
             else:
                 e["status"], e["accepted_by"] = "pending", ""
+        elif _consent(e):   # unanimous reviewer consent for a change that cannot be proven
+            e["status"], e["accepted_by"] = "accepted", "reviewers"
         else:
-            e["status"], e["accepted_by"] = "pending", ""   # reviewer consent: a later task
+            e["status"], e["accepted_by"] = "pending", ""
 
 
 def pending(entries: list[dict]) -> list[dict]:

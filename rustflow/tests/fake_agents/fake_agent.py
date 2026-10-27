@@ -79,7 +79,8 @@ mod tests {
 '''
 
 
-GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change")
+LINTS_SCENARIOS = ("lints_both_accept", "lints_one_reject", "lints_degraded")
+GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change") + LINTS_SCENARIOS
 CAP_LINTS = '[build]\nrustflags = ["--cap-lints", "allow"]\n'
 NEEDLESS_RETURN = "\npub fn answer() -> i32 {\n    return 1;\n}\n"
 MANY_ARGS = ("\npub fn many(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32) -> i32 {\n"
@@ -137,7 +138,11 @@ def review(prompt):
         if SCENARIO == "reject":
             findings.append(finding("P2", "idiom", "src/lib.rs", 2, "Return impl Iterator instead of Vec", conf="medium"))
     verdict = "REQUEST_CHANGES" if findings and any(f["severity"] in ("P0", "P1") for f in findings) else "APPROVE"
-    return {"summary": f"{ROLE} review", "verdict": verdict, "findings": findings, "disputes": disputes,
+    votes = []
+    if SCENARIO in LINTS_SCENARIOS:
+        reject = SCENARIO == "lints_one_reject" and ROLE == "reviewer_b"
+        votes = [{"id": g, "decision": "reject" if reject else "accept", "reason": "vote"} for g in gate_ids(prompt)]
+    return {"summary": f"{ROLE} review", "verdict": verdict, "gate_changes": votes, "findings": findings, "disputes": disputes,
             "acceptance": [{"criterion": "trim whitespace",
                             "status": "met" if fixed or SCENARIO == "dispute" else "not_met", "note": ""}],
             "residual_risks": []}
@@ -184,7 +189,7 @@ def act(prompt):
             return {"summary": "added b", "files_changed": ["src/lib.rs"], "tests_added": [],
                     "gates_green": True, "notes": ""}
         if SCENARIO in ("weaken", "weaken_revert"):  # needless_return hidden by --cap-lints in a cargo config
-            lib().write_text(FIXED + NEEDLESS_RETURN)
+            lib().write_text(replaced(FIXED, "#[cfg(test)]", NEEDLESS_RETURN.lstrip("\n") + "\n#[cfg(test)]"))
             Path(".cargo").mkdir(exist_ok=True)
             Path(".cargo/config.toml").write_text(CAP_LINTS)
             return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
@@ -192,6 +197,13 @@ def act(prompt):
         if SCENARIO == "allow_unneeded":  # an #[allow] that hides nothing
             lib().write_text(replaced(FIXED, "pub fn parse_kv", "#[allow(dead_code)]\npub fn parse_kv"))
             return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO in LINTS_SCENARIOS:  # a lint relaxed in Cargo.toml with nothing to hide: cannot be proven
+            lib().write_text(FIXED)
+            toml = Path("Cargo.toml")
+            toml.write_text(toml.read_text() + '\n[lints.clippy]\nneedless_return = "allow"\n')
+            return {"summary": "implemented parse_kv; relaxed needless_return as the task requires",
+                    "files_changed": ["src/lib.rs", "Cargo.toml"], "tests_added": ["parses_pairs"],
                     "gates_green": True, "notes": ""}
         if SCENARIO == "digest_change":  # a harmless clippy.toml now, a hiding one after the fixer
             lib().write_text(BUGGY)
@@ -207,7 +219,7 @@ def act(prompt):
                 return {"summary": "nothing changed", "resolutions": [], "tests_added": []}
             lib().write_text(BUGGY)
             return {"summary": "removed needless return / collect", "resolutions": [], "tests_added": []}
-        if SCENARIO in ("weaken", "weaken_revert", "digest_change") and gate_ids(prompt):
+        if SCENARIO in ("weaken", "weaken_revert", "digest_change") + LINTS_SCENARIOS and gate_ids(prompt):
             if SCENARIO == "weaken_revert":
                 Path(".cargo/config.toml").unlink()
                 lib().write_text(FIXED)
@@ -302,6 +314,9 @@ def main():
         return 1
     if ROLE == "implementer" and (SCENARIO == "impl_down" or (SCENARIO == "impl_flaky" and earlier_calls(ROLE) == 0)):
         return overloaded()
+    if SCENARIO == "lints_degraded" and ROLE == "reviewer_b":
+        print("boom", file=sys.stderr)
+        return 1
     if SCENARIO == "reviewers_down" and ROLE in ("reviewer_a", "reviewer_b"):
         return overloaded()
     gate_fix = "gates are RED" in prompt

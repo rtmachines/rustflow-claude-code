@@ -311,7 +311,10 @@ class Orchestrator:
         for key in ("outcome", "finished", "final_gates", "final_gates_ok", "final_gates_feedback"):
             self.state.pop(key, None)
         self.state["gate_fix_attempts"] = 0
-        if any(f.get("status") == "open" for f in self.state.get("findings", [])):
+        open_f = [f for f in self.state.get("findings", []) if f.get("status") == "open"]
+        # Gate-change findings are recomputed from the tree: a human may have reverted them by hand, so
+        # re-gate (refresh -> review) instead of sending the fixer after a change that may be gone.
+        if open_f and not all(f.get("category") == "gate-integrity" for f in open_f):
             self.state["phase"] = "fix"
         else:  # final gates red / required tests missing: gates (+ gate fixer) -> review recomputes findings
             self.state["phase"], self.state["gates_after"] = "gates", "continue"
@@ -658,6 +661,21 @@ class Orchestrator:
             self.log(f"   gate change [{e['id']}] {e['status']}"
                      + (f" (by {e['accepted_by']})" if e["accepted_by"] else "") + f": {e['detail'][:100]}")
 
+    def _votable_gate_changes(self) -> str:
+        """Pending changes the reviewers may vote on (not provable, not unknown), with the justifications."""
+        impl = ((self.state.get("implementation") or {}).get("summary") or "").strip()
+        out = []
+        for e in self.state.get("gate_changes") or []:
+            if e.get("provable") or e["kind"] == "unknown" or e["status"] != "pending":
+                continue
+            lines = [f"- [{e['id']}] {e['kind']} in `{e['path']}`: {e['detail']}"]
+            if impl:
+                lines.append(f"  implementer's summary: {impl[:500]}")
+            if e.get("justification"):
+                lines.append(f"  fixer's justification: {e['justification'][:500]}")
+            out.append("\n".join(lines))
+        return "\n".join(out)
+
     def _gate_findings(self, rnd: int, prev_open: list[fnd.Finding]) -> list[fnd.Finding]:
         was_open = {f.id for f in prev_open}
         out = []
@@ -962,6 +980,7 @@ class Orchestrator:
             diff_inline=inline, gates_summary=self.state.get("last_gates", "n/a"),
             advisory=advisory, risk=risk.describe(),
             acceptance=[c.for_prompt() for c in self.criteria], round_no=rnd,
+            gate_changes=self._votable_gate_changes(),
         )
         if rnd > 1 and self.state.get("last_review_tree"):
             prev_tree = self.state["last_review_tree"]
@@ -1051,6 +1070,11 @@ class Orchestrator:
         else:
             self.state.pop("degraded_review", None)
 
+        entries = self.state.get("gate_changes") or []
+        for name, data in reviews.items():
+            if name in integrity.REVIEWERS:
+                integrity.apply_votes(entries, name, data.get("gate_changes") or [])
+        integrity.decide(entries)
         ids = fnd.IdAllocator(int(self.state.get("id_counter", 0)))
         agg = fnd.aggregate(
             reviews, root=self.workdir, round_no=rnd, previous=prev_findings, ids=ids,

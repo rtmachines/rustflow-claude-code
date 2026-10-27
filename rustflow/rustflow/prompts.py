@@ -65,6 +65,7 @@ class ReviewContext:
     delta_stat: str = ""
     delta_inline: str | None = None
     prev_tree: str = ""
+    gate_changes: str = ""       # pending gate-affecting changes that cannot be proven, formatted for voting
 
 
 def plan_prompt(task: str, language: str) -> str:
@@ -185,6 +186,14 @@ Your final answer is the JSON object described by the schema.
         delta = (f"```diff\n{ctx.delta_inline}\n```" if ctx.delta_inline is not None else
                  f"Read it with `git diff {ctx.prev_tree} {ctx.head_tree}`.")
         parts.append(_block("DELTA SINCE PREVIOUS REVIEW", f"```\n{ctx.delta_stat.strip()}\n```\n\n{delta}"))
+    if ctx.gate_changes:
+        parts.append(_block(
+            "GATE-AFFECTING CHANGES NEEDING YOUR VOTE",
+            "These changes alter what the gates check and cannot be proven harmless mechanically. For each, "
+            "add an entry to `gate_changes` (`id`, `decision` accept|reject, `reason`). Vote `accept` only if "
+            "the TASK requires the change and it does not hide a defect; otherwise vote `reject`. A change is "
+            "accepted only when both reviewers accept. Do not also report these as findings.\n\n"
+            + ctx.gate_changes))
     parts.append(_block("DIFF", diff_part))
     parts.append(_block("GATES (deterministic, run by the orchestrator)", ctx.gates_summary))
     if ctx.risk:
