@@ -116,6 +116,28 @@ rustflow run "Add an add function and a tests::adds unit test" --criteria criter
 
 The named test must actually run and pass on the checked tree. Short names match suffixes: at least one matching test must pass and no observed matching test may fail. Prefer a fully qualified name to avoid collisions. Zero executed tests, ignored tests, or a different passing test do not satisfy it. Criteria without `test` are assessed by reviewers. Hard-task planning can also supply criteria. Missing required tests become blocking `T-<id>` findings and can end as `criteria_unmet`. The report includes mechanical evidence and reviewer assessments. See [`criteria.py`](../rustflow/criteria.py) and [`test_criteria.py`](../tests/test_criteria.py).
 
+### Gate-affecting changes
+
+Rustflow also checks changes that could make the gates weaker than the base commit. Each such change has a kind:
+
+- `config`: `rustflow.toml`, `.cargo/config` and `.cargo/config.toml` at any depth, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`, and paths matched by `integrity_extra_paths`.
+- `cargo-lints`: `[lints]`, `[workspace.lints]`, or `[profile.*]` in a `Cargo.toml`. Adding a dependency is not a change.
+- `silence`: an added `#[allow(`, `#![allow(`, `#[expect(`, `cfg_attr(…, allow/expect(`, or `#[ignore` attribute.
+- `tests-removed`: a net decrease in test attributes across the diff. Moving a test is fine.
+- `unknown`: the scan failed. This always blocks.
+
+Acceptance is automatic; no CLI or MCP option overrides it:
+
+- `config` and `silence` need a proof. Rustflow reruns the gates with the changed configuration restored to the base version and the added attributes stripped. Green accepts the change (`accepted_by: proof`). Red means the change hides a real failure and blocks it; reviewers cannot override that.
+- `cargo-lints` and `tests-removed` are accepted only when both reviewers vote `accept` for the current diff.
+
+Every change that is not accepted becomes a blocking finding `G-<kind>-<path>`. Reviewers and the fixer cannot close it. When only these findings remain after a fix round, or at the final check, the run ends as `gate_changes_pending` (exit code 2, resumable). Its `next_actions` (`rustflow status <id> --json`) offers two recovery paths:
+
+1. Revert the change by hand, then run `rustflow resume <id> --extra-rounds 1`. This reruns the gates and review without the fixer.
+2. Commit the change yourself as a gate-policy change on the base branch, then start a new run.
+
+Approved runs with accepted gate changes end at most as `approved_with_advisories`. The report has a section "## Zmiany wpływające na bramki" that lists the id, kind, path, status, `accepted_by`, proof, votes, and justification of each change.
+
 ## Review existing changes
 
 ```bash
@@ -171,6 +193,8 @@ Compilation failures can skip redundant tests. nextest is preferred when install
 ## Claude Code hooks and interactive review
 
 Initialization registers `PostToolUse` formatting/check feedback, a `Stop` gate, `PreToolUse` command/edit guards, and normally a `UserPromptSubmit` review router. Stop blocks at most three times by default, then emits a manual-review warning; this does not turn failed gates green. Orchestrated reviewers skip write-oriented interactive hooks; the driving session respects the active checkout.
+
+Stop and the commit gate read the gate configuration from `HEAD` and block unproven [gate-affecting changes](#gate-affecting-changes) in interactive sessions. Revert such a change, or ask the user to commit it. Agents started by the orchestrator are not checked by hooks; the orchestrator handles them instead.
 
 In a trusted Claude Code project, `/rustflow-pr-review [base]` invokes the installed interactive reviewer. This forked read-only interface is separate from the two-reviewer workflow. Hooks validate its Markdown report and can suggest a Trail of Bits audit for unsafe/FFI signals. `init --with-plugins` enables that optional plugin integration; an orchestrated plugin audit also needs auditor configuration. Folder trust and permissions affect hook activation. `doctor --selftest` replays local hook scenarios.
 

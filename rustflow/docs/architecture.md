@@ -26,6 +26,8 @@ flowchart TD
     AGENTS --> USAGE[usage.py: durable attempt records]
     AGENTS --> PROC[procutil.py and process.py]
     GATES --> PROCESS[process.py: bounded subprocess capture]
+    ORCH --> INTEGRITY[integrity.py: gate-affecting change decisions]
+    HOOKS --> INTEGRITY
     GIT --> GATES
     PROC --> PROCESS
     ORCH --> REPORT[report.py: Markdown report]
@@ -47,6 +49,7 @@ flowchart TD
 | [`gates.py`](../rustflow/gates.py) | Run formatting, compilation/linting, tests, and optional policy checks; parse diagnostics and test names; cache successful checks by tree fingerprint. |
 | [`findings.py`](../rustflow/findings.py) | Validate anchors, merge duplicate findings, preserve IDs, apply blocking/confidence rules, and manage disputes without another model call. |
 | [`criteria.py`](../rustflow/criteria.py) | Load acceptance criteria and prove named tests from current gate output independently of reviewer claims. |
+| [`integrity.py`](../rustflow/integrity.py) | Standalone, copied to `.rustflow/` like the gate code. Pipeline: scan the base-to-tree diff for gate-affecting changes, reconcile them with earlier decisions, prove `config` and `silence` changes by rerunning gates, apply reviewer votes for `cargo-lints` and `tests-removed`, then decide which changes are accepted. |
 | [`budget.py`](../rustflow/budget.py) | Persist physical attempt counts and active wall time; reserve initial parallel reviewer slots and enforce execution limits. |
 | [`usage.py`](../rustflow/usage.py) | Normalize provider measurements, atomically write attempt records, and distinguish known measurements, missing data, and timeout estimates. |
 | [`process.py`](../rustflow/process.py), [`procutil.py`](../rustflow/procutil.py) | Capture bounded UTF-8 subprocess output, enforce deadlines/cancellation, kill process trees, resolve Windows npm shims, and scrub inherited agent-session variables. |
@@ -116,6 +119,7 @@ The implementation keeps mechanical evidence outside the model's verdict:
 - **Findings:** [`findings.py`](../rustflow/findings.py) normalizes paths, drops nonexistent file anchors, downgrades confidence for invalid lines, merges similar cross-reviewer findings, and retains alternative descriptions. Repeated findings keep IDs for escalation and progress detection. P0 bypasses severity/confidence filtering; other severities follow `loop.block_on`, with a confidence threshold for findings from only one reviewer. After two rejected-and-raised-again disputes, a finding becomes `disputed` for human decision, including a P0 finding.
 - **Required tests:** [`criteria.py`](../rustflow/criteria.py) checks parsed `tests` and `doctests` output. At least one matching test must pass and no matching test may fail. Exact paths and suffix names are supported, including nextest binary-qualified names. A short name matching several tests requires all observed matches to pass. Ignored tests, zero-test success, reviewer assertions, skipped steps, and incomplete output cannot prove a criterion. Missing evidence creates a blocking `T-<criterion-id>` finding.
 - **Tree identity:** Git snapshots include relevant tracked and untracked files, excluding runtime artifacts. Full gates check that commands did not change source files after formatting; a lockfile may change only when the check is not locked. A review whose checkout changes is discarded and resumes through gates on the new tree. Successful gate cache entries describe a particular fingerprint; strict checks and mechanical-criteria checks bypass cache.
+- **Gate-affecting changes:** [`integrity.py`](../rustflow/integrity.py) turns each unaccepted change into a blocking `G-<kind>-<path>` finding that reviewers and fixers cannot close. Changes that are provable are accepted only by a green proof; reviewer votes are required for `cargo-lints` and `tests-removed`. When only `G-` findings remain, the run ends as `gate_changes_pending`, which is not approved and can be resumed with `rustflow resume` after the change is reverted by hand.
 - **Degraded review:** An ordinary failure of one reviewer can leave a usable result from another. The summary records failed planned reviewers and suggests another review before merge. An execution-limit/incomplete-output failure instead stops the run; it cannot be converted into approval by the surviving reviewer.
 
 ## Durable state and execution limits

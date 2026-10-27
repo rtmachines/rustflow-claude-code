@@ -274,7 +274,7 @@ Both provider skill directories must contain explicitly requested skills when th
 
 ## Deterministic gates
 
-Gates are shared by hooks, orchestration, and CI. Their configuration comes from the working checkout as described under [Loading and precedence](#loading-and-precedence).
+Gates are shared by hooks, orchestration, and CI. Their configuration comes from `rustflow.toml` as described under [Loading and precedence](#loading-and-precedence), but the source of that file depends on the caller: orchestrator runs read `[gates]` from the run's base commit (also on resume), and interactive hooks read it from `HEAD`. Editing `[gates]` in the working tree does not change the gates of a running task or the Stop hook until the change is committed.
 
 | Key in `[gates]` | Default | Behavior |
 | --- | --- | --- |
@@ -293,8 +293,20 @@ Gates are shared by hooks, orchestration, and CI. Their configuration comes from
 | `semver` | `"auto"` | `auto`, `always`, or `off`; details below. |
 | `sqlx` | `"auto"` | `auto`, `require`, or `off`; details below. |
 | `extra` | `[]` (implicit) | Additional gate command definitions. |
+| `integrity_extra_paths` | `[]` (implicit) | List of globs. Matching changed files are treated as gate configuration (kind `config`) and need a proof; see below. |
 
 There is no general gate-timeout TOML key. Most built-in gate commands use a one-hour timeout, subject to the run's remaining deadline; individual helpers have shorter fixed timeouts. Custom commands accept `timeout_s`.
+
+### Gate integrity
+
+Changes to gate configuration can weaken the gates themselves, so the diff between the base and the current tree is scanned. Files named in the built-in list (`rustflow.toml`, `.cargo/config` and `.cargo/config.toml` at any depth, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`) and paths matching `integrity_extra_paths` are classified as `config`. Each such change needs a proof: the gates are re-run in a temporary worktree with the changed configuration restored to the base version. A red proof blocks the change. Projects without the key keep the default `[]`.
+
+```toml
+[gates]
+integrity_extra_paths = ["ci/*.sh"]
+```
+
+The changes are described in [usage](usage.md#gate-affecting-changes).
 
 ### Profiles and strict mode
 
