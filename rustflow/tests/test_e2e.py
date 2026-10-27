@@ -330,3 +330,35 @@ def test_missing_always_on_skill_stops_at_preflight(rust_repo, monkeypatch, tmp_
     rc, st = run(rust_repo, "happy", monkeypatch, config=cfg)
     assert st["status"] == "error" and "rust-best-practices" in st["stop_reason"]
     assert read_log(rust_repo) == []
+
+
+def test_weaken_ends_gate_changes_pending(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "weaken", monkeypatch, difficulty="easy")
+    assert st["status"] == "gate_changes_pending" and rc == 2
+    e = next(x for x in st["gate_changes"] if x["path"] == ".cargo/config.toml")
+    assert (e["kind"], e["proof"], e["status"]) == ("config", "failed", "blocked")
+    assert e["justification"] == "the task requires this configuration" and e["fix_rounds"] >= 1
+
+
+def test_weaken_revert_approved(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "weaken_revert", monkeypatch, difficulty="easy")
+    assert st["status"] == "approved", st.get("stop_reason")
+    assert st["gate_changes"] == []
+
+
+def test_allow_unneeded_accepted_by_proof(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "allow_unneeded", monkeypatch, difficulty="easy")
+    assert st["status"] == "approved_with_advisories", st.get("stop_reason")
+    assert st["gate_changes"][0]["accepted_by"] == "proof"
+    assert any(f["status"] == "accepted_gate_change" for f in st["findings"])
+
+
+def test_digest_change_requires_new_proof(rust_repo, monkeypatch):
+    rc, st = run(rust_repo, "digest_change", monkeypatch, difficulty="easy")
+    assert st["status"] == "gate_changes_pending", st.get("stop_reason")
+    assert st["gate_changes"][0]["proof"] == "failed"
+
+
+def test_gate_changes_pending_is_continuable():
+    from rustflow.orchestrator import CONTINUABLE
+    assert "gate_changes_pending" in CONTINUABLE

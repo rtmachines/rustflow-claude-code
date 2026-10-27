@@ -79,6 +79,23 @@ mod tests {
 '''
 
 
+GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change")
+CAP_LINTS = '[build]\nrustflags = ["--cap-lints", "allow"]\n'
+NEEDLESS_RETURN = "\npub fn answer() -> i32 {\n    return 1;\n}\n"
+MANY_ARGS = ("\npub fn many(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32) -> i32 {\n"
+             "    a + b + c + d + e + f + g + h\n}\n")
+
+
+def replaced(text, old, new):
+    assert old in text, f"scenario edit did not apply: {old!r}"
+    return text.replace(old, new, 1)
+
+
+def gate_ids(prompt):
+    import re
+    return re.findall(r"\[(G-[^\]]+)\]", prompt)
+
+
 def arg_after(flag):
     if flag in ARGS:
         i = ARGS.index(flag)
@@ -114,7 +131,7 @@ def review(prompt):
         findings.append(finding("P1", "correctness", "src/lib.rs", line, "Whitespace around key/value is not trimmed", prev=prev))
         if round2 and SCENARIO == "dispute":
             disputes.append({"id": "F1", "decision": "reraise", "note": "the task says trim"})
-    if not round2 and ROLE == "reviewer_b":
+    if not round2 and ROLE == "reviewer_b" and SCENARIO not in GATE_SCENARIOS:
         findings.append(finding("P1", "correctness", "src/does_not_exist.rs", 3, "Hallucinated file"))
         findings.append(finding("P3", "docs", "./src/lib.rs", 1, "Doc comment could mention separator", conf="medium"))
         if SCENARIO == "reject":
@@ -166,6 +183,21 @@ def act(prompt):
             lib().write_text(lib().read_text() + "pub fn b() -> i32 { return 2; }\n")
             return {"summary": "added b", "files_changed": ["src/lib.rs"], "tests_added": [],
                     "gates_green": True, "notes": ""}
+        if SCENARIO in ("weaken", "weaken_revert"):  # needless_return hidden by --cap-lints in a cargo config
+            lib().write_text(FIXED + NEEDLESS_RETURN)
+            Path(".cargo").mkdir(exist_ok=True)
+            Path(".cargo/config.toml").write_text(CAP_LINTS)
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO == "allow_unneeded":  # an #[allow] that hides nothing
+            lib().write_text(replaced(FIXED, "pub fn parse_kv", "#[allow(dead_code)]\npub fn parse_kv"))
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO == "digest_change":  # a harmless clippy.toml now, a hiding one after the fixer
+            lib().write_text(BUGGY)
+            Path("clippy.toml").write_text("# nothing configured\n")
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
         lib().write_text(CLIPPY_RED if SCENARIO == "gatefix" else BUGGY)
         return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
                 "gates_green": True, "notes": ""}
@@ -175,6 +207,20 @@ def act(prompt):
                 return {"summary": "nothing changed", "resolutions": [], "tests_added": []}
             lib().write_text(BUGGY)
             return {"summary": "removed needless return / collect", "resolutions": [], "tests_added": []}
+        if SCENARIO in ("weaken", "weaken_revert", "digest_change") and gate_ids(prompt):
+            if SCENARIO == "weaken_revert":
+                Path(".cargo/config.toml").unlink()
+                lib().write_text(FIXED)
+                status, note = "fixed", "reverted the cargo config and the needless return"
+            else:
+                status, note = "rejected", "the task requires this configuration"
+            return {"summary": "gate changes", "tests_added": [],
+                    "resolutions": [{"id": g, "status": status, "note": note} for g in gate_ids(prompt)]}
+        if SCENARIO == "digest_change":  # round 1 (F1): fix the bug and swap the accepted config for a hiding one
+            lib().write_text(replaced(FIXED, "#[cfg(test)]", MANY_ARGS.lstrip("\n") + "\n#[cfg(test)]"))
+            Path("clippy.toml").write_text("too-many-arguments-threshold = 100\n")
+            return {"summary": "trimmed", "resolutions": [{"id": "F1", "status": "fixed", "note": "trim + test"}],
+                    "tests_added": ["trims_whitespace"]}
         if SCENARIO == "dispute":
             return {"summary": "disagree", "resolutions": [{"id": "F1", "status": "rejected",
                     "note": "inputs are pre-trimmed by the caller"}], "tests_added": []}

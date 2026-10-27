@@ -611,3 +611,35 @@ def test_prove_lifetime_next_to_attribute(rust_repo):
     write(rust_repo, "src/lib.rs", LIB_OK + "pub struct W<'a>(#[allow(dead_code)] pub &'a u8);\n")
     r = proof(rust_repo)
     assert r.status == "passed", r
+
+
+# ── state functions ──────────────────────────────────────────────────────────
+def _gc(path="clippy.toml", kind="config", digest="d1", provable=True):
+    return integrity.GateChange(f"G-{kind}-{path}", path, kind, "detail", digest, provable)
+
+
+def test_reconcile_carries_by_digest():
+    first = integrity.reconcile([], [_gc()])
+    e = first[0]
+    e.update(proof="passed", proof_tree="t", votes={"reviewer_a": {"digest": "d1", "decision": "accept", "reason": "r"}},
+             justification="why", fix_rounds=2, status="accepted", accepted_by="proof")
+    same = integrity.reconcile(first, [_gc()])[0]
+    assert (same["proof"], same["justification"], same["fix_rounds"], same["status"]) == ("passed", "why", 2, "accepted")
+    assert same["votes"] == e["votes"]
+    other = integrity.reconcile(first, [_gc(digest="d2")])[0]
+    assert (other["proof"], other["votes"], other["justification"], other["status"]) == ("", {}, "", "pending")
+    assert other["fix_rounds"] == 2
+    assert integrity.reconcile(first, []) == []
+
+
+def test_decide_rules():
+    ents = integrity.reconcile([], [_gc("a.toml"), _gc("b.toml"), _gc("c.toml"), _gc("u", "unknown", provable=False),
+                                    _gc("d", "tests-removed", provable=False)])
+    by = {e["path"]: e for e in ents}
+    integrity.apply_proof([by["a.toml"]], ProofResult("passed", "ok"))
+    integrity.apply_proof([by["b.toml"]], ProofResult("failed", "no"))
+    integrity.decide(ents)
+    assert (by["a.toml"]["status"], by["a.toml"]["accepted_by"]) == ("accepted", "proof")
+    assert by["b.toml"]["status"] == "blocked" and by["c.toml"]["status"] == "pending"
+    assert by["u"]["status"] == "blocked" and by["d"]["status"] == "pending"
+    assert {e["path"] for e in integrity.pending(ents)} == {"b.toml", "c.toml", "u", "d"}

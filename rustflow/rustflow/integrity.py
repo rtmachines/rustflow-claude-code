@@ -17,6 +17,7 @@ import re
 import shutil
 import sys
 import tempfile
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -508,6 +509,7 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
     root = root.resolve()
     wt = _wt_path(root, head_tree)
     had_target = "CARGO_TARGET_DIR" in os.environ
+    saved_base = os.environ.get("RUSTFLOW_BASE")
     try:
         _prepare_wt_parent(wt)
         shutil.rmtree(wt, ignore_errors=True)
@@ -536,6 +538,7 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
                     fh.write(_strip_verified(text, added[c.path], all_added.get(c.path, set()), c.path))
         if not had_target:
             os.environ["CARGO_TARGET_DIR"] = str(root / "target")
+        os.environ["RUSTFLOW_BASE"] = base_rev   # the semver gate compares against the base, not crates.io
         res = gates.run_gates(wt, profile, cfg=cfg, strict=(profile == "full"), use_cache=False,
                               log_dir=log_dir, fix_fmt=False)
     except Exception as e:
@@ -543,8 +546,62 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
     finally:
         if not had_target:
             os.environ.pop("CARGO_TARGET_DIR", None)
+        if saved_base is None:
+            os.environ.pop("RUSTFLOW_BASE", None)
+        else:
+            os.environ["RUSTFLOW_BASE"] = saved_base
         _remove_worktree(root, wt)
     incomplete = [s.name for s in res.steps if not s.output_complete]
     if incomplete:
         return ProofResult("failed", res.summary_line(), "incomplete gate output: " + ", ".join(incomplete))
     return ProofResult("passed" if res.ok else "failed", res.summary_line())
+
+
+# ── state of the detected changes (pure functions; entries are plain dicts kept in the run state) ──────
+_CARRIED = ("status", "accepted_by", "proof", "proof_tree", "votes", "justification")
+
+
+def reconcile(prev: list[dict], changes: list[GateChange]) -> list[dict]:
+    """New state entries for `changes`. Verdicts (proof, votes, justification) survive only for the same
+    id AND digest; `fix_rounds` survives for the same id; changes that are gone disappear."""
+    old = {e.get("id"): e for e in prev}
+    out = []
+    for c in changes:
+        e = c.to_dict()
+        p = old.get(c.id) or {}
+        same = bool(p) and p.get("digest") == c.digest
+        e.update(status="pending", accepted_by="", proof="", proof_tree="", votes={}, justification="",
+                 fix_rounds=int(p.get("fix_rounds", 0) or 0))
+        if same:
+            for k in _CARRIED:
+                if k in p:
+                    e[k] = deepcopy(p[k])
+        out.append(e)
+    return out
+
+
+def apply_proof(entries: list[dict], result: ProofResult, tree: str = "") -> None:
+    """Record the proof outcome on every provable entry that has none yet."""
+    for e in entries:
+        if e.get("provable") and not e.get("proof"):
+            e["proof"] = result.status
+            e["proof_tree"] = tree
+
+
+def decide(entries: list[dict]) -> None:
+    for e in entries:
+        if e["kind"] == "unknown":
+            e["status"], e["accepted_by"] = "blocked", ""
+        elif e.get("provable"):
+            if e.get("proof") == "passed":
+                e["status"], e["accepted_by"] = "accepted", "proof"
+            elif e.get("proof") == "failed":
+                e["status"], e["accepted_by"] = "blocked", ""
+            else:
+                e["status"], e["accepted_by"] = "pending", ""
+        else:
+            e["status"], e["accepted_by"] = "pending", ""   # reviewer consent: a later task
+
+
+def pending(entries: list[dict]) -> list[dict]:
+    return [e for e in entries if e.get("status") != "accepted"]

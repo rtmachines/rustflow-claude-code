@@ -26,7 +26,7 @@ from typing import Any
 
 from rustflow import criteria as crit_mod
 from rustflow import findings as fnd
-from rustflow import gates, gitutil, procutil, prompts, report, runs, schemas, triage, usage
+from rustflow import gates, gitutil, integrity, procutil, prompts, report, runs, schemas, triage, usage
 from rustflow.agents import AgentCall, AgentResult, make_runners, run_with_retry
 from rustflow.config import AgentSpec, Config, bump, gates_command, max_difficulty
 from rustflow.budget import BudgetManager, BudgetExceeded, DEFAULT_LIMITS, validate_limits
@@ -36,7 +36,7 @@ RUNS_DIR = Path(".rustflow") / "runs"
 RUNTIME_GITIGNORE = "runs/\ncache/\nwt/\n__pycache__/\n"
 RESUMABLE = ("interrupted", "budget", "crashed", "tree_changed", "agent_failed", "incomplete")
 # Finished, but another fix round can still help: `rustflow resume <run> --extra-rounds N`.
-CONTINUABLE = ("max_rounds", "stalled", "final_gates_red", "criteria_unmet")
+CONTINUABLE = ("max_rounds", "stalled", "final_gates_red", "criteria_unmet", "gate_changes_pending")
 
 
 @dataclass
@@ -208,7 +208,7 @@ class Orchestrator:
         self.state = {
             "run_id": run_id, "created": _now(), "task": task, "mode": self.opts.mode,
             "repo": str(self.repo), "workdir": str(self.repo), "phase": "preflight", "round": 0,
-            "gate_fix_attempts": 0, "findings": [], "id_counter": 0, "rounds": [], "agents": [],
+            "gate_fix_attempts": 0, "findings": [], "gate_changes": [], "id_counter": 0, "rounds": [], "agents": [],
             "cost_usd": 0.0, "tokens": {}, "status": "running", "dry_run": self.opts.dry_run,
             "options": self.opts.__dict__.copy(), "pid": os.getpid(),
             "criteria": [c.to_dict() for c in criteria], "mechanical": [], "seen_trees": [],
@@ -635,6 +635,47 @@ class Orchestrator:
                 round=rnd))
         return out
 
+    def _refresh_gate_changes(self, label: str) -> None:
+        """Scan base..tree for gate-affecting changes, prove the provable ones harmless, record the verdicts."""
+        if self.opts.dry_run:
+            return
+        head = self.snapshot()
+        cfg = self._gate_cfg()
+        changes = integrity.scan(self.workdir, self.state["base_sha"], head, cfg)
+        entries = integrity.reconcile(self.state.get("gate_changes") or [], changes)
+        for e in entries:   # a proof is about one tree: other code may now be hidden by the same config
+            if e["provable"] and e["proof"] and e["proof_tree"] != head:
+                e["proof"] = e["proof_tree"] = ""
+        if any(e["provable"] and not e["proof"] for e in entries):
+            result = integrity.prove(self.workdir, self.state["base_sha"], head, changes, "full", cfg,
+                                     log_dir=self.run_dir / "gates" / f"proof-{label}")
+            self.log(f"gate-change proof [{label}]: {result.status} - {result.summary} {result.error}".rstrip())
+            integrity.apply_proof(entries, result, head)
+            self._check_budget()
+        integrity.decide(entries)
+        self.state["gate_changes"] = entries
+        for e in entries:
+            self.log(f"   gate change [{e['id']}] {e['status']}"
+                     + (f" (by {e['accepted_by']})" if e["accepted_by"] else "") + f": {e['detail'][:100]}")
+
+    def _gate_findings(self, rnd: int, prev_open: list[fnd.Finding]) -> list[fnd.Finding]:
+        was_open = {f.id for f in prev_open}
+        out = []
+        for e in self.state.get("gate_changes") or []:
+            fid = e["id"]
+            accepted = e["status"] == "accepted"
+            out.append(fnd.Finding(
+                id=fid, severity="P1", category="gate-integrity",
+                file=e["path"] if (self.workdir / e["path"]).exists() else "", line=0,
+                title=f"Gate-affecting change ({e['kind']}): {e['detail']}",
+                trigger="the change alters what the gates check or how strictly (detected by the orchestrator)",
+                impact="a gate can pass because of this change instead of because the code is correct",
+                rule="gate-affecting changes need a proof that they hide nothing (or reviewer consent)",
+                fix="revert the change unless the task explicitly requires it; if it does, reject with the justification",
+                confidence="high", reviewers=["orchestrator"], previous_id=fid if fid in was_open else None,
+                status="accepted_gate_change" if accepted else "open", round=rnd))
+        return out
+
     def _seen_tree(self, tree: str) -> bool:
         """Remember a tree produced by a write agent; True if it was produced before (oscillation)."""
         seen = self.state.setdefault("seen_trees", [])
@@ -871,6 +912,7 @@ class Orchestrator:
         if self._gates_ok(res):
             self.state["last_gates"] = res.summary_line()
             self.state["last_gates_feedback"] = ""
+            self._refresh_gate_changes(label)
             self.state["round"] += 1
             self.state["phase"] = "review"
             return
@@ -1017,7 +1059,7 @@ class Orchestrator:
             escalation_signals=risk.escalation,
         )
         self.state["id_counter"] = ids.n
-        agg.findings[:0] = self._mechanical_findings(rnd, prev_blocking)
+        agg.findings[:0] = self._mechanical_findings(rnd, prev_blocking) + self._gate_findings(rnd, prev_blocking)
         self.state["findings"] = [f.to_dict() for f in agg.findings]
         self.state["last_review_tree"] = head
         self.state["escalate"] = bool(self.state.get("escalate")) or agg.escalate
@@ -1045,6 +1087,13 @@ class Orchestrator:
         max_rounds = int(self.opts.max_rounds or self.cfg.get("loop.max_review_rounds", 3))
         if self.opts.mode == "review" and not self.opts.fix:
             self.state["outcome"] = "changes_requested"
+            self.state["phase"] = "final"
+            return
+        by_id = {e["id"]: e for e in self.state.get("gate_changes") or []}
+        if all(f.category == "gate-integrity" and by_id.get(f.id, {}).get("fix_rounds", 0) >= 1 for f in blocking):
+            # Only gate changes are left and the fixer has already seen them: a human decides.
+            self.state["outcome"] = "gate_changes_pending"
+            self.log("only unaccepted gate-affecting changes remain after a fix round")
             self.state["phase"] = "final"
             return
         if rnd >= max_rounds:
@@ -1161,6 +1210,13 @@ class Orchestrator:
             self.log("fixer changed nothing and did not argue the findings - stopping")
             self.state["phase"] = "final"
             return
+        notes = {r.get("id"): r.get("note", "") for r in (res.data or {}).get("resolutions", [])} if res.ok else {}
+        seen = {f.id for f in blocking if f.category == "gate-integrity"}
+        for e in self.state.get("gate_changes") or []:
+            if e["id"] in seen:
+                e["fix_rounds"] = int(e.get("fix_rounds", 0)) + 1
+                if notes.get(e["id"]):
+                    e["justification"] = notes[e["id"]]
         self.checkpoint(f"fix round {rnd}")
         self.state["gate_fix_attempts"] = 0
         self.state["gates_after"] = "fix"
@@ -1170,19 +1226,26 @@ class Orchestrator:
         res = self.run_gates("final", strict=True, fix_fmt=False, use_cache=False)
         self.state["final_gates"] = res.summary_line()
         self.state["final_gates_ok"] = self._gates_ok(res)
+        if self.state["final_gates_ok"]:
+            self._refresh_gate_changes("final")
         self._evaluate_mechanical(res)
         missing = crit_mod.unmet(self.state.get("mechanical") or [])
         if not self.state["final_gates_ok"]:
             self.state["final_gates_feedback"] = res.feedback()
         outcome = self.state.get("outcome", "approved")
         findings = [fnd.Finding.from_dict(f) for f in self.state.get("findings", [])]
-        if outcome == "approved" and self.state["final_gates_ok"] and missing:
+        entries = self.state.get("gate_changes") or []
+        clean = outcome in ("approved", "gate_changes_pending")
+        if clean and self.state["final_gates_ok"] and missing:
             status = "criteria_unmet"
             self.log("required tests not proven on the final tree: " + ", ".join(r["test"] for r in missing))
-        elif outcome == "approved" and self.state["final_gates_ok"]:
-            has_adv = any(f.status in ("advisory", "disputed") for f in findings)
+        elif clean and self.state["final_gates_ok"] and integrity.pending(entries):
+            status = "gate_changes_pending"
+            self.log("gate-affecting changes without acceptance: " + ", ".join(e["id"] for e in integrity.pending(entries)))
+        elif clean and self.state["final_gates_ok"]:
+            has_adv = bool(entries) or any(f.status in ("advisory", "disputed") for f in findings)
             status = "approved_with_advisories" if has_adv else "approved"
-        elif outcome == "approved":
+        elif clean:
             status = "final_gates_red"
         else:
             status = outcome

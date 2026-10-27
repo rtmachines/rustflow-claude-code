@@ -110,6 +110,10 @@ Rules:
 - Keep the diff focused on the task; no drive-by refactors or dependency churn.
 - Never silence problems: no `#[allow(...)]` to pass clippy, no `#[ignore]`, no deleted/weakened tests,
   no `unwrap()` on recoverable paths in production code.
+- Change gate configuration files (rustflow.toml, .cargo/config*, clippy.toml, rustfmt.toml, deny.toml,
+  rust-toolchain, nextest config, `[lints]` in Cargo.toml), add `#[allow]` / `#[expect]` / `#[ignore]`, or remove a
+  test ONLY when the task explicitly requires it, and justify each such change in your report. The orchestrator
+  detects these changes mechanically, re-runs the gates without them, and blocks the run if they hide a failure.
 - Before you finish run the gates yourself: `{GATES} run --profile stop`.
   Finish only when they are green, or explain precisely why they cannot be.
 - Do not commit, push, or change git state - the orchestrator handles git.
@@ -205,6 +209,9 @@ Rules:
 - {reject}
 - Fix the root cause, minimal change, and add a regression test for each behavioral bug.
 - Never silence: no `#[allow]`, no `#[ignore]`, no weakened tests.
+- A finding `G-...` is a gate-affecting change (gate config, `#[allow]`/`#[ignore]`, removed test) detected by the
+  orchestrator: revert it, unless the TASK explicitly requires it - then set status `rejected` and give the
+  justification in note. Only the orchestrator and the reviewers can accept such a change, never you.
 - Run `{GATES} run --profile stop` before finishing; finish when green.
 - Do not commit or change git state.
 Your final answer is the JSON object described by the schema.
