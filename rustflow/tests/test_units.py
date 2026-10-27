@@ -646,5 +646,12 @@ def test_report_gate_changes_section():
     assert "## Zmiany wpływające na bramki" in text
     assert "| id | rodzaj | ścieżka | status | accepted_by | dowód | głosy | uzasadnienie |" in text
     row = next(ln for ln in text.splitlines() if ln.startswith("| G-config-clippy.toml"))
-    assert "proof" in row and "passed" in row and "a: accept" in row
+    assert "ok \\| fine" in row and "proof" in row and "passed" in row and "a: accept" in row
     assert "Zmiany wpływające na bramki" not in report.render({"run_id": "r", "status": "approved"}, Path("."))
+
+
+def test_report_gate_changes_pending_resume_line():
+    from pathlib import Path
+    from rustflow import report
+    text = report.render({"run_id": "r9", "status": "gate_changes_pending"}, Path("."))
+    assert "rustflow resume r9 --extra-rounds 1" in text

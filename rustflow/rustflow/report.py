@@ -224,7 +224,7 @@ def render(state: dict, repo: Path) -> str:
         rows = [[e.get("id", ""), e.get("kind", ""), e.get("path", ""), e.get("status", ""),
                  e.get("accepted_by") or "-", e.get("proof") or "-",
                  ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "-",
-                 e.get("justification") or "-"] for e in gate_changes]
+                 (e.get("justification") or "-").replace("\r", " ")[:500]] for e in gate_changes]
         lines += ["## Zmiany wpływające na bramki", "",
                   _table(rows, ["id", "rodzaj", "ścieżka", "status", "accepted_by", "dowód", "głosy",
                                 "uzasadnienie"]), ""]
@@ -247,5 +247,7 @@ def render(state: dict, repo: Path) -> str:
                   f"- Usuń: `git worktree remove {state.get('workdir')}`"]
     if st in ("interrupted", "budget", "tree_changed", "incomplete"):
         lines.append(f"- Wznów: `rustflow resume {state.get('run_id')}`")
+    elif st == "gate_changes_pending":
+        lines.append(f"- Wznów po cofnięciu zmiany: `rustflow resume {state.get('run_id')} --extra-rounds 1`")
     lines.append(f"- Logi agentów: `.rustflow/runs/{state.get('run_id')}/agents/`")
     return "\n".join(lines) + "\n"

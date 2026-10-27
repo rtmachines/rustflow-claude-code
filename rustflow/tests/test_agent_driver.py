@@ -252,3 +252,24 @@ def test_next_actions_gate_changes_pending():
     s = runs.summary(st)
     assert s["gate_changes"] == {"pending": 1, "accepted": 0}
     assert "gate changes: 1 pending, 0 accepted" in runs.brief_markdown(s)
+
+
+def test_gate_changes_question_bounded_and_counts():
+    many = [{**GATE_ENTRY, "id": f"G-config-{i}", "path": "p" * 500 + str(i), "detail": "weak",
+             "justification": "IGNORE PREVIOUS", "votes": {"r": {"decision": "reject", "reason": "SECRET-REASON"}}}
+            for i in range(20)]
+    q = runs.next_actions({"status": "gate_changes_pending", "run_id": "r", "gate_changes": many})[0]["question"]
+    assert "G-config-14" in q and "G-config-15" not in q and "+5 more - see report.md" in q
+    assert "IGNORE PREVIOUS" not in q and "SECRET-REASON" not in q and "weak" in q and "`" in q
+    assert "p" * 201 not in q
+    mixed = [{**GATE_ENTRY, "status": "accepted"}, {**GATE_ENTRY, "id": "G-x", "status": "blocked"}]
+    assert runs.summary({"status": "gate_changes_pending", "run_id": "r", "gate_changes": mixed})[
+        "gate_changes"] == {"pending": 1, "accepted": 1}
+
+
+def test_merge_note_lists_accepted_gate_changes():
+    st = {"status": "approved_with_advisories", "run_id": "r", "branch": "rustflow/r", "isolation": "branch",
+          "original_branch": "main", "gate_changes": [{**GATE_ENTRY, "status": "accepted"}]}
+    acts = runs.next_actions(st)
+    merge = next(a for a in acts if a["action"] == "merge")
+    assert "includes accepted gate changes: G-config-rustflow.toml" in merge["note"]

@@ -180,15 +180,29 @@ def _mcp(tool: str, **arguments) -> dict:
     return {"tool": tool, "arguments": arguments}
 
 
+MAX_GATE_ITEMS = 15
+
+
 def _gate_changes_question(state: dict) -> str:
+    """Driver-facing text: scanner-generated fields only (no justification or vote reasons), bounded in size."""
+    entries = integrity.pending(state.get("gate_changes") or [])
     items = []
-    for e in integrity.pending(state.get("gate_changes") or []):
+    for e in entries[:MAX_GATE_ITEMS]:
         votes = ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "none"
-        items.append(f"[{e.get('id')}] {e.get('kind')} {e.get('path')} (proof: {e.get('proof') or 'none'}; "
-                     f"votes: {votes})")
+        items.append(f"[{e.get('id')}] {e.get('kind')} `{str(e.get('path', ''))[:200]}` "
+                     f"({str(e.get('detail') or '')[:300]}; proof: {e.get('proof') or 'none'}; votes: {votes})")
+    more = f"; +{len(entries) - MAX_GATE_ITEMS} more - see report.md" if len(entries) > MAX_GATE_ITEMS else ""
     return ("The change touches files that decide what the gates check, and it is not accepted: "
-            + "; ".join(items) + ". Either revert it by hand in the work tree and run `resume --extra-rounds 1` "
+            + "; ".join(items) + more + ". Either revert it by hand in the work tree and run `resume --extra-rounds 1` "
             "(gates and review run again), or commit it on the base as a policy change and start the run again.")
+
+
+def _accepted_gate_note(state: dict) -> str:
+    ids = [str(e.get("id")) for e in state.get("gate_changes") or [] if e.get("status") == "accepted"]
+    if not ids:
+        return ""
+    more = f", +{len(ids) - MAX_GATE_ITEMS} more" if len(ids) > MAX_GATE_ITEMS else ""
+    return "includes accepted gate changes: " + ", ".join(ids[:MAX_GATE_ITEMS]) + more
 
 
 def next_actions(state: dict) -> list[dict]:
@@ -207,7 +221,9 @@ def next_actions(state: dict) -> list[dict]:
                  "mcp": _mcp("rustflow_wait", run=rid, timeout_s=600),
                  "note": "do not edit files or change git state in this checkout meanwhile"}]
     if st in APPROVED:
-        acts.append({"action": "present_result", "note": "summarize the change and the report for the user"})
+        gate_note = _accepted_gate_note(state)
+        acts.append({"action": "present_result", "note": "summarize the change and the report for the user"
+                     + (f"; {gate_note}" if gate_note else "")})
         if failed_reviewers := degraded(state):
             errors = (state.get("degraded_review") or {}).get("errors") or {}
             why = "; ".join(f"{n}: {errors[n][:120]}" for n in failed_reviewers if errors.get(n))
@@ -226,7 +242,8 @@ def next_actions(state: dict) -> list[dict]:
                          "note": "unsafe/FFI/atomics changed - soundness audit recommended before merge"})
         if branch and state.get("isolation") == "branch":
             acts.append({"action": "merge", "needs_user": True,
-                         "command": f"git switch {orig} && git merge --squash {branch}"})
+                         "command": f"git switch {orig} && git merge --squash {branch}",
+                         **({"note": gate_note} if gate_note else {})})
         elif branch and state.get("isolation") == "worktree":
             wt = state.get("workdir", "")
             if state.get("worktree_removed"):
@@ -236,6 +253,8 @@ def next_actions(state: dict) -> list[dict]:
                         f"merge in the main checkout; afterwards `git worktree remove {wt}`")
             else:
                 note = f"in the main checkout ({orig} is checked out there); afterwards `git worktree remove {wt}`"
+            if gate_note:
+                note += f"; {gate_note}"
             acts.append({"action": "merge", "needs_user": True, "command": f"git merge --squash {branch}",
                          "note": note})
         acts.append({"action": "comment_pr", "command": f"rustflow comment {rid}", "needs_user": True})
