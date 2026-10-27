@@ -23,11 +23,17 @@ def test_shared_raw_byte_boundary(tmp_path, adapter, extra):
     assert r.ok is (extra == 0)
 
 
-def test_large_stdin_is_sent_while_output_is_drained(tmp_path):
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_large_stdin_is_sent_while_output_is_drained(newline):
     r = procutil.run([sys.executable, '-c',
-        'import os,sys; os.write(1,b"x"*100000); data=sys.stdin.buffer.read(); print(len(data))'],
+        f'import os,sys; sys.stdout.reconfigure(newline={newline!r}); '
+        'os.write(1,b"x"*100000); data=sys.stdin.buffer.read(); print(len(data))'],
         stdin_text='z'*1000000, timeout_s=5, max_output_bytes=110000)
-    assert r.ok and r.stdout.endswith('1000000\n')
+    expected = 'x'*100000 + '1000000' + newline
+    assert r.ok and r.output_complete
+    assert r.stdout == expected
+    assert r.stdout_bytes == len(expected.encode('utf-8'))
+    assert r.stderr_bytes == 0
 
 
 def test_infinite_output_and_stdout_file_are_bounded(tmp_path):
