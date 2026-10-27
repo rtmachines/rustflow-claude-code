@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import os
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -235,3 +238,173 @@ def _scan(root: Path, base_rev: str, head_tree: str, cfg: dict) -> list[GateChan
     if sum(n for p, n in removed.items() if not _is_runtime(p)) > 0:
         out.append(_change("tests-removed", "*", "test attributes removed in: " + ", ".join(files), _sha("\n".join(files))))
     return out
+
+
+# ── proof ────────────────────────────────────────────────────────────────────
+@dataclass
+class ProofResult:
+    status: str      # passed | failed
+    summary: str
+    error: str = ""
+
+
+def _skip_literal(text: str, i: int) -> int:
+    """Index just past a string / char literal / line comment starting at `i`; `i` itself when none starts there."""
+    c = text[i]
+    if c == '"':
+        j = i + 1
+        while j < len(text) and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return j + 1
+    if c == "'":  # char literal, not a lifetime: 'x' or '\n'
+        m = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^\\'])'").match(text, i)
+        return m.end() if m else i
+    if text.startswith("//", i):
+        j = text.find("\n", i)
+        return len(text) if j < 0 else j
+    return i
+
+
+def _attr_end(text: str, i: int) -> int:
+    """`i` is at `#`; index just past the matching `]` of `#[...]` / `#![...]`, or -1 when it is no attribute."""
+    j = i + 1
+    if text.startswith("!", j):
+        j += 1
+    if not text.startswith("[", j):
+        return -1
+    depth = 0
+    while j < len(text):
+        k = _skip_literal(text, j)
+        if k != j:
+            j = k
+            continue
+        if text[j] == "[":
+            depth += 1
+        elif text[j] == "]":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return -1
+
+
+def strip_attributes(text: str, added: list[str]) -> str:
+    """Cut the silencing attributes (`#[...]` / `#![...]`, bracket-counted, literals skipped) that stand on the
+    `added` lines. A line left empty disappears."""
+    wanted = {a.strip() for a in added}
+    gone = bytearray(len(text))
+    touched: set[int] = set()
+    pos = 0
+    for n, line in enumerate(text.splitlines(keepends=True)):
+        start, end = pos, pos + len(line)
+        pos = end
+        if line.strip() not in wanted:
+            continue
+        i = start
+        while i < end:
+            k = _skip_literal(text, i)
+            if k != i:
+                i = k
+                continue
+            if text[i] == "#" and (e := _attr_end(text, i)) > 0:
+                if SILENCE_RE.search(text[i:e]):
+                    while e < len(text) and text[e] in " \t":
+                        e += 1
+                    for x in range(i, e):
+                        gone[x] = 1
+                    touched.add(n)
+                i = max(e, i + 1)
+                continue
+            i += 1
+    if not any(gone):
+        return text
+    out, pos = [], 0
+    for n, line in enumerate(text.splitlines(keepends=True)):
+        kept = "".join(ch for x, ch in enumerate(line, pos) if not gone[x])
+        pos += len(line)
+        if kept != line and not kept.strip():
+            continue  # the line held only removed attributes (possibly continued from an earlier line)
+        out.append(kept)
+    return "".join(out)
+
+
+def _wt_path(root: Path, head_tree: str) -> Path:
+    """Deterministic (so a crashed run is recovered) and OUTSIDE the project: cargo merges `.cargo/config.toml`
+    from every ancestor directory, so a worktree under `root/` would inherit the very head config the proof removes."""
+    scope = hashlib.sha256(str(root).encode("utf-8", "replace")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / "rustflow-wt" / scope / f"proof-{hashlib.sha256(head_tree.encode()).hexdigest()[:12]}"
+
+
+def _added_attrs(root: Path, base_rev: str, head_tree: str) -> dict[str, list[str]]:
+    d = gates._git(root, "-c", "core.quotepath=false", "diff", "--no-renames", "--no-color", "-U0",
+                   base_rev, head_tree, "--", "*.rs")
+    if d.returncode != 0:
+        raise RuntimeError((d.stderr or "").strip() or "git diff -U0 failed")
+    return _parse_rs_diff(d.stdout)[0]
+
+
+def _git_ok(root: Path, *args: str, env: dict | None = None) -> str:
+    r = gates._git(root, *args, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {(r.stderr or r.stdout or '').strip()}")
+    return r.stdout
+
+
+def _remove_worktree(root: Path, wt: Path) -> None:
+    try:
+        gates._git(root, "worktree", "remove", "--force", str(wt))
+    except Exception:
+        pass
+    shutil.rmtree(wt, ignore_errors=True)
+    try:
+        gates._git(root, "worktree", "prune")
+    except Exception:
+        pass
+
+
+def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], profile: str, cfg: dict,
+          log_dir: Path | None = None) -> ProofResult:
+    """Run the gates on `head_tree` with the base configuration restored and the added silencing attributes
+    stripped, in a temporary worktree. Passing means the provable changes do not hide any failure.
+    Fail-closed: any error or incomplete gate output is `failed`."""
+    provable = [c for c in changes if c.provable]
+    if not provable:
+        return ProofResult("passed", "nothing to prove")
+    root = root.resolve()
+    wt = _wt_path(root, head_tree)
+    had_target = "CARGO_TARGET_DIR" in os.environ
+    try:
+        shutil.rmtree(wt, ignore_errors=True)
+        gates._git(root, "worktree", "prune")
+        env = {f"GIT_{who}_{f}": v for who in ("AUTHOR", "COMMITTER") for f, v in (("NAME", "rustflow"), ("EMAIL", "rustflow@localhost"))}
+        commit = _git_ok(root, "commit-tree", head_tree, "-m", "proof", env=env).strip()
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        _git_ok(root, "worktree", "add", "--detach", str(wt), commit)
+        for c in provable:
+            if c.kind == "config":
+                base = gates._git(root, "show", f"{base_rev}:{c.path}")
+                target = wt / c.path
+                if base.returncode == 0:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(base.stdout.encode("utf-8"))
+                elif target.exists():
+                    target.unlink()
+        added = _added_attrs(root, base_rev, head_tree)
+        for c in provable:
+            if c.kind == "silence" and c.path in added and (wt / c.path).is_file():
+                f = wt / c.path
+                f.write_text(strip_attributes(f.read_text(encoding="utf-8"), added[c.path]), encoding="utf-8")
+        if not had_target:
+            os.environ["CARGO_TARGET_DIR"] = str(root / "target")
+        res = gates.run_gates(wt, profile, cfg=cfg, strict=(profile == "full"), use_cache=False,
+                              log_dir=log_dir, fix_fmt=False)
+    except Exception as e:
+        return ProofResult("failed", "proof could not run", f"{type(e).__name__}: {e}")
+    finally:
+        if not had_target:
+            os.environ.pop("CARGO_TARGET_DIR", None)
+        _remove_worktree(root, wt)
+    incomplete = [s.name for s in res.steps if not s.output_complete]
+    if incomplete:
+        return ProofResult("failed", res.summary_line(), "incomplete gate output: " + ", ".join(incomplete))
+    return ProofResult("passed" if res.ok else "failed", res.summary_line())
