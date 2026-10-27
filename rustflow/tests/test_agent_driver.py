@@ -231,3 +231,24 @@ def test_mcp_start_filters_flags_by_mode(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
     text, info = mcp_server.t_start({"mode": "review", "base": "main", "fix": False, "allow_dirty": True, "task": "x"})
     assert seen["args"] == ["review", "--base", "main"] and info["ignored_for_mode"] == ["allow_dirty"]
+
+
+GATE_ENTRY = {"id": "G-config-rustflow.toml", "path": "rustflow.toml", "kind": "config", "detail": "weakened",
+              "digest": "d", "provable": True, "status": "pending", "accepted_by": "", "proof": "failed",
+              "proof_tree": "", "votes": {"gate-reviewer": {"digest": "d", "decision": "reject", "reason": "x"}},
+              "justification": "", "fix_rounds": 0}
+
+
+def test_next_actions_gate_changes_pending():
+    st = {"status": "gate_changes_pending", "run_id": "r", "base_sha": "abcdef1234567", "branch": "rustflow/r",
+          "isolation": "branch", "original_branch": "main", "gate_changes": [GATE_ENTRY]}
+    acts = runs.next_actions(st)
+    assert len(acts) == 1 and acts[0]["action"] == "ask_user" and acts[0]["needs_user"] is True
+    assert "G-config-rustflow.toml" in acts[0]["question"] and "failed" in acts[0]["question"]
+    assert acts[0]["command"] == "rustflow resume r --extra-rounds 1 --detach"
+    assert acts[0]["mcp"] == {"tool": "rustflow_resume", "arguments": {"run": "r", "extra_rounds": 1}}
+    assert not any(a["action"] == "merge" for a in acts)
+    assert runs.exit_code("gate_changes_pending") == 2
+    s = runs.summary(st)
+    assert s["gate_changes"] == {"pending": 1, "accepted": 0}
+    assert "gate changes: 1 pending, 0 accepted" in runs.brief_markdown(s)

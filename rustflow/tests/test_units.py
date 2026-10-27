@@ -634,3 +634,17 @@ def test_review_prompt_lists_pending_changes():
     assert "GATE-AFFECTING CHANGES NEEDING YOUR VOTE" in p and "[G-cargo-lints-Cargo.toml]" in p
     ctx.gate_changes = ""
     assert "NEEDING YOUR VOTE" not in prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")
+
+
+def test_report_gate_changes_section():
+    from pathlib import Path
+    from rustflow import report
+    entry = {"id": "G-config-clippy.toml", "path": "clippy.toml", "kind": "config", "status": "accepted",
+             "accepted_by": "proof", "proof": "passed", "votes": {"a": {"decision": "accept"}},
+             "justification": "ok | fine"}
+    text = report.render({"run_id": "r", "status": "approved_with_advisories", "gate_changes": [entry]}, Path("."))
+    assert "## Zmiany wpływające na bramki" in text
+    assert "| id | rodzaj | ścieżka | status | accepted_by | dowód | głosy | uzasadnienie |" in text
+    row = next(ln for ln in text.splitlines() if ln.startswith("| G-config-clippy.toml"))
+    assert "proof" in row and "passed" in row and "a: accept" in row
+    assert "Zmiany wpływające na bramki" not in report.render({"run_id": "r", "status": "approved"}, Path("."))

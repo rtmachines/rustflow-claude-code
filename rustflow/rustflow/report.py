@@ -25,6 +25,7 @@ STATUS_TEXT = {
     "error": "BŁĄD",
     "interrupted": "PRZERWANE (można wznowić)",
     "tree_changed": "PLIKI ZMIENIONE W TRAKCIE RECENZJI - wyniki odrzucone (można wznowić)",
+    "gate_changes_pending": "ZMIANY WPŁYWAJĄCE NA BRAMKI CZEKAJĄ NA DECYZJĘ CZŁOWIEKA (można wznowić)",
     "running": "W TOKU",
 }
 
@@ -217,6 +218,16 @@ def render(state: dict, repo: Path) -> str:
                                  + (f" - fix: {f['fix']}" if f.get("fix") else "")
                                  + (f" - fixer: {f['resolution']}" if f.get("resolution") else ""))
                 lines.append("")
+
+    gate_changes = state.get("gate_changes") or []
+    if gate_changes:
+        rows = [[e.get("id", ""), e.get("kind", ""), e.get("path", ""), e.get("status", ""),
+                 e.get("accepted_by") or "-", e.get("proof") or "-",
+                 ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "-",
+                 e.get("justification") or "-"] for e in gate_changes]
+        lines += ["## Zmiany wpływające na bramki", "",
+                  _table(rows, ["id", "rodzaj", "ścieżka", "status", "accepted_by", "dowód", "głosy",
+                                "uzasadnienie"]), ""]
 
     risks = [r for rec in state.get("rounds", [])[-1:] for r in rec.get("residual_risks", [])]
     if risks:

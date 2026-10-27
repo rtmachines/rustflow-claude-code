@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from rustflow import gates, usage
+from rustflow import gates, integrity, usage
 
 RUNS = Path(".rustflow") / "runs"
 APPROVED = ("approved", "approved_with_advisories")
@@ -180,6 +180,17 @@ def _mcp(tool: str, **arguments) -> dict:
     return {"tool": tool, "arguments": arguments}
 
 
+def _gate_changes_question(state: dict) -> str:
+    items = []
+    for e in integrity.pending(state.get("gate_changes") or []):
+        votes = ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "none"
+        items.append(f"[{e.get('id')}] {e.get('kind')} {e.get('path')} (proof: {e.get('proof') or 'none'}; "
+                     f"votes: {votes})")
+    return ("The change touches files that decide what the gates check, and it is not accepted: "
+            + "; ".join(items) + ". Either revert it by hand in the work tree and run `resume --extra-rounds 1` "
+            "(gates and review run again), or commit it on the base as a policy change and start the run again.")
+
+
 def next_actions(state: dict) -> list[dict]:
     st = effective_status(state)
     rid = state.get("run_id", "?")
@@ -229,6 +240,11 @@ def next_actions(state: dict) -> list[dict]:
                          "note": note})
         acts.append({"action": "comment_pr", "command": f"rustflow comment {rid}", "needs_user": True})
         return acts
+    if st == "gate_changes_pending":
+        return [{"action": "ask_user", "needs_user": True,
+                 "question": _gate_changes_question(state),
+                 "command": f"rustflow resume {rid} --extra-rounds 1 --detach",
+                 "mcp": _mcp("rustflow_resume", run=rid, extra_rounds=1)}]
     if st == "changes_requested":
         return [{"action": "ask_user", "question": f"{len(open_)} blocking finding(s). Run the fix loop?",
                  "command": f"rustflow review --fix --base {base} --detach",
@@ -288,7 +304,10 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
     def brief(f: dict) -> dict:
         return {"id": f["id"], "severity": f["severity"],
                 "where": f"{f['file']}:{f['line']}" if f.get("file") else "", "title": f["title"][:160]}
+    gate_changes = state.get("gate_changes") or []
     return {
+        "gate_changes": {"pending": len(integrity.pending(gate_changes)),
+                         "accepted": sum(1 for e in gate_changes if e.get("status") == "accepted")},
         "run_id": state.get("run_id"), "status": st, "phase": state.get("phase"), "round": state.get("round"),
         "difficulty": state.get("difficulty"), "cost_usd": state.get("cost_usd", 0.0),
         "usage_summary": usage.summary_for_state(state),
@@ -329,6 +348,9 @@ def brief_markdown(s: dict, mcp: bool = False) -> str:
         if s[key]:
             lines.append(f"{label}:")
             lines += [f"  [{f['id']}] {f['severity']} {f['where']} {f['title']}" for f in s[key]]
+    gc = s.get("gate_changes") or {}
+    if gc.get("pending") or gc.get("accepted"):
+        lines.append(f"gate changes: {gc.get('pending', 0)} pending, {gc.get('accepted', 0)} accepted")
     if s["advisory_count"]:
         lines.append(f"advisory: {s['advisory_count']}")
     if s.get("degraded"):
