@@ -176,10 +176,11 @@ def _unquote(name: str) -> str:
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
 
 
-def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None
-                   ) -> tuple[dict[str, list[str]], dict[str, int]]:
+def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None,
+                   all_added: dict[str, set[int]] | None = None) -> tuple[dict[str, list[str]], dict[str, int]]:
     """Added silencing attributes per file and net removed test attributes per file (comment lines ignored).
-    When `positions` is given it receives, per file, the head line numbers (1-based) of the added silencing lines."""
+    When `positions` is given it receives, per file, the head line numbers (1-based) of the added silencing lines;
+    `all_added` receives every added head line number per file."""
     silence: dict[str, list[str]] = {}
     removed: dict[str, int] = {}
     path, in_header, new_no = None, False, 0
@@ -207,6 +208,8 @@ def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None
             here = new_no
             if line[0] == "+":
                 new_no += 1
+                if all_added is not None:
+                    all_added.setdefault(path, set()).add(here)
             if body.startswith("//"):
                 continue
             if line[0] == "+" and SILENCE_RE.search(body):
@@ -314,10 +317,11 @@ def _attr_end(text: str, i: int) -> int:
     return -1
 
 
-def _strip(text: str, added: list[int]) -> tuple[str, list[int]]:
+def _strip(text: str, added: list[int], allowed: set[int] | None = None) -> tuple[str, list[int]]:
     """Cut the silencing attributes (`#[...]` / `#![...]`, bracket-counted, literals skipped) that stand on the
     `added` lines (1-based line numbers in `text`, git numbering). A line left empty disappears. Also returns the
-    added line numbers that still carry a silencing attribute afterwards (a tokenizer miss)."""
+    added line numbers that still carry a silencing attribute afterwards (a tokenizer miss) and, when `allowed`
+    (every added line) is given, the lines outside it that were cut (a span running into pre-existing code)."""
     wanted = set(added)
     gone = bytearray(len(text))
     pos = 0
@@ -346,6 +350,8 @@ def _strip(text: str, added: list[int]) -> tuple[str, list[int]]:
         kept = "".join(ch for x, ch in enumerate(line, pos) if not gone[x])
         pos += len(line)
         if n + 1 in wanted and SILENCE_RE.search(kept.strip()):
+            left.append(n + 1)
+        if allowed is not None and kept != line and n + 1 not in allowed:
             left.append(n + 1)
         if kept != line and not kept.strip():
             continue  # the line held only removed attributes (possibly continued from an earlier line)
@@ -404,14 +410,15 @@ def _prepare_wt_parent(wt: Path) -> None:
                 raise RuntimeError(f"cargo config in an ancestor of the proof worktree: {cargo / name}")
 
 
-def _added_attrs(root: Path, base_rev: str, head_tree: str) -> dict[str, list[int]]:
+def _added_attrs(root: Path, base_rev: str, head_tree: str) -> tuple[dict[str, list[int]], dict[str, set[int]]]:
     d = gates._git(root, "-c", "core.quotepath=false", "diff", "--no-renames", "--no-color", "-U0",
                    base_rev, head_tree, "--", "*.rs")
     if d.returncode != 0:
         raise RuntimeError((d.stderr or "").strip() or "git diff -U0 failed")
     positions: dict[str, list[int]] = {}
-    _parse_rs_diff(d.stdout, positions)
-    return positions
+    all_added: dict[str, set[int]] = {}
+    _parse_rs_diff(d.stdout, positions, all_added)
+    return positions, all_added
 
 
 def _silence_lines(text: str) -> int:
@@ -419,12 +426,12 @@ def _silence_lines(text: str) -> int:
                if not ln.strip().startswith("//") and SILENCE_RE.search(ln.strip()))
 
 
-def _strip_verified(text: str, positions: list[int], path: str) -> str:
+def _strip_verified(text: str, positions: list[int], allowed: set[int], path: str) -> str:
     """Strip the added attributes and check that exactly those silencing lines are gone (a tokenizer miss such as
     an odd quote inside a block comment would otherwise leave the attribute in and let the proof pass)."""
-    out, left = _strip(text, positions)
+    out, left = _strip(text, positions, allowed)
     if left or _silence_lines(out) != _silence_lines(text) - len(positions):
-        raise RuntimeError(f"could not strip every added attribute in {path}")
+        raise RuntimeError(f"could not strip every added attribute in {path} exactly (unfinished or non-added lines: {left})")
     return out
 
 
@@ -474,7 +481,7 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
                     target.write_bytes(base.stdout.encode("utf-8"))
                 elif target.exists():
                     target.unlink()
-        added = _added_attrs(root, base_rev, head_tree)
+        added, all_added = _added_attrs(root, base_rev, head_tree)
         for c in provable:
             if c.kind == "silence":
                 f = wt / c.path
@@ -483,7 +490,7 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
                 with open(f, encoding="utf-8", newline="") as fh:  # no newline translation: line numbers must match git's
                     text = fh.read()
                 with open(f, "w", encoding="utf-8", newline="") as fh:
-                    fh.write(_strip_verified(text, added[c.path], c.path))
+                    fh.write(_strip_verified(text, added[c.path], all_added.get(c.path, set()), c.path))
         if not had_target:
             os.environ["CARGO_TARGET_DIR"] = str(root / "target")
         res = gates.run_gates(wt, profile, cfg=cfg, strict=(profile == "full"), use_cache=False,

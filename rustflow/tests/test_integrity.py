@@ -475,3 +475,23 @@ def test_prove_rustflow_cache_dir_is_checked(rust_repo):
     integrity._wt_path(rust_repo.resolve(), "x").parents[2].chmod(0o777)
     r = proof(rust_repo)
     assert r.status == "failed" and "accessible" in r.error, r
+
+
+def test_prove_raw_string_overstrip_fails(rust_repo):
+    write(rust_repo, "src/lib.rs", LIB_OK)
+    commit(rust_repo)
+    write(rust_repo, "src/lib.rs",
+          '#[allow(clippy::needless_return, reason = r"\\")]\npub fn a() -> i32 {\n    return 1;\n}\n// "]\npub fn b() {}\n')
+    r = proof(rust_repo)
+    assert r.status == "failed" and "strip" in r.error, r
+
+
+def test_prove_multiline_added_attribute_is_stripped(rust_repo):
+    write(rust_repo, "src/lib.rs", LIB_OK)
+    commit(rust_repo)
+    write(rust_repo, "src/lib.rs", "#[allow(\n    clippy::needless_return,\n)]\npub fn a() -> i32 {\n    return 1;\n}\n")
+    r = proof(rust_repo)
+    assert r.status == "failed" and not r.error and "clippy=FAIL" in r.summary, r
+    write(rust_repo, "src/lib.rs", "#[allow(\n    dead_code,\n)]\n" + LIB_OK)
+    r = proof(rust_repo)
+    assert r.status == "passed", r
