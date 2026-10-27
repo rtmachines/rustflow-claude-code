@@ -138,6 +138,28 @@ def _scan_cargo(root: Path, base_rev: str, head_tree: str, path: str, status: st
     return _change("cargo-lints", path, "lints/profile settings changed", _sha(head) if head else "deleted")
 
 
+_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, '"': 34, "\\": 92}
+
+
+def _unquote(name: str) -> str:
+    """Decode a git C-quoted path (`"a/we\\"ird.rs"`); unquoted names pass through (minus a trailing tab)."""
+    if not name.startswith('"'):
+        return name.split("\t")[0]
+    raw, i, body = bytearray(), 1, name
+    while i < len(body) and body[i] != '"':
+        c = body[i]
+        if c != "\\":
+            raw += c.encode("utf-8")
+            i += 1
+        elif body[i + 1 : i + 2].isdigit():
+            raw.append(int(body[i + 1 : i + 4], 8))
+            i += 4
+        else:
+            raw.append(_ESCAPES[body[i + 1]])
+            i += 2
+    return raw.decode("utf-8", "replace")
+
+
 def _parse_rs_diff(diff: str) -> tuple[dict[str, list[str]], dict[str, int]]:
     """Added silencing attributes per file and net removed test attributes per file (comment lines ignored)."""
     silence: dict[str, list[str]] = {}
@@ -147,14 +169,16 @@ def _parse_rs_diff(diff: str) -> tuple[dict[str, list[str]], dict[str, int]]:
         if line.startswith("diff --git"):
             path, in_header = None, True
         elif in_header:
-            name = line[4:].split("\t")[0]
+            name = _unquote(line[4:])
             if line.startswith("--- ") and name.startswith("a/"):
                 path = name[2:]
             elif line.startswith("+++ ") and name.startswith("b/"):
                 path = name[2:]
             elif line.startswith("@@"):
                 in_header = False
-        elif path and line[:1] in "+-" and not line.startswith("\\"):
+        elif line[:1] in "+-" and not line.startswith("\\"):
+            if not path:  # undecodable header: refuse to skip changes silently
+                raise ValueError("cannot attribute diff lines to a file")
             body = line[1:].strip()
             if body.startswith("//"):
                 continue

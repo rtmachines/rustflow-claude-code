@@ -210,3 +210,12 @@ def test_init_copies_integrity(tmp_path):
     write(tmp_path, "Cargo.toml", CARGO)
     Installer(tmp_path, with_rust_skills=False, ci=False, out=lambda *_: None, python_cmd="python3").run()
     assert (tmp_path / ".rustflow" / "integrity.py").is_file()
+
+
+def test_quoted_path_is_still_scanned(repo):
+    write(repo, 'we"ird.rs', "#[test]\nfn q() {}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "q")
+    write(repo, 'we"ird.rs', "#[allow(dead_code)]\nfn q() {}\n")
+    got = kinds(run(repo))
+    assert ("silence", 'we"ird.rs') in got and ("tests-removed", "*") in got
