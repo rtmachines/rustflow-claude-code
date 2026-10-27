@@ -163,11 +163,16 @@ def _unquote(name: str) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def _parse_rs_diff(diff: str) -> tuple[dict[str, list[str]], dict[str, int]]:
-    """Added silencing attributes per file and net removed test attributes per file (comment lines ignored)."""
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
+
+
+def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None
+                   ) -> tuple[dict[str, list[str]], dict[str, int]]:
+    """Added silencing attributes per file and net removed test attributes per file (comment lines ignored).
+    When `positions` is given it receives, per file, the head line numbers (1-based) of the added silencing lines."""
     silence: dict[str, list[str]] = {}
     removed: dict[str, int] = {}
-    path, in_header = None, False
+    path, in_header, new_no = None, False, 0
     for line in diff.splitlines():
         if line.startswith("diff --git"):
             path, in_header = None, True
@@ -179,14 +184,25 @@ def _parse_rs_diff(diff: str) -> tuple[dict[str, list[str]], dict[str, int]]:
                 path = name[2:]
             elif line.startswith("@@"):
                 in_header = False
+                new_no = int(HUNK_RE.match(line).group(1))  # type: ignore[union-attr]
+        elif line.startswith("@@"):
+            m = HUNK_RE.match(line)
+            if not m:
+                raise ValueError(f"cannot parse hunk header: {line}")
+            new_no = int(m.group(1))
         elif line[:1] in "+-" and not line.startswith("\\"):
             if not path:  # undecodable header: refuse to skip changes silently
                 raise ValueError("cannot attribute diff lines to a file")
             body = line[1:].strip()
+            here = new_no
+            if line[0] == "+":
+                new_no += 1
             if body.startswith("//"):
                 continue
             if line[0] == "+" and SILENCE_RE.search(body):
                 silence.setdefault(path, []).append(body)
+                if positions is not None:
+                    positions.setdefault(path, []).append(here)
             if TEST_RE.search(body):
                 removed[path] = removed.get(path, 0) + (1 if line[0] == "-" else -1)
     return silence, removed
@@ -288,17 +304,17 @@ def _attr_end(text: str, i: int) -> int:
     return -1
 
 
-def strip_attributes(text: str, added: list[str]) -> str:
+def strip_attributes(text: str, added: list[int]) -> str:
     """Cut the silencing attributes (`#[...]` / `#![...]`, bracket-counted, literals skipped) that stand on the
-    `added` lines. A line left empty disappears."""
-    wanted = {a.strip() for a in added}
+    `added` lines (1-based line numbers in `text`). A line left empty disappears."""
+    wanted = set(added)
     gone = bytearray(len(text))
     touched: set[int] = set()
     pos = 0
     for n, line in enumerate(text.splitlines(keepends=True)):
         start, end = pos, pos + len(line)
         pos = end
-        if line.strip() not in wanted:
+        if n + 1 not in wanted:
             continue
         i = start
         while i < end:
@@ -328,19 +344,76 @@ def strip_attributes(text: str, added: list[str]) -> str:
     return "".join(out)
 
 
+def _cache_base() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base)
+
+
 def _wt_path(root: Path, head_tree: str) -> Path:
-    """Deterministic (so a crashed run is recovered) and OUTSIDE the project: cargo merges `.cargo/config.toml`
-    from every ancestor directory, so a worktree under `root/` would inherit the very head config the proof removes."""
+    """Deterministic (a crashed run is recovered) per-user location OUTSIDE the project: cargo merges
+    `.cargo/config.toml` from every ancestor directory, so a worktree under `root/` would inherit the head config
+    the proof removes, and a shared /tmp could be planted by anyone."""
     scope = hashlib.sha256(str(root).encode("utf-8", "replace")).hexdigest()[:12]
-    return Path(tempfile.gettempdir()) / "rustflow-wt" / scope / f"proof-{hashlib.sha256(head_tree.encode()).hexdigest()[:12]}"
+    return _cache_base() / "rustflow" / "wt" / scope / f"proof-{hashlib.sha256(head_tree.encode()).hexdigest()[:12]}"
 
 
-def _added_attrs(root: Path, base_rev: str, head_tree: str) -> dict[str, list[str]]:
+def _private_dir(d: Path) -> None:
+    """Create `d` (mode 0700) when missing; refuse a symlink, a foreign owner or group/other access (POSIX)."""
+    if not d.exists() and not d.is_symlink():
+        d.mkdir(mode=0o700)
+    if os.name == "nt":
+        return
+    st = d.lstat()
+    if d.is_symlink() or not d.is_dir():
+        raise RuntimeError(f"{d} is a symlink or not a directory")
+    if st.st_uid != os.getuid():
+        raise RuntimeError(f"{d} is not owned by the current user")
+    if st.st_mode & 0o077:
+        raise RuntimeError(f"{d} is accessible to other users (mode {st.st_mode & 0o777:o}, expected 700)")
+
+
+def _prepare_wt_parent(wt: Path) -> None:
+    """Secure `<cache>/rustflow/wt/<scope>`, and refuse a cargo config in any ancestor (cargo would merge it
+    into the proof and the scan never sees it). `$CARGO_HOME` is the user's own config and is allowed."""
+    wt.parents[3].mkdir(parents=True, exist_ok=True)
+    wt.parents[2].mkdir(mode=0o700, exist_ok=True)
+    for d in (wt.parents[1], wt.parent):
+        _private_dir(d)
+    home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo").resolve()
+    for anc in wt.parents:
+        cargo = anc / ".cargo"
+        if cargo.resolve() == home:
+            continue
+        for name in ("config", "config.toml"):
+            if (cargo / name).exists():
+                raise RuntimeError(f"cargo config in an ancestor of the proof worktree: {cargo / name}")
+
+
+def _added_attrs(root: Path, base_rev: str, head_tree: str) -> dict[str, list[int]]:
     d = gates._git(root, "-c", "core.quotepath=false", "diff", "--no-renames", "--no-color", "-U0",
                    base_rev, head_tree, "--", "*.rs")
     if d.returncode != 0:
         raise RuntimeError((d.stderr or "").strip() or "git diff -U0 failed")
-    return _parse_rs_diff(d.stdout)[0]
+    positions: dict[str, list[int]] = {}
+    _parse_rs_diff(d.stdout, positions)
+    return positions
+
+
+def _silence_lines(text: str) -> int:
+    return sum(1 for ln in text.splitlines()
+               if not ln.strip().startswith("//") and SILENCE_RE.search(ln.strip()))
+
+
+def _strip_verified(text: str, positions: list[int], path: str) -> str:
+    """Strip the added attributes and check that exactly those silencing lines are gone (a tokenizer miss such as
+    an odd quote inside a block comment would otherwise leave the attribute in and let the proof pass)."""
+    out = strip_attributes(text, positions)
+    if _silence_lines(out) != _silence_lines(text) - len(positions):
+        raise RuntimeError(f"could not strip every added attribute in {path}")
+    return out
 
 
 def _git_ok(root: Path, *args: str, env: dict | None = None) -> str:
@@ -374,11 +447,11 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
     wt = _wt_path(root, head_tree)
     had_target = "CARGO_TARGET_DIR" in os.environ
     try:
+        _prepare_wt_parent(wt)
         shutil.rmtree(wt, ignore_errors=True)
         gates._git(root, "worktree", "prune")
         env = {f"GIT_{who}_{f}": v for who in ("AUTHOR", "COMMITTER") for f, v in (("NAME", "rustflow"), ("EMAIL", "rustflow@localhost"))}
         commit = _git_ok(root, "commit-tree", head_tree, "-m", "proof", env=env).strip()
-        wt.parent.mkdir(parents=True, exist_ok=True)
         _git_ok(root, "worktree", "add", "--detach", str(wt), commit)
         for c in provable:
             if c.kind == "config":
@@ -391,9 +464,11 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
                     target.unlink()
         added = _added_attrs(root, base_rev, head_tree)
         for c in provable:
-            if c.kind == "silence" and c.path in added and (wt / c.path).is_file():
+            if c.kind == "silence":
                 f = wt / c.path
-                f.write_text(strip_attributes(f.read_text(encoding="utf-8"), added[c.path]), encoding="utf-8")
+                if c.path not in added or not f.is_file():
+                    raise RuntimeError(f"cannot locate the added attributes of {c.path}")
+                f.write_text(_strip_verified(f.read_text(encoding="utf-8"), added[c.path], c.path), encoding="utf-8")
         if not had_target:
             os.environ["CARGO_TARGET_DIR"] = str(root / "target")
         res = gates.run_gates(wt, profile, cfg=cfg, strict=(profile == "full"), use_cache=False,

@@ -1,6 +1,9 @@
 """integrity.scan: detection of gate-affecting changes (no cargo is run here)."""
 from __future__ import annotations
 
+import os
+import shutil
+
 import pytest
 
 from rustflow import gates, integrity
@@ -224,14 +227,24 @@ def test_quoted_path_is_still_scanned(repo):
 # ── strip_attributes / prove ─────────────────────────────────────────────────
 def test_strip_attributes_inline_and_standalone():
     src = "#[allow(clippy::needless_return)]\nfn a() {}\n#[allow(x)] fn b() {}\nfn c() { let s = \"#[allow(y)]\"; }\n"
-    out = strip_attributes(src, ["#[allow(clippy::needless_return)]", "#[allow(x)] fn b() {}"])
+    out = strip_attributes(src, [1, 3])
     assert out == "fn a() {}\nfn b() {}\nfn c() { let s = \"#[allow(y)]\"; }\n"
 
 
 def test_strip_attributes_multiline_and_brackets():
     src = "#![allow(\n    dead_code, // ] in comment-free\n)]\nfn a() -> [u8; 1] { [0] }\n#[allow(x)] #[derive(Debug)] struct S;\n"
-    out = strip_attributes(src, ["#![allow(", "#[allow(x)] #[derive(Debug)] struct S;"])
+    out = strip_attributes(src, [1, 5])
     assert out == "fn a() -> [u8; 1] { [0] }\n#[derive(Debug)] struct S;\n"
+
+
+def test_strip_attributes_only_added_positions():
+    src = "#[test]\n#[ignore]\nfn a(){}\n#[test]\n#[ignore]\nfn b(){}\n"
+    assert strip_attributes(src, [5]) == "#[test]\n#[ignore]\nfn a(){}\n#[test]\nfn b(){}\n"
+
+
+@pytest.fixture(autouse=True)
+def xdg(tmp_path_factory, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path_factory.mktemp("xdg")))
 
 
 LIB_OK = "pub fn a() -> i32 {\n    1\n}\n"
@@ -269,7 +282,8 @@ def test_prove_masking_allow_fails(rust_repo):
     write(rust_repo, "src/lib.rs", LIB_OK)
     commit(rust_repo)
     write(rust_repo, "src/lib.rs", "#[allow(clippy::needless_return)]\npub fn a() -> i32 {\n    return 1;\n}\n")
-    assert proof(rust_repo).status == "failed"
+    r = proof(rust_repo)
+    assert r.status == "failed" and not r.error, r
 
 
 def test_prove_cap_lints_fails(rust_repo):
@@ -277,24 +291,27 @@ def test_prove_cap_lints_fails(rust_repo):
     commit(rust_repo)
     write(rust_repo, "src/lib.rs", "pub fn a() -> i32 {\n    return 1;\n}\n")
     write(rust_repo, ".cargo/config.toml", '[build]\nrustflags = ["--cap-lints", "allow"]\n')
-    assert proof(rust_repo).status == "failed"
+    r = proof(rust_repo)
+    assert r.status == "failed" and not r.error, r
 
 
 def test_prove_tests_off_fails(rust_repo):
-    write(rust_repo, "src/lib.rs", LIB_OK + "\n#[test]\nfn t() {\n    assert!(false);\n}\n")
+    write(rust_repo, "src/lib.rs", LIB_OK + "\n#[test]\nfn t() {\n    assert_eq!(a(), 2);\n}\n")
     commit(rust_repo)
     cfg = gates.load_gate_config(rust_repo)
     toml = (rust_repo / "rustflow.toml").read_text(encoding="utf-8")
     assert 'tests = "auto"' in toml
     write(rust_repo, "rustflow.toml", toml.replace('tests = "auto"', 'tests = "off"'))
-    assert proof(rust_repo, cfg=cfg).status == "failed"
+    r = proof(rust_repo, cfg=cfg)
+    assert r.status == "failed" and not r.error, r
 
 
 def test_prove_ignore_on_failing_test_fails(rust_repo):
-    write(rust_repo, "src/lib.rs", LIB_OK + "\n#[test]\nfn t() {\n    assert!(false);\n}\n")
+    write(rust_repo, "src/lib.rs", LIB_OK + "\n#[test]\nfn t() {\n    assert_eq!(a(), 2);\n}\n")
     commit(rust_repo)
-    write(rust_repo, "src/lib.rs", LIB_OK + "\n#[test]\n#[ignore]\nfn t() {\n    assert!(false);\n}\n")
-    assert proof(rust_repo).status == "failed"
+    write(rust_repo, "src/lib.rs", LIB_OK + "\n#[test]\n#[ignore]\nfn t() {\n    assert_eq!(a(), 2);\n}\n")
+    r = proof(rust_repo)
+    assert r.status == "failed" and not r.error, r
 
 
 def test_prove_neutral_clippy_toml_passes(rust_repo):
@@ -323,7 +340,9 @@ def test_prove_worktree_error_fails(rust_repo, monkeypatch):
 def test_prove_recovers_stale_worktree(rust_repo):
     write(rust_repo, "src/lib.rs", "#[allow(dead_code)]\n" + LIB_OK)
     stale = integrity._wt_path(rust_repo.resolve(), head(rust_repo))
-    stale.mkdir(parents=True)
+    for d in reversed(stale.parents[:3]):
+        d.mkdir(mode=0o700, exist_ok=True)
+    stale.mkdir(mode=0o700)
     (stale / "junk.txt").write_text("junk", encoding="utf-8")
     assert proof(rust_repo).status == "passed" and not wt_dirs(rust_repo)
 
@@ -340,7 +359,11 @@ def test_prove_respects_cargo_dir(tmp_path, shared_target, monkeypatch):
     commit(r)
     write(r, "crate/src/lib.rs", "#[allow(clippy::needless_return)]\npub fn a() -> i32 {\n    return 1;\n}\n")
     cfg = dict(gates.DEFAULT_GATES, cargo_dir="crate")
-    assert proof(r, cfg=cfg).status == "failed"
+    res = proof(r, cfg=cfg)
+    assert res.status == "failed" and not res.error and "clippy=FAIL" in res.summary, res
+    write(r, "crate/src/lib.rs", "#[allow(dead_code)]\n" + LIB_OK)  # counterpart: unneeded allow passes
+    res = proof(r, cfg=cfg)
+    assert res.status == "passed" and "clippy=PASS" in res.summary, res
 
 
 def test_prove_leaves_tree_untouched(rust_repo):
@@ -348,3 +371,62 @@ def test_prove_leaves_tree_untouched(rust_repo):
     before = gates.tree_fingerprint(rust_repo)
     proof(rust_repo)
     assert gates.tree_fingerprint(rust_repo) == before and not wt_dirs(rust_repo)
+
+
+def test_prove_only_added_ignore_is_stripped(rust_repo):
+    bad = "#[test]\n#[ignore]\nfn bad_t() {\n    assert_eq!(a(), 2);\n}\n"
+    write(rust_repo, "src/lib.rs", LIB_OK + "\n" + bad)
+    commit(rust_repo)
+    good = "#[test]\n#[ignore]\nfn good_t() {}\n"
+    write(rust_repo, "src/lib.rs", LIB_OK + "\n" + bad + "\n" + good)
+    # the pre-existing #[ignore] on the failing test must stay; only the added one (on a passing test) is stripped
+    r = proof(rust_repo)
+    assert r.status == "passed", r
+
+
+@pytest.mark.parametrize("src", [
+    '/* " */ #[allow(clippy::needless_return)] pub fn a() -> i32 {\n    return 1;\n}\n',
+    'pub const P: &str = r"C:\\"; #[allow(clippy::needless_return)] pub fn a() -> i32 {\n    return 1;\n}\n',
+])
+def test_prove_unstrippable_attribute_fails(rust_repo, src):
+    write(rust_repo, "src/lib.rs", LIB_OK)
+    commit(rust_repo)
+    write(rust_repo, "src/lib.rs", src)
+    r = proof(rust_repo)
+    assert r.status == "failed" and "strip" in r.error, r
+
+
+def test_prove_unlocatable_silence_fails(rust_repo):
+    write(rust_repo, "src/lib.rs", LIB_OK)
+    commit(rust_repo)
+    ghost = integrity.GateChange("G-silence-src/ghost.rs", "src/ghost.rs", "silence", "x", "d", True)
+    h = head(rust_repo)
+    r = prove(rust_repo, "HEAD", h, [ghost], "stop", gates.load_gate_config(rust_repo))
+    assert r.status == "failed" and "cannot locate" in r.error, r
+
+
+def test_prove_ancestor_cargo_config_fails(rust_repo, monkeypatch, tmp_path):
+    write(rust_repo, "src/lib.rs", "#[allow(dead_code)]\n" + LIB_OK)
+    cache = tmp_path / "planted"
+    cache.mkdir()
+    write(cache, ".cargo/config.toml", '[build]\nrustflags = ["--cap-lints", "allow"]\n')
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    r = proof(rust_repo)
+    assert r.status == "failed" and ".cargo" in r.error, r
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode checks")
+def test_prove_wt_dir_mode_and_symlink_fail(rust_repo, tmp_path):
+    write(rust_repo, "src/lib.rs", "#[allow(dead_code)]\n" + LIB_OK)
+    wt = integrity._wt_path(rust_repo.resolve(), head(rust_repo))
+    assert proof(rust_repo).status == "passed"
+    scope = wt.parent
+    scope.chmod(0o777)
+    r = proof(rust_repo)
+    assert r.status == "failed" and "accessible" in r.error, r
+    shutil.rmtree(scope)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    scope.symlink_to(other)
+    r = proof(rust_repo)
+    assert r.status == "failed" and "symlink" in r.error, r
