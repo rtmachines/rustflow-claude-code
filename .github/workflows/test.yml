@@ -40,3 +40,18 @@ jobs:
         run: python -m ruff check rustflow
       - name: Test installed product outside source checkout
         run: python .github/scripts/test-installed.py
+
+  standalone:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Exercise standalone gates without installed package
+        run: python .github/scripts/test-standalone.py

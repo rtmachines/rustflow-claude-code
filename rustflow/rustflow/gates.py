@@ -28,6 +28,11 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PureWindowsPath
 
+try:
+    from .process import run_process, kill_tree, DEFAULT_MAX_OUTPUT_BYTES, execution_scope
+except ImportError:  # installed standalone next to gates.py
+    from process import run_process, kill_tree, DEFAULT_MAX_OUTPUT_BYTES, execution_scope
+
 PROFILES = ("edit", "stop", "full")
 PROFILE_RANK = {p: i for i, p in enumerate(PROFILES)}
 
@@ -80,6 +85,11 @@ class Step:
     failed_tests: list[str] = field(default_factory=list)
     tail: str = ""
     passed_tests: list[str] = field(default_factory=list)   # for mechanical acceptance criteria
+    termination_reason: str = "exited"
+    output_complete: bool = True
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
 
 
 @dataclass
@@ -159,8 +169,7 @@ def _git(root: Path, *args: str, env: dict | None = None) -> subprocess.Complete
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
-    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", env=full_env)
+    return gate_process(["git", *args], cwd=root, env=full_env, timeout_s=120)
 
 
 def find_root(start: Path | None = None) -> Path:
@@ -197,6 +206,7 @@ def load_gate_config(root: Path) -> dict:
             with path.open("rb") as fh:
                 data = toml.load(fh)
             cfg.update(data.get("gates", {}) or {})
+            cfg["max_output_bytes"] = data.get("process", {}).get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
         except (OSError, ValueError) as exc:  # TOMLDecodeError subclasses ValueError
             print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
             cfg["_config_error"] = str(exc)   # hooks surface it: stderr of a passing hook reaches nobody
@@ -324,7 +334,7 @@ def manifests_changed(root: Path) -> bool:
 
 def has_tool(*argv: str) -> bool:
     try:
-        r = subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
+        r = gate_process(list(argv), timeout_s=60)
         return r.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -409,49 +419,18 @@ def parse_failed_tests(text: str) -> list[str]:
     return found
 
 
-def run_tree(argv: list[str], cwd: Path, env: dict, timeout: float) -> tuple[int, str, str]:
-    """subprocess with a hard timeout that kills the whole tree (cargo + test binaries).
-    subprocess.run(timeout=) only kills cargo; on Windows an orphaned test keeps the pipe open."""
-    kwargs: dict = {}
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **kwargs)
-    except OSError as exc:
-        return 127, "", str(exc)
-    try:
-        out, err = proc.communicate(timeout=timeout)
-        return proc.returncode, out, err
-    except subprocess.TimeoutExpired:
-        kill_process_tree(proc)
-        try:
-            out, err = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            out, err = "", ""
-        return 124, out or "", (err or "") + f"\nTIMEOUT after {timeout}s"
-    except KeyboardInterrupt:
-        kill_process_tree(proc)
-        raise
+def gate_process(argv, **kwargs):
+    result = run_process(argv, **kwargs)
+    if not result.output_complete:
+        raise IncompleteGate(argv[0] if argv else "process", result)
+    return result
 
 
-def kill_process_tree(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        else:
-            import signal
-            os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+def run_tree(argv: list[str], cwd: Path, env: dict, timeout: float, **kwargs):
+    return run_process(argv, cwd=cwd, env=env, timeout_s=timeout, **kwargs)
+
+
+kill_process_tree = kill_tree
 
 
 SQLX_HINT = ("HINT: the queries in the code do not match .sqlx/. Run: cargo sqlx prepare --workspace -- "
@@ -571,12 +550,21 @@ def is_compile_error(d: Diagnostic) -> bool:
 
 
 # ── runner ───────────────────────────────────────────────────────────────────
+class IncompleteGate(Exception):
+    def __init__(self, name, result):
+        self.step = Step(name, False, result.argv, reason=f"incomplete process output: {result.termination_reason}",
+                         duration_s=result.duration_s, tail=result.stdout[-4000:] + result.stderr[-4000:],
+                         **{k: getattr(result, k) for k in ("termination_reason", "output_complete", "stdout_bytes",
+                                                          "stderr_bytes", "max_output_bytes")})
+
+
 class GateRunner:
     def __init__(self, root: Path, cfg: dict | None = None, *, ci: bool = False, strict: bool = False,
                  log_dir: Path | None = None):
         """strict: check-only (fmt --check, --locked). ci: strict + extras with when_env always run and
         cargo-deny regardless of manifest changes (the CI job owns its environment)."""
         self.root = root
+        self._captures = {}
         self.cfg = cfg or load_gate_config(root)
         self.cargo_dir = (root / self.cfg.get("cargo_dir", ".")).resolve()
         self.ci = ci
@@ -589,7 +577,10 @@ class GateRunner:
         env = os.environ.copy()
         env.update({"CARGO_TERM_COLOR": "never", "RUST_BACKTRACE": "0"})
         start = time.monotonic()
-        rc, out, err = run_tree(argv, self.cargo_dir, env, timeout)
+        result = run_tree(argv, self.cargo_dir, env, timeout,
+                          max_output_bytes=int(self.cfg.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)))
+        self._captures[name] = result
+        rc, out, err = result
         dur = time.monotonic() - start
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -598,7 +589,18 @@ class GateRunner:
                 f"$ {' '.join(argv)}\n--- stdout\n{out}\n--- stderr\n{err}\n", encoding="utf-8")
         except OSError:
             pass
+        if hasattr(result, "output_complete") and not result.output_complete:
+            raise IncompleteGate(name, result)
         return rc, out, err, dur
+
+    def _step(self, name, *args, **kwargs):
+        step = Step(name, *args, **kwargs)
+        step.max_output_bytes = self.cfg.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+        result = self._captures.get(name)
+        if result is not None and hasattr(result, "output_complete"):
+            for key in ("termination_reason", "output_complete", "stdout_bytes", "stderr_bytes", "max_output_bytes"):
+                setattr(step, key, getattr(result, key))
+        return step
 
     def _tail(self, text: str) -> str:
         lines = int(self.cfg.get("log_lines", 60))
@@ -611,7 +613,7 @@ class GateRunner:
         argv = ["cargo", "fmt", "--all"] + ([] if fix else ["--", "--check", "--color", "never"])
         rc, out, err, dur = self._exec("fmt", argv)
         diags = [] if fix or rc == 0 else parse_fmt_check(out, self.root)
-        return Step("fmt", rc == 0, argv, duration_s=dur, diagnostics=diags,
+        return self._step("fmt", rc == 0, argv, duration_s=dur, diagnostics=diags,
                     tail=self._tail(out + err) if rc and not diags else "")
 
     def fmt_changed(self) -> Step:
@@ -627,7 +629,7 @@ class GateRunner:
             files = [f for f in files if self.clean_at(f, base)]
         failed = [s for s in (self.fmt_file(f) for f in files) if not s.ok]
         argv = ["rustfmt", "<changed files>", *[f.relative_to(self.root).as_posix() for f in files][:20]]
-        return Step("fmt", not failed, argv, duration_s=time.monotonic() - start,
+        return self._step("fmt", not failed, argv, duration_s=time.monotonic() - start,
                     tail="\n".join(s.tail or s.reason for s in failed))
 
     def fmt_file(self, path: Path) -> Step:
@@ -638,13 +640,13 @@ class GateRunner:
         argv = ["rustfmt", "--edition", crate_edition(path, self.root)]
         try:
             src = path.read_text(encoding="utf-8")
-            r = subprocess.run(argv, input=src, capture_output=True, text=True, encoding="utf-8",
-                               cwd=path.parent, timeout=120)   # cwd: rustfmt.toml is found from here upwards
+            r = gate_process(argv, stdin_text=src, cwd=path.parent, timeout_s=120)
+            self._captures["fmt"] = r   # cwd: rustfmt.toml is found from here upwards
         except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
-            return Step("fmt", False, argv, reason=str(exc))
+            return self._step("fmt", False, argv, reason=str(exc))
         if r.returncode == 0 and r.stdout and r.stdout != src:
             path.write_text(r.stdout, encoding="utf-8")
-        return Step("fmt", r.returncode == 0, argv, tail=self._tail(r.stderr) if r.returncode else "")
+        return self._step("fmt", r.returncode == 0, argv, tail=self._tail(r.stderr) if r.returncode else "")
 
     def clean_at(self, path: Path, rev: str) -> bool:
         """Was `path` rustfmt-clean at `rev`? A file that did not exist there counts as clean."""
@@ -656,8 +658,8 @@ class GateRunner:
         if old.returncode != 0:
             return True
         try:  # `rustfmt --check` on stdin always exits 0: format the old text and compare instead
-            r = subprocess.run(["rustfmt", "--edition", crate_edition(path, self.root)], input=old.stdout,
-                               capture_output=True, text=True, encoding="utf-8", cwd=path.parent, timeout=120)
+            r = gate_process(["rustfmt", "--edition", crate_edition(path, self.root)], stdin_text=old.stdout,
+                             cwd=path.parent, timeout_s=120)
         except (OSError, subprocess.SubprocessError):
             return True
         return r.returncode != 0 or r.stdout == old.stdout   # unparsable at rev: treat as clean
@@ -674,7 +676,7 @@ class GateRunner:
         tail = "" if ok else self._tail(err)
         if not keep_all and ok:
             diags = [d for d in diags if d.level == "error"]
-        return Step(name, ok, argv, duration_s=dur, diagnostics=diags, tail=tail)
+        return self._step(name, ok, argv, duration_s=dur, diagnostics=diags, tail=tail)
 
     def check(self) -> Step:
         return self.cargo_json("check", "check")
@@ -685,7 +687,7 @@ class GateRunner:
     def tests(self) -> Step:
         mode = self.cfg.get("tests", "auto")
         if mode == "off":
-            return Step("tests", True, skipped=True, reason="disabled in config")
+            return self._step("tests", True, skipped=True, reason="disabled in config")
         use_nextest = mode == "nextest" or (mode == "auto" and has_tool("cargo", "nextest", "--version"))
         if use_nextest:
             argv = ["cargo", "nextest", "run", "--workspace", *self.features, *self.locked,
@@ -697,19 +699,19 @@ class GateRunner:
         both = out + "\n" + err
         ok = rc == 0
         diags = [d for d in parse_cargo_json(out, self.root, self.cargo_dir) if d.level == "error"]
-        return Step("tests", ok, argv, duration_s=dur, diagnostics=diags,
+        return self._step("tests", ok, argv, duration_s=dur, diagnostics=diags,
                     failed_tests=parse_failed_tests(both) if not ok else [],
                     tail="" if ok else self._tail(both), passed_tests=parse_passed_tests(both))
 
     def doc_tests(self) -> Step:
         if not self.cfg.get("doc_tests", True):
-            return Step("doctests", True, skipped=True, reason="disabled in config")
+            return self._step("doctests", True, skipped=True, reason="disabled in config")
         argv = ["cargo", "test", "--workspace", "--doc", *self.features, *self.locked]
         rc, out, err, dur = self._exec("doctests", argv)
         both = out + "\n" + err
         if rc != 0 and "no library targets found" in both:
-            return Step("doctests", True, argv, skipped=True, reason="no library targets", duration_s=dur)
-        return Step("doctests", rc == 0, argv, duration_s=dur,
+            return self._step("doctests", True, argv, skipped=True, reason="no library targets", duration_s=dur)
+        return self._step("doctests", rc == 0, argv, duration_s=dur,
                     failed_tests=parse_failed_tests(both) if rc else [],
                     tail="" if rc == 0 else self._tail(both), passed_tests=parse_passed_tests(both))
 
@@ -717,15 +719,15 @@ class GateRunner:
         mode = self.cfg.get("deny", "auto")
         argv = ["cargo", "deny", *self.locked, "check"]
         if mode == "off":
-            return Step("deny", True, argv, skipped=True, reason="disabled in config")
+            return self._step("deny", True, argv, skipped=True, reason="disabled in config")
         if not (self.cargo_dir / "deny.toml").is_file():
-            return Step("deny", True, argv, skipped=True, reason="no deny.toml (run: cargo deny init)")
+            return self._step("deny", True, argv, skipped=True, reason="no deny.toml (run: cargo deny init)")
         if mode == "auto" and not self.ci and not manifests_changed(self.root):  # strict local: same rule
-            return Step("deny", True, argv, skipped=True, reason="manifests unchanged")
+            return self._step("deny", True, argv, skipped=True, reason="manifests unchanged")
         if not has_tool("cargo", "deny", "--version"):
-            return Step("deny", True, argv, skipped=True, reason="cargo-deny not installed")
+            return self._step("deny", True, argv, skipped=True, reason="cargo-deny not installed")
         rc, out, err, dur = self._exec("deny", argv)
-        return Step("deny", rc == 0, argv, duration_s=dur, tail="" if rc == 0 else self._tail(out + err))
+        return self._step("deny", rc == 0, argv, duration_s=dur, tail="" if rc == 0 else self._tail(out + err))
 
     def sqlx(self) -> Step:
         """`cargo sqlx prepare --check`: .sqlx/ offline metadata must match the query!() macros.
@@ -734,24 +736,23 @@ class GateRunner:
         mode = self.cfg.get("sqlx", "auto")
         argv = ["cargo", "sqlx", "prepare", "--workspace", "--check", "--", "--all-targets", *self.features]
         if mode == "off":
-            return Step("sqlx", True, argv, skipped=True, reason="disabled in config")
+            return self._step("sqlx", True, argv, skipped=True, reason="disabled in config")
         require = mode == "require" or os.environ.get("REQUIRE_SQLX_CHECK") == "1"
         if not uses_sqlx_macros(self.cargo_dir):
-            return Step("sqlx", True, argv, skipped=True, reason="no SQLx query macros")
+            return self._step("sqlx", True, argv, skipped=True, reason="no SQLx query macros")
         if not database_url(self.cargo_dir):
-            return Step("sqlx", not require, argv, skipped=not require,
+            return self._step("sqlx", not require, argv, skipped=not require,
                         reason="no DATABASE_URL (env or .env)" + (" but sqlx = require" if require else ""))
         if not has_tool("cargo", "sqlx", "--version"):
-            return Step("sqlx", not require, argv, skipped=not require,
+            return self._step("sqlx", not require, argv, skipped=not require,
                         reason="sqlx-cli not installed (cargo install --locked sqlx-cli)")
         rc, out, err, dur = self._exec("sqlx", argv)
-        return Step("sqlx", rc == 0, argv, duration_s=dur, tail="" if rc == 0 else self._tail(out + err),
+        return self._step("sqlx", rc == 0, argv, duration_s=dur, tail="" if rc == 0 else self._tail(out + err),
                     reason="" if rc == 0 else SQLX_HINT)
 
     def publishable_libs(self) -> list[str]:
         """Workspace packages that are published (publish != false) and have a library target."""
-        rc, out, _err = run_tree(["cargo", "metadata", "--no-deps", "--format-version", "1", *self.locked],
-                                 self.cargo_dir, os.environ.copy(), 300)
+        rc, out, _err, _dur = self._exec("metadata", ["cargo", "metadata", "--no-deps", "--format-version", "1", *self.locked], 300)
         if rc != 0:
             return []
         try:
@@ -767,17 +768,17 @@ class GateRunner:
         if base:
             argv += ["--baseline-rev", base]  # compare against the run's base commit, not crates.io
         if mode == "off":
-            return Step("semver", True, argv, skipped=True, reason="disabled in config")
+            return self._step("semver", True, argv, skipped=True, reason="disabled in config")
         if not has_tool("cargo", "semver-checks", "--version"):
             if mode == "always":
-                return Step("semver", False, argv, reason="cargo-semver-checks not installed "
+                return self._step("semver", False, argv, reason="cargo-semver-checks not installed "
                                                           "(cargo install --locked cargo-semver-checks)")
-            return Step("semver", True, argv, skipped=True, reason="cargo-semver-checks not installed")
+            return self._step("semver", True, argv, skipped=True, reason="cargo-semver-checks not installed")
         libs = self.publishable_libs()
         if not libs:
-            return Step("semver", True, argv, skipped=True, reason="no publishable library crates")
+            return self._step("semver", True, argv, skipped=True, reason="no publishable library crates")
         rc, out, err, dur = self._exec("semver", argv)
-        return Step("semver", rc == 0, argv, duration_s=dur, tail="" if rc == 0 else self._tail(out + err),
+        return self._step("semver", rc == 0, argv, duration_s=dur, tail="" if rc == 0 else self._tail(out + err),
                     reason="" if rc == 0 else "public API change without a semver-compatible version bump")
 
     def extras(self, profile: str) -> list[Step]:
@@ -789,16 +790,22 @@ class GateRunner:
             argv = list(ex.get("cmd") or [])
             when_env = ex.get("when_env")
             if when_env and not os.environ.get(when_env) and not self.ci:
-                steps.append(Step(name, True, argv, skipped=True, reason=f"${when_env} not set"))
+                steps.append(self._step(name, True, argv, skipped=True, reason=f"${when_env} not set"))
                 continue
             rc, out, err, dur = self._exec(name, argv, int(ex.get("timeout_s", 1800)))
-            steps.append(Step(name, rc == 0, argv, duration_s=dur,
+            steps.append(self._step(name, rc == 0, argv, duration_s=dur,
                               tail="" if rc == 0 else self._tail(out + err),
                               reason=ex.get("hint", "") if rc else ""))
         return steps
 
     # profiles
-    def run(self, profile: str, *, fix_fmt: bool | None = None, fail_fast: bool = False,
+    def run(self, profile: str, **kwargs) -> list[Step]:
+        try:
+            return self._run(profile, **kwargs)
+        except IncompleteGate as exc:
+            return [exc.step]
+
+    def _run(self, profile: str, *, fix_fmt: bool | None = None, fail_fast: bool = False,
             after_fmt=None) -> list[Step]:
         if profile not in PROFILES:
             raise ValueError(f"unknown profile {profile}")
@@ -820,7 +827,7 @@ class GateRunner:
                 return steps
             if st.name == "clippy" and not st.ok and any(is_compile_error(d) for d in st.diagnostics):
                 # Code does not compile: tests would only repeat the same errors.
-                steps.append(Step("tests", False, skipped=True, reason="skipped: code does not compile"))
+                steps.append(self._step("tests", False, skipped=True, reason="skipped: code does not compile"))
                 return steps
         steps += self.extras(profile)
         return steps
@@ -911,7 +918,16 @@ def cache_store(root: Path, profile: str, fp: str | None) -> None:
         pass
 
 
-def run_gates(root: Path, profile: str, *, ci: bool = False, strict: bool = False, use_cache: bool = True,
+def run_gates(root: Path, profile: str, **kwargs) -> GateResult:
+    cfg = kwargs.get("cfg") or load_gate_config(root)
+    try:
+        with execution_scope(max_output_bytes=cfg.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)):
+            return _run_gates(root, profile, **kwargs)
+    except IncompleteGate as exc:
+        return GateResult(profile, False, None, steps=[exc.step])
+
+
+def _run_gates(root: Path, profile: str, *, ci: bool = False, strict: bool = False, use_cache: bool = True,
               log_dir: Path | None = None, cfg: dict | None = None,
               fix_fmt: bool | None = None) -> GateResult:
     root = root.resolve()
@@ -929,7 +945,7 @@ def run_gates(root: Path, profile: str, *, ci: bool = False, strict: bool = Fals
         step = tree_stability_step(root, mid.get("fp"), fp_after, allow_lockfile=not runner.locked)
         if step is not None:
             steps.append(step)
-    ok = all(s.ok or s.skipped for s in steps)
+    ok = all(s.output_complete and (s.ok or s.skipped) for s in steps)
     if ok and not strict:
         cache_store(root, profile, fp_after)
     return GateResult(profile, ok, fp_after, steps=steps)

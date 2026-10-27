@@ -46,6 +46,10 @@ def _obj(props: dict, required: list[str] | None = None) -> dict:
 
 RUN_REF = {"type": "string", "description": "run id (or unique part of it); default: the latest run"}
 
+LIMIT_PROPERTIES = {k: {"type": "integer", "minimum": 1,
+                         "description": "execution limit; resume only permits an increase"}
+                    for k in ("max_agent_calls", "max_active_seconds", "max_output_bytes")}
+
 TOOLS: list[dict] = [
     {"name": "rustflow_triage",
      "description": "Difficulty, per-role model routing and estimated cost (from this repo's run history) for a "
@@ -56,6 +60,7 @@ TOOLS: list[dict] = [
                     "`task` on a new branch; mode=review reviews existing changes against `base` (fix=true also "
                     "fixes them in place). Fails if another run is active in this repo.",
      "inputSchema": _obj({
+         **LIMIT_PROPERTIES,
          "mode": {"type": "string", "enum": ["run", "review"], "default": "run"},
          "task": {"type": "string", "description": "task (run) or intent/context (review)"},
          "base": {"type": "string"}, "difficulty": {"type": "string", "enum": list(DIFFICULTIES)},
@@ -87,7 +92,7 @@ TOOLS: list[dict] = [
      "description": "Resume an interrupted / budget-stopped / crashed / agent_failed run in the background. With "
                     "extra_rounds: continue a run that ended max_rounds / stalled / final_gates_red / criteria_unmet "
                     "with up to that many more fix rounds on its own branch or worktree.",
-     "inputSchema": _obj({"run": RUN_REF, "extra_rounds": {"type": "integer", "minimum": 1, "maximum": 5}})},
+     "inputSchema": _obj({**LIMIT_PROPERTIES, "run": RUN_REF, "extra_rounds": {"type": "integer", "minimum": 1, "maximum": 5}})},
     {"name": "rustflow_gates",
      "description": "Run the deterministic gates (fmt, clippy -D warnings, tests, doc tests, deny/semver/sqlx when "
                     "relevant). check_only=true never modifies files.",
@@ -122,6 +127,7 @@ def t_start(a: dict) -> tuple[str, dict]:
                 "infer the intent from the diff and commit messages.")
     args = [mode]
     valued = {"base": "--base", "difficulty": "--difficulty", "max_rounds": "--max-rounds", "criteria": "--criteria"}
+    valued.update({k: "--" + k.replace("_", "-") for k in LIMIT_PROPERTIES})
     if a.get("criteria"):
         crit = Path(a["criteria"])
         a = {**a, "criteria": str(crit if crit.is_absolute() else (repo / crit).resolve())}
@@ -214,6 +220,9 @@ def t_resume(a: dict) -> tuple[str, dict]:
     repo = _repo()
     run_dir = runs.find_run(repo, a.get("run"))
     more = ["--extra-rounds", str(int(a["extra_rounds"]))] if a.get("extra_rounds") else []
+    for key in LIMIT_PROPERTIES:
+        if a.get(key) is not None:
+            more += ["--" + key.replace("_", "-"), str(a[key])]
     info = runs.spawn_detached(repo, ["resume", run_dir.name, *more], None, run_id=run_dir.name)
     return json.dumps(info), info
 

@@ -18,6 +18,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from rustflow import procutil, schemas, usage
+from rustflow.budget import BudgetExceeded
 from rustflow.config import AgentSpec, Config, gates_command
 
 IS_WINDOWS = os.name == "nt"
@@ -54,6 +55,8 @@ class AgentCall:
     attempt_kind: str = "initial"
     attempt_ids: list[str] = field(default_factory=list)
     on_attempt: Callable[[dict], None] | None = None
+    budget: Any = None
+    reservation: str | None = None
 
 
 @dataclass
@@ -82,6 +85,11 @@ class AgentResult:
     raw_usage: Any = None
     measured_cost_usd: float | None = None
     estimated_cost_usd: float | None = None
+    termination_reason: str = "exited"
+    output_complete: bool = True
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    max_output_bytes: int = 16 * 1024 * 1024
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -240,11 +248,13 @@ class BaseRunner:
         # Resolve the CLI and prepare input artifacts first: configuration errors
         # are not provider invocations and must not create unknown usage records.
         invoke = prepare(logged_call)
-        call.attempt_ids.append(attempt_id)
         record = {"schema_version": 1, "attempt_id": attempt_id, "logical_call_id": call.logical_call_id,
-                  "attempt_number": len(call.attempt_ids), "name": call.name, "role": call.role,
+                  "attempt_number": len(call.attempt_ids) + 1, "name": call.name, "role": call.role,
                   "provider": call.spec.provider, "requested_model": call.spec.model, "spec": str(call.spec),
                   "kind": call.attempt_kind, "status": "started", "started_at": usage.timestamp(),
+                  "termination_reason": None, "output_complete": False, "stdout_bytes": None, "stderr_bytes": None,
+                  "max_output_bytes": (call.budget.limits["max_output_bytes"] if call.budget else
+                                       self.cfg.get("process.max_output_bytes", 16777216)),
                   "finished_at": None, "duration_s": None, "estimated_cost_usd": None, "artifacts": {},
                   **usage.normalize(self.provider, None, None)}
         directory = call.log_dir.parent / "attempts"
@@ -254,12 +264,23 @@ class BaseRunner:
             if call.on_attempt:
                 call.on_attempt(record)
 
-        persist()
+        if call.budget:
+            try:
+                call.budget.start_attempt(record, persist,
+                                         call.reservation if call.attempt_kind == "initial" else None)
+            except BudgetExceeded as exc:
+                return AgentResult(call.name, call.role, str(call.spec), ok=False, error=str(exc),
+                                   retryable=False, output_complete=False, termination_reason=exc.reason)
+        else:
+            persist()
+        call.attempt_ids.append(attempt_id)
         started = time.monotonic()
         try:
             res = invoke()
             res.name, res.logical_call_id, res.attempt_ids = call.name, call.logical_call_id, [attempt_id]
-            record.update(status="succeeded" if res.ok else "timed_out" if "timeout" in res.error else "failed",
+            record.update(status="succeeded" if res.ok else "timed_out" if res.termination_reason == "timeout" else "failed",
+                          **{k: getattr(res, k) for k in ("termination_reason", "output_complete", "stdout_bytes",
+                                                        "stderr_bytes", "max_output_bytes")},
                           duration_s=res.duration_s, error=res.error, estimated_cost_usd=res.estimated_cost_usd,
                           **usage.normalize(self.provider, res.raw_usage, res.measured_cost_usd))
             self._write(logged_call, "result.json", json.dumps(usage.json_safe(res.to_dict()), indent=2,
@@ -267,7 +288,8 @@ class BaseRunner:
             return res
         except BaseException as exc:
             record.update(status="interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed",
-                          error=f"{type(exc).__name__}: {exc}", duration_s=time.monotonic() - started)
+                          termination_reason="interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "exception",
+                          output_complete=False, error=f"{type(exc).__name__}: {exc}", duration_s=time.monotonic() - started)
             raise
         finally:
             record["finished_at"] = usage.timestamp()
@@ -354,7 +376,7 @@ class ClaudeRunner(BaseRunner):
                                 extras_inline=self.pcfg.get("extra_skills_via", "system") == "inline")
         res = self._tracked_attempt(call, lambda c: self._prepare_attempt(c, argv, prompt))
         if (call.schema is not None and not res.ok and res.session_id and "structured" in res.error
-                and self.pcfg.get("repair_structured_output", True)):
+                and res.output_complete and self.pcfg.get("repair_structured_output", True)):
             # One more turn in the SAME session with the SAME argv (tools, system prompt, schema): the
             # cached prefix holds, and a long write session is not redone just to get its JSON report.
             rep = replace(call, name=f"{call.name}-json", timeout_s=min(call.timeout_s, 600), attempt_kind="json_repair")
@@ -376,11 +398,20 @@ class ClaudeRunner(BaseRunner):
     def _attempt(self, call: AgentCall, argv: list[str], prompt: str) -> AgentResult:
         env = {"RUSTFLOW_ROLE": call.role, **call.env}
         proc = procutil.run(argv, cwd=call.cwd, stdin_text=prompt, env=env, timeout_s=call.timeout_s,
-                            isolate_session=True)
+                            isolate_session=True, max_output_bytes=(call.budget.limits["max_output_bytes"] if call.budget
+                                              else int(self.cfg.get("process.max_output_bytes", 16777216))),
+                            deadline=call.budget.deadline if call.budget else None,
+                            cancel=call.budget.cancel if call.budget else None)
         self._write(call, "stdout.json", proc.stdout)
         if proc.stderr.strip():
             self._write(call, "stderr.log", proc.stderr)
         res = AgentResult(call.name, call.role, str(call.spec), ok=False, duration_s=proc.duration_s, argv=argv)
+        for key in ("termination_reason", "output_complete", "stdout_bytes", "stderr_bytes", "max_output_bytes"):
+            setattr(res, key, getattr(proc, key))
+        if not proc.output_complete and not proc.timed_out:
+            res.error = f"incomplete process output: {proc.termination_reason}"
+            res.retryable = False
+            return self._finish(call, res)
         if proc.timed_out:
             res.error = f"timeout after {call.timeout_s:.0f}s"
             if call.max_budget_usd:
@@ -458,11 +489,20 @@ class CodexRunner(BaseRunner):
     def _attempt(self, call: AgentCall, argv: list[str], prompt: str, last_msg: Path) -> AgentResult:
         env = {"RUSTFLOW_ROLE": call.role, **call.env}
         proc = procutil.run(argv, cwd=call.cwd, stdin_text=prompt, env=env, timeout_s=call.timeout_s,
-                            isolate_session=True)
+                            isolate_session=True, max_output_bytes=(call.budget.limits["max_output_bytes"] if call.budget
+                                              else int(self.cfg.get("process.max_output_bytes", 16777216))),
+                            deadline=call.budget.deadline if call.budget else None,
+                            cancel=call.budget.cancel if call.budget else None)
         self._write(call, "events.jsonl", proc.stdout)
         if proc.stderr.strip():
             self._write(call, "stderr.log", proc.stderr)
         res = AgentResult(call.name, call.role, str(call.spec), ok=False, duration_s=proc.duration_s, argv=argv)
+        for key in ("termination_reason", "output_complete", "stdout_bytes", "stderr_bytes", "max_output_bytes"):
+            setattr(res, key, getattr(proc, key))
+        if not proc.output_complete and not proc.timed_out:
+            res.error = f"incomplete process output: {proc.termination_reason}"
+            res.retryable = False
+            return self._finish(call, res)
         raw_usage: list[Any] = []
         errors: list[str] = []
         for line in proc.stdout.splitlines():
@@ -490,7 +530,14 @@ class CodexRunner(BaseRunner):
         if proc.timed_out:
             res.error = f"timeout after {call.timeout_s:.0f}s"
             return self._finish(call, res)
-        res.text = last_msg.read_text(encoding="utf-8", errors="replace") if last_msg.is_file() else ""
+        if last_msg.is_file():
+            with last_msg.open("rb") as fh:
+                message = fh.read(proc.max_output_bytes + 1)
+            if len(message) > proc.max_output_bytes:
+                res.termination_reason, res.output_complete, res.retryable = "output_limit", False, False
+                res.error = "incomplete process output: output_limit (last message artifact)"
+                return self._finish(call, res)
+            res.text = message.decode("utf-8", errors="replace")
         if proc.returncode != 0 or (errors and not res.text):
             res.error = ("; ".join(errors) or proc.stderr.strip() or f"exit code {proc.returncode}")[-2000:]
             res.retryable = not classify_permanent(res.error + "\n" + proc.stderr)
@@ -582,11 +629,14 @@ def run_with_retry(runner: BaseRunner, call: AgentCall, retries: int = 1,
     A failed structured-output repair is not retried again: the repair turn already was the retry."""
     res = runner.run(call)
     attempt = 0
-    while (not res.ok and attempt < retries and res.retryable and not res.json_repair and "timeout" not in res.error
+    while (not res.ok and res.output_complete and attempt < retries and res.retryable and not res.json_repair and "timeout" not in res.error
            and "max_budget" not in res.error and "error_max_budget" not in res.error
            and "error_max_turns" not in res.error and (may_retry is None or may_retry())):
         attempt += 1
-        time.sleep(5 * attempt)
+        if call.budget:
+            call.budget.wait(5 * attempt)
+        else:
+            time.sleep(5 * attempt)
         call.name = f"{call.name}-retry{attempt}"
         call.attempt_kind = "retry"
         previous = res

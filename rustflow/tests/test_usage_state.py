@@ -158,7 +158,9 @@ def test_estimator_excludes_unknown_and_timeout_samples_but_retains_zero(tmp_pat
     invoke(o, "missing")
     invoke(o, "free")
     monkeypatch.setattr(procutil, "run", lambda argv, **kw: procutil.ProcResult(argv, -1, "", "", 2, True))
-    invoke(o, "timeout")
+    from rustflow.orchestrator import Abort
+    with pytest.raises(Abort):
+        invoke(o, "timeout")
     o.state.update(status="approved", difficulty="medium")
     o.save()
     est = triage.estimate_cost(tmp_path, {"reviewer_a": str(SPEC)}, "medium")
@@ -192,3 +194,37 @@ def test_legacy_estimator_samples_survive_resume_and_remain_labelled(tmp_path, m
     assert mixed["per_call_usd"]["reviewer_a"] == 1.1875  # (legacy 2 + measured 0.375) / 2
     assert mixed["legacy_runs"] == 1 and "completeness unknown" in mixed["text"]
     assert mixed["same_difficulty"]["n"] == 0  # new missing costs cannot enter a legacy total
+
+
+def test_attempt_limit_has_no_phantom_provider_record(tmp_path, monkeypatch):
+    from rustflow.orchestrator import Abort
+    o = orchestrator(tmp_path, monkeypatch)
+    o.budget.raise_limits({'max_agent_calls': 40})
+    o.budget.limits['max_agent_calls'] = 1
+    feed(monkeypatch, [json.loads((FIXTURES / 'claude_usage.json').read_text())[1]])
+    invoke(o)
+    with pytest.raises(Abort) as caught:
+        invoke(o, 'denied')
+    assert caught.value.status == 'budget'
+    state = runs.load_state(o.run_dir)
+    assert state['usage_summary']['attempt_count'] == 1
+    assert state['execution_budget']['agent_calls_used'] == 1
+    assert any(e['kind'] == 'budget_denied' for e in state['events'])
+
+
+def test_resume_preserves_saved_limits_and_explicitly_raises_them(tmp_path, monkeypatch):
+    o = orchestrator(tmp_path, monkeypatch)
+    o.budget.close()
+    o.state['status'] = 'budget'
+    o.save()
+    o2 = Orchestrator(tmp_path, o.cfg, Options(max_agent_calls=80), out=io.StringIO())
+    monkeypatch.setattr(o2, 'loop', lambda: 0)
+    assert o2.resume(o.run_dir) == 0
+    assert o2.state['execution_budget']['limits']['max_agent_calls'] == 80
+    assert any(e['kind'] == 'budget_limit_raised' for e in o2.state['events'])
+    o2.budget.close()
+    o2.state['status'] = 'budget'
+    o2.save()
+    o3 = Orchestrator(tmp_path, o.cfg, Options(max_agent_calls=79), out=io.StringIO())
+    assert o3.resume(o.run_dir) == 2
+    assert runs.load_state(o.run_dir)['execution_budget']['limits']['max_agent_calls'] == 80

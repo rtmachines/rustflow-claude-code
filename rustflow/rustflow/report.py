@@ -21,6 +21,7 @@ STATUS_TEXT = {
     "review_failed": "RECENZJA NIEUDANA - żaden recenzent nie zwrócił wyniku",
     "agent_failed": "AGENT NIEUDANY - wywołanie modelu nie powiodło się, drzewo bez zmian (można wznowić)",
     "budget": "PRZEKROCZONY BUDŻET",
+    "incomplete": "NIEKOMPLETNE WYKONANIE",
     "error": "BŁĄD",
     "interrupted": "PRZERWANE (można wznowić)",
     "tree_changed": "PLIKI ZMIENIONE W TRAKCIE RECENZJI - wyniki odrzucone (można wznowić)",
@@ -71,6 +72,21 @@ def render(state: dict, repo: Path) -> str:
                       "na plikach z sygnałami."]
     lines.append("")
 
+    budget = state.get("execution_budget") or {}
+    if budget.get("limits"):
+        limits = budget["limits"]
+        lines += ["## Budżet wykonania", "",
+                  f"- Próby providera: {budget.get('agent_calls_used', 0)}/{limits['max_agent_calls']}; "
+                  f"pozostało {budget.get('agent_calls_remaining', 0)}.",
+                  f"- Aktywny czas: {budget.get('active_seconds_used', 0):.2f}s; "
+                  f"pozostało {budget.get('active_seconds_remaining', 0):.2f}s z {limits['max_active_seconds']}s.",
+                  f"- Limit stdout + stderr procesu: {limits['max_output_bytes']} surowych bajtów.",
+                  f"- Kompletność wyjścia: {state.get('output_complete', True)}; "
+                  f"przyczyna zatrzymania: {state.get('termination_reason') or '—'}.",
+                  f"- Oszacowanie po awarii: +{budget.get('crash_estimate_seconds', 0)}s.", ""]
+        if not budget.get("history_complete"):
+            lines += ["Wcześniejsze zużycie sprzed migracji jest nieznane; licznik działa od migracji.", ""]
+
     measured = usage.summary_for_state(state)
     lines += ["## Zużycie providerów", "", usage.brief(measured), ""]
     if measured["providers"]:
@@ -95,7 +111,8 @@ def render(state: dict, repo: Path) -> str:
                  f"{a['role']} / {a['provider']} / {a['requested_model']}", a["status"],
                  a["started_at"], f"{a['duration_s']:.2f}s" if a.get("duration_s") is not None else "?",
                  amount(a.get("measured_cost_usd")), amount(a.get("estimated_cost_usd")),
-                 a["measurement_status"], (a.get("error") or "")[:120],
+                 a["measurement_status"] + f"; logs={a.get('output_complete', True)}; {a.get('termination_reason', 'unknown')} "
+                 + f"({a.get('stdout_bytes', '?')}+{a.get('stderr_bytes', '?')} bytes / {a.get('max_output_bytes', '?')})", (a.get("error") or "")[:120],
                  ", ".join(a.get("artifacts", {}).values())] for a in attempts]
         lines += ["## Próby agentów", "", _table(rows, ["id próby", "id wywołania", "numer/rodzaj", "rola/provider/model",
                   "wynik", "start (UTC)", "czas", "pomiar USD", "estymacja USD", "kompletność", "błąd", "artefakty"]), ""]
@@ -217,7 +234,7 @@ def render(state: dict, repo: Path) -> str:
     elif state.get("isolation") == "worktree":
         lines += [f"- Worktree: `{state.get('workdir')}` (gałąź `{state.get('branch')}`)",
                   f"- Usuń: `git worktree remove {state.get('workdir')}`"]
-    if st in ("interrupted", "budget", "tree_changed"):
+    if st in ("interrupted", "budget", "tree_changed", "incomplete"):
         lines.append(f"- Wznów: `rustflow resume {state.get('run_id')}`")
     lines.append(f"- Logi agentów: `.rustflow/runs/{state.get('run_id')}/agents/`")
     return "\n".join(lines) + "\n"

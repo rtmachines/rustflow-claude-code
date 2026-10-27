@@ -259,9 +259,13 @@ def next_actions(state: dict) -> list[dict]:
                 "formats only the files the change touches)?")}]
         return [{"action": "ask_user", "question": "The base branch is already red. Fix it first, or continue "
                  "with --accept-red-baseline (only new failures block)?"}]
-    if st in ("budget", "interrupted", "crashed", "tree_changed", "agent_failed"):
+    if st in ("budget", "interrupted", "crashed", "tree_changed", "agent_failed", "incomplete"):
         failed = state.get("failed_agent") or {}
-        hint = {"budget": "raise [budget].max_total_usd in rustflow.toml, then",
+        reason = state.get("termination_reason")
+        limit_hint = {"agent_call_limit": "--max-agent-calls", "active_time_limit": "--max-active-seconds",
+                      "output_limit": "--max-output-bytes"}.get(reason)
+        hint = {"budget": (f"resume with a larger {limit_hint}" if limit_hint else "raise [budget].max_total_usd in rustflow.toml, then"),
+                "incomplete": (f"resume with a larger {limit_hint}" if limit_hint else "inspect incomplete process logs, then resume"),
                 "interrupted": "", "crashed": "check console.log / stop_reason, then",
                 "tree_changed": "files changed during the review; stop editing this checkout, then",
                 "agent_failed": (f"{failed.get('name', 'an agent')} failed, nothing changed - likely transient "
@@ -288,6 +292,9 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
         "run_id": state.get("run_id"), "status": st, "phase": state.get("phase"), "round": state.get("round"),
         "difficulty": state.get("difficulty"), "cost_usd": state.get("cost_usd", 0.0),
         "usage_summary": usage.summary_for_state(state),
+        "execution_budget": state.get("execution_budget", {"history_complete": False}),
+        "termination_reason": state.get("termination_reason"),
+        "output_complete": state.get("output_complete", True),
         "isolation": state.get("isolation"), "branch": state.get("branch"), "workdir": state.get("workdir"),
         "blocking": [brief(f) for f in fs if f.get("status") == "open"][:findings_limit],
         "disputed": [brief(f) for f in fs if f.get("status") == "disputed"][:findings_limit],
@@ -305,6 +312,15 @@ def brief_markdown(s: dict, mcp: bool = False) -> str:
     lines = [f"rustflow {s['run_id']}: **{s['status']}** (phase {s['phase']}, round {s['round']}, "
              f"{s['difficulty']}, booked ${s['cost_usd']:.2f})"]
     lines.append(usage.brief(s.get("usage_summary") or usage.summarize([], history_complete=False)))
+    budget = s.get("execution_budget") or {}
+    if budget.get("limits"):
+        lines.append(f"execution: {budget.get('agent_calls_used', 0)}/{budget['limits']['max_agent_calls']} calls; "
+                     f"{budget.get('active_seconds_used', 0):.1f}s used, {budget.get('active_seconds_remaining', 0):.1f}s remaining; "
+                     f"output limit {budget['limits']['max_output_bytes']} bytes; complete={s.get('output_complete', True)}")
+        if not budget.get("history_complete"):
+            lines.append("execution usage before migration is unknown")
+        if budget.get("crash_estimate_seconds"):
+            lines.append(f"active time includes {budget['crash_estimate_seconds']}s estimated after crash")
     if s.get("branch"):
         lines.append(f"branch: {s['branch']} ({s['isolation']})")
     if s.get("final_gates"):

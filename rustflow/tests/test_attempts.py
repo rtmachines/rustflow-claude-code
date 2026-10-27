@@ -87,6 +87,7 @@ def test_attempt_is_durable_before_process_and_exception_keeps_unknown_usage(tmp
         runner.run(call)
     row, = records(tmp_path)
     assert row["status"] == "interrupted" and row["measured_cost_usd"] is None
+    assert row["output_complete"] is False and row["termination_reason"] == "interrupted"
     assert row["measurement_status"] == "unknown" and row["duration_s"] >= 0
 
 
@@ -172,3 +173,36 @@ def test_missing_binary_creates_no_provider_attempt(tmp_path, monkeypatch, provi
     with pytest.raises(procutil.CommandNotFound):
         runner.run(call)
     assert records(tmp_path) == [] and call.attempt_ids == []
+
+
+@pytest.mark.parametrize('provider', ['claude', 'codex'])
+def test_truncated_valid_json_never_succeeds_or_retries(tmp_path, monkeypatch, provider):
+    call, runner = call_and_runner(tmp_path, monkeypatch, provider=provider, schema=schemas.REVIEW_SCHEMA)
+    payload = {'type': 'result', 'subtype': 'success', 'session_id': 's',
+               'structured_output': {'summary': 'done', 'verdict': 'APPROVE', 'findings': [],
+                                     'disputes': [], 'acceptance': [], 'residual_risks': []}}
+    def run(argv, **kw):
+        if provider == 'codex':
+            Path(argv[argv.index('-o')+1]).write_text(json.dumps(payload['structured_output']))
+        return procutil.ProcResult(argv, 0, json.dumps(payload), '', 1,
+                                   termination_reason='output_limit', output_complete=False,
+                                   stdout_bytes=1024, max_output_bytes=1024)
+    monkeypatch.setattr(procutil, 'run', run)
+    result = agents.run_with_retry(runner, call, retries=3)
+    assert not result.ok and not result.retryable and result.data is None
+    assert result.termination_reason == 'output_limit' and not result.output_complete
+    row, = records(tmp_path)
+    assert row['termination_reason'] == 'output_limit' and row['output_complete'] is False
+    assert row['measurement_status'] == 'unknown'
+
+
+def test_codex_last_message_read_is_bounded(tmp_path, monkeypatch):
+    call, runner = call_and_runner(tmp_path, monkeypatch, provider='codex')
+    runner.cfg.data['process']['max_output_bytes'] = 100
+    def run(argv, **kwargs):
+        Path(argv[argv.index('-o')+1]).write_bytes(b'x'*101)
+        return procutil.ProcResult(argv, 0, '', '', 0, max_output_bytes=100)
+    monkeypatch.setattr(procutil, 'run', run)
+    result = agents.run_with_retry(runner, call, retries=3)
+    assert not result.ok and result.termination_reason == 'output_limit'
+    assert not result.output_complete and len(records(tmp_path)) == 1

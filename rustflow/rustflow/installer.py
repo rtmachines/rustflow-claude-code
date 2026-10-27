@@ -111,6 +111,7 @@ class Installer:
         if not gitutil.is_repo(self.repo):
             self.out("  warning: not a git repository - `rustflow run` requires git")
         self._copy(TEMPLATES / "rustflow.toml", "rustflow.toml", managed=False)
+        self._copy(PACKAGE_DIR / "process.py", ".rustflow/process.py", managed=True)
         self._copy(PACKAGE_DIR / "gates.py", ".rustflow/gates.py", managed=True)
         self._copy(PACKAGE_DIR / "hooks.py", ".rustflow/hooks.py", managed=True)
         gi = self.repo / ".rustflow" / ".gitignore"

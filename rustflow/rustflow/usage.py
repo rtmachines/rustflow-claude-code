@@ -147,6 +147,7 @@ def load_attempts(directory: Path, *, interrupt_started: bool = False) -> list[d
         row = json.loads(path.read_text(encoding="utf-8"))
         if interrupt_started and row["status"] == "started":
             row.update(status="interrupted", finished_at=timestamp(), duration_s=None,
+                       termination_reason="interrupted", output_complete=False,
                        error="previous process ended before recording a result", estimated_cost_usd=None,
                        **normalize(row["provider"], None, None))
             write_attempt(directory, row)

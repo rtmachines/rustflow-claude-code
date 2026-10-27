@@ -144,6 +144,9 @@ def evaluate(criteria: list[Criterion], steps: list) -> list[dict]:
         get = s.get if isinstance(s, dict) else (lambda k, d=None, _s=s: getattr(_s, k, d))
         if get("name") not in ("tests", "doctests"):
             continue
+        if not get("output_complete", True):
+            return [{"id": c.id, "test": c.test, "text": c.text, "status": "not_met",
+                     "detail": "incomplete test output"} for c in criteria if c.test]
         passed += list(get("passed_tests") or [])
         failed += list(get("failed_tests") or [])
         if get("skipped"):

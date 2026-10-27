@@ -111,6 +111,12 @@ class Config:
             )
 
     def validate(self) -> None:
+        from rustflow.budget import DEFAULT_LIMITS, validate_limits
+        try:
+            validate_limits({k: self.get(("process." if k == "max_output_bytes" else "budget.") + k, v)
+                             for k, v in DEFAULT_LIMITS.items()})
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
         for role in ALL_ROLES:
             if role == "auditor":
                 spec = self.get("roles.auditor.spec", "")

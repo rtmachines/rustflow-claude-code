@@ -10,27 +10,13 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 IS_WINDOWS = os.name == "nt"
-
-# Children run in their own process group (so a timeout can kill the whole tree), which also means
-# they do not receive Ctrl+C. Track them so the orchestrator can kill everything on interrupt.
-_ACTIVE: set[subprocess.Popen] = set()
-_ACTIVE_LOCK = threading.Lock()
-
-
-def kill_all() -> None:
-    with _ACTIVE_LOCK:
-        procs = list(_ACTIVE)
-    for p in procs:
-        kill_tree(p)
 
 _NPM_SHIM_RE = re.compile(r'"%(?:~?dp0|_prog)%\\?([^"%]+?\.(?:c?js|mjs))"', re.IGNORECASE)
 _NPM_SHIM_RE2 = re.compile(r'%~?dp0%?\\([^"\s]+?\.(?:c?js|mjs))', re.IGNORECASE)
@@ -92,42 +78,8 @@ def clean_env(extra_scrub: tuple[str, ...] | list[str] = ()) -> dict[str, str]:
     return env
 
 
-@dataclass
-class ProcResult:
-    argv: list[str]
-    returncode: int
-    stdout: str
-    stderr: str
-    duration_s: float
-    timed_out: bool = False
-
-    @property
-    def ok(self) -> bool:
-        return self.returncode == 0 and not self.timed_out
-
-
-def kill_tree(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        if IS_WINDOWS:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        else:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.kill()
-        except OSError:
-            pass
+# Public compatibility names share the standalone executor and active process registry.
+from rustflow.process import ProcessResult as ProcResult, kill_tree, kill_all, run_process
 
 
 def _communicate_polled(proc: subprocess.Popen, stdin_text: str | None,
@@ -154,6 +106,9 @@ def run(
     timeout_s: float | None = None,
     stdout_path: Path | None = None,
     isolate_session: bool = False,
+    max_output_bytes: int | None = None,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> ProcResult:
     """Run a command; never raises on non-zero exit. Kills the process tree on timeout.
     isolate_session=True drops parent agent-session variables (see SESSION_ENV)."""
@@ -161,63 +116,9 @@ def run(
     full_env.setdefault("PYTHONIOENCODING", "utf-8")
     if env:
         full_env.update(env)
-    kwargs: dict = {}
-    if IS_WINDOWS:
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    else:
-        kwargs["start_new_session"] = True
-    start = time.monotonic()
-    out_fh = stdout_path.open("w", encoding="utf-8", errors="replace") if stdout_path else None
-    try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(cwd) if cwd else None,
-            env=full_env,
-            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            stdout=out_fh if out_fh else subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **kwargs,
-        )
-    except FileNotFoundError as exc:
-        if out_fh:
-            out_fh.close()
-        return ProcResult(argv, 127, "", str(exc), 0.0)
-    timed_out = False
-    with _ACTIVE_LOCK:
-        _ACTIVE.add(proc)
-    try:
-        if IS_WINDOWS:
-            stdout, stderr = _communicate_polled(proc, stdin_text, timeout_s)
-        else:
-            stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        kill_tree(proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:  # a grandchild escaped the tree and still holds the pipe
-            stdout, stderr = "", "process tree did not exit after kill"
-    except KeyboardInterrupt:
-        kill_tree(proc)
-        raise
-    finally:
-        with _ACTIVE_LOCK:
-            _ACTIVE.discard(proc)
-        if out_fh:
-            out_fh.close()
-    if stdout_path:
-        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
-    return ProcResult(
-        argv=argv,
-        returncode=proc.returncode if proc.returncode is not None else -1,
-        stdout=stdout or "",
-        stderr=stderr or "",
-        duration_s=time.monotonic() - start,
-        timed_out=timed_out,
-    )
+    return run_process(argv, cwd=str(cwd) if cwd else None, stdin_text=stdin_text, env=full_env,
+                       timeout_s=timeout_s, stdout_path=stdout_path, max_output_bytes=max_output_bytes,
+                       deadline=deadline, cancel=cancel)
 
 
 def which(name: str) -> str | None:
