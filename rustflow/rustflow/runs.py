@@ -183,13 +183,7 @@ def _mcp(tool: str, **arguments) -> dict:
 MAX_GATE_ITEMS = 15
 
 
-_UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f`\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
-
-
-def _display_safe(text, limit: int = 200) -> str:
-    """Driver-facing form of a file name or id: no backticks or control chars, capped. State keeps the real value."""
-    t = _UNSAFE_CHARS.sub("?", str(text))
-    return t if len(t) <= limit else t[:limit] + "…"
+_display_safe = gates.display_safe
 
 
 def _gate_changes_question(state: dict) -> str:

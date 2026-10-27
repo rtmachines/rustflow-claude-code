@@ -47,8 +47,6 @@ def test_interactive_commit_gate(rust_repo):
 
 
 # ── gate integrity in interactive mode (HEAD config, scan + proof) ───────────
-import subprocess  # noqa: E402
-
 GOOD_LIB = "/// f\npub fn f() -> i32 {\n    1\n}\n"
 
 
@@ -71,7 +69,8 @@ def test_stop_uses_head_config(rust_repo):
     cfg = rust_repo / "rustflow.toml"
     cfg.write_text(cfg.read_text() + '\n[gates]\ntests = "off"\n')
     (rust_repo / "src" / "lib.rs").write_text(GOOD_LIB + "#[cfg(test)]\nmod t {\n    #[test]\n    fn bad() {\n        assert!(false);\n    }\n}\n")
-    assert json.loads(_stop(rust_repo, "a").stdout)["decision"] == "block"
+    d = json.loads(_stop(rust_repo, "a").stdout)
+    assert d["decision"] == "block" and "rustflow gates failed" in d["reason"]
 
 
 def test_stop_blocks_masking_allow(rust_repo):
@@ -102,7 +101,8 @@ def test_commit_gate_denies_gate_change(rust_repo):
     _commit_lib(rust_repo, GOOD_LIB + "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n}\n")
     (rust_repo / "src" / "lib.rs").write_text(GOOD_LIB)
     r = hook(rust_repo, "guard-bash", {"tool_input": {"command": "git commit -am x"}})
-    assert json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "tests-removed" in out["permissionDecisionReason"]
 
 
 def test_no_head_skips_integrity(tmp_path, shared_target):
@@ -128,6 +128,58 @@ def test_integrity_exception_blocks(rust_repo):
     (rust_repo / "src" / "lib.rs").write_text(GOOD_LIB + "// touched\n")
     d = json.loads(_stop(rust_repo, "e").stdout)
     assert d["decision"] == "block" and "boom" in d["reason"]
+    assert "could not run" in d["reason"] and "rustflow doctor" in d["reason"]
+    assert "Revert them" not in d["reason"]
+
+
+def test_missing_integrity_module_names_file(monkeypatch):
+    import pytest
+    from rustflow import hooks
+    monkeypatch.setitem(sys.modules, "integrity", None)
+    monkeypatch.setitem(sys.modules, "rustflow.integrity", None)
+    monkeypatch.delattr(__import__("rustflow"), "integrity", raising=False)
+    with pytest.raises(RuntimeError, match=r"\.rustflow/integrity\.py"):
+        hooks._integrity()
+    ok, why, internal = hooks._integrity_verdict(__import__("pathlib").Path("."), {})
+    assert not ok and internal and ".rustflow/integrity.py" in why and "rustflow doctor" in why
+
+
+def _env(repo, **extra):
+    return {**__import__("os").environ, "CLAUDE_PROJECT_DIR": str(repo), **extra}
+
+
+def test_orchestrated_role_has_no_integrity_block(rust_repo):
+    _commit_lib(rust_repo)
+    base = _git(rust_repo, "rev-parse", "HEAD").strip()
+    (rust_repo / "src" / "lib.rs").write_text(
+        "/// f\n#[allow(clippy::needless_return)]\npub fn f() -> i32 {\n    return 1;\n}\n")
+    r = subprocess.run([sys.executable, str(rust_repo / ".rustflow" / "hooks.py"), "stop"],
+                       input=json.dumps({"session_id": "o"}), capture_output=True, text=True, cwd=rust_repo,
+                       env=_env(rust_repo, RUSTFLOW_ROLE="implementer", RUSTFLOW_BASE=base))
+    assert "Gate-affecting" not in r.stdout and "decision" not in r.stdout
+
+
+def test_commit_gate_config_error_denies(rust_repo, monkeypatch, capsys):
+    from rustflow import hooks
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(rust_repo))
+    monkeypatch.delenv("RUSTFLOW_ROLE", raising=False)
+
+    def boom(root, rev):
+        raise hooks.gates.GateConfigError("cannot resolve revision 'HEAD'")
+    monkeypatch.setattr(hooks.gates, "load_gate_config_at", boom)
+    assert hooks.guard_bash({"tool_input": {"command": "git commit -am x"}}) == 0
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "cannot read the gate configuration" in out["permissionDecisionReason"]
+
+
+def test_stop_runs_on_rename_of_config_side(rust_repo):
+    _commit_lib(rust_repo, GOOD_LIB + "#[cfg(test)]\nmod t {\n    #[test]\n    fn bad() {\n        assert!(false);\n    }\n}\n")
+    (rust_repo / "tests").mkdir()
+    (rust_repo / "tests" / "it.rs").write_text("#[test]\nfn t() {}\n")
+    _git(rust_repo, "add", "-A")
+    _git(rust_repo, "commit", "-qm", "it")
+    _git(rust_repo, "mv", "tests/it.rs", "tests/it.rs.off")
+    assert json.loads(_stop(rust_repo, "r").stdout)["decision"] == "block"
 
 
 def test_head_config_git_error_blocks(rust_repo):

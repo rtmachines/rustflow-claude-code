@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from rustflow import usage
+from rustflow import gates, usage
 
 STATUS_TEXT = {
     "approved": "ZATWIERDZONE - bramki zielone, brak blokujących uwag",
@@ -37,11 +37,8 @@ def _table(rows: list[list[str]], head: list[str]) -> str:
     return "\n".join(out)
 
 
-_UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
-
-
 def _cell(text) -> str:
-    return _UNSAFE_CHARS.sub(" ", str(text))
+    return gates.display_safe(text, limit=len(str(text)), replacement=" ", backticks=False)
 
 
 def render(state: dict, repo: Path) -> str:

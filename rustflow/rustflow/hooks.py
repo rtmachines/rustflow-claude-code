@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -80,26 +81,28 @@ def _state_dir(root: Path) -> Path:
     return d
 
 
-_UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f`\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
-
-
-def _safe(text: object, limit: int = 200) -> str:
-    """Model-visible form of an implementer-controlled string: no control chars or backticks, bounded."""
-    t = _UNSAFE_CHARS.sub("?", str(text))
-    return t if len(t) <= limit else t[:limit] + "..."
+_safe = gates.display_safe   # model-visible form of implementer-controlled strings
 
 
 def _integrity():
     """Imported lazily: a missing/broken integrity module must fail closed in the integrity path only."""
     try:
         import integrity  # type: ignore[import-not-found]   # .rustflow/integrity.py (installed layout)
-    except ImportError:  # running from the package
-        from rustflow import integrity  # type: ignore[no-redef]
+    except ImportError as first:
+        try:  # running from the package
+            from rustflow import integrity  # type: ignore[no-redef]
+        except ImportError:
+            raise RuntimeError(f"cannot import .rustflow/integrity.py ({first})") from None
     return integrity
 
 
-def _has_head(root: Path) -> bool:
-    return gates._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").returncode == 0
+def _head_sha(root: Path) -> str | None:
+    """HEAD commit, None in a repo without commits. Git failures become GateConfigError (fail closed)."""
+    try:
+        r = gates._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    except (OSError, subprocess.SubprocessError, gates.IncompleteGate) as exc:
+        raise gates.GateConfigError(f"git failed resolving HEAD: {exc}") from exc
+    return r.stdout.strip() or None if r.returncode == 0 else None
 
 
 def _hook_config(root: Path) -> dict:
@@ -111,9 +114,8 @@ def _hook_config(root: Path) -> dict:
     if _role():
         base = os.environ.get("RUSTFLOW_BASE", "").strip()
         return gates.load_gate_config_at(root, base) if base else gates.load_gate_config(root)
-    if not _has_head(root):
-        return gates.load_gate_config(root)
-    return gates.load_gate_config_at(root, "HEAD")
+    head = _head_sha(root)
+    return gates.load_gate_config_at(root, head) if head else gates.load_gate_config(root)
 
 
 def _proof_cache(root: Path) -> Path:
@@ -127,25 +129,25 @@ def _describe_changes(changes: list, limit: int = 5) -> str:
     return "; ".join(items) + more
 
 
-def _integrity_verdict(root: Path, cfg: dict) -> tuple[bool, str]:
+def _integrity_verdict(root: Path, cfg: dict) -> tuple[bool, str, bool]:
     """Gate-integrity check of the working tree against HEAD (interactive sessions).
 
-    (True, "") nothing changed; (True, note) changes proven harmless / nothing to compare; (False, why) block.
-    Fail-closed: any exception becomes (False, ...).
+    (True, "", False) nothing changed; (True, note, False) proven harmless / nothing to compare;
+    (False, why, False) gate-affecting changes not proven harmless; (False, why, True) the check itself
+    could not run (internal/installation error). Fail-closed: any exception is (False, ..., True).
     """
     try:
-        head = gates._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-        if head.returncode != 0:
-            return True, "rustflow: no commit yet - gate integrity not checked"
-        base = head.stdout.strip()
+        base = _head_sha(root)
+        if not base:
+            return True, "rustflow: no commit yet - gate integrity not checked", False
         integrity = _integrity()
         tree = gates.tree_fingerprint(root) or ""
         changes = integrity.scan(root, base, tree, cfg)
         if not changes:
-            return True, ""
+            return True, "", False
         unprovable = [c for c in changes if not c.provable]
         if unprovable:
-            return False, "not provably harmless: " + _describe_changes(unprovable)
+            return False, "not provably harmless: " + _describe_changes(unprovable), False
         key = f"{base}:{tree}"   # the same tree against another HEAD is another diff
         try:
             cache = json.loads(_proof_cache(root).read_text(encoding="utf-8"))
@@ -164,10 +166,18 @@ def _integrity_verdict(root: Path, cfg: dict) -> tuple[bool, str]:
                 except OSError:
                     pass
         if status == "passed":
-            return True, "rustflow: gate-affecting changes proven harmless: " + _describe_changes(changes, 3)
-        return False, "proof with the HEAD configuration failed (" + detail + "): " + _describe_changes(changes)
+            return True, "rustflow: gate-affecting changes proven harmless: " + _describe_changes(changes, 3), False
+        return False, "proof with the HEAD configuration failed (" + detail + "): " + _describe_changes(changes), False
     except Exception as exc:  # fail closed
-        return False, f"gate integrity check could not run: {_safe(type(exc).__name__)}: {_safe(exc, 300)}"
+        return False, (f"rustflow gate-integrity check could not run ({_safe(type(exc).__name__)}: "
+                       f"{_safe(exc, 300)}); gate changes were not verified. Run `rustflow init` / `rustflow doctor`, "
+                       "or ask the user to commit your changes himself."), True
+
+
+def _integrity_text(why: str, internal: bool) -> str:
+    if internal:
+        return why
+    return f"Gate-affecting changes: {why}. Revert them, or ask the user to commit them himself."
 
 
 # ── post-edit ────────────────────────────────────────────────────────────────
@@ -265,21 +275,25 @@ def guard_edit(data: dict) -> int:
 
 
 def _rust_changes_pending(root: Path, cfg: dict | None = None) -> bool:
-    r = gates._git(root, "status", "--porcelain", "--untracked-files=all")
+    try:
+        r = gates._git(root, "status", "--porcelain", "--untracked-files=all")
+    except (OSError, subprocess.SubprocessError, gates.IncompleteGate):
+        return True
     if r.returncode != 0:
         return True
     extra = list((cfg or {}).get("integrity_extra_paths", []) or [])
     for line in r.stdout.splitlines():
-        path = line[3:].split(" -> ")[-1].strip().strip('"')
-        if path.startswith(".rustflow/"):
-            continue
-        if RUST_RELEVANT.search(path):
-            return True
-        try:
-            if _integrity().is_config_path(path, extra):
+        for part in line[3:].split(" -> "):   # a rename lists both sides
+            path = part.strip().strip('"')
+            if path.startswith(".rustflow/"):
+                continue
+            if RUST_RELEVANT.search(path):
                 return True
-        except Exception:  # fail closed: cannot classify -> check
-            return True
+            try:
+                if _integrity().is_config_path(path, extra):
+                    return True
+            except Exception:  # fail closed: cannot classify -> check
+                return True
     return False
 
 
@@ -347,11 +361,10 @@ def stop(data: dict) -> int:
             f"rustflow gates failed (attempt {n}/{max_blocks}). Fix them before finishing. Do not "
             "silence lints with #[allow] or skip/weaken tests.\n\n" + res.feedback(max_diags=10, max_chars=8000)))
     if not role:  # the orchestrator owns gate-affecting changes of orchestrated roles
-        ok, why = _integrity_verdict(root, cfg)
+        ok, why, internal = _integrity_verdict(root, cfg)
         if not ok:
             return block(max_blocks, "gate integrity", lambda n: (
-                f"Gate-affecting changes: {why}. Revert them, or ask the user to commit them himself."
-                f" (attempt {n}/{max_blocks})"))
+                f"{_integrity_text(why, internal)} (attempt {n}/{max_blocks})"))
         counter.unlink(missing_ok=True)
         return finish({"systemMessage": why} if why else None)
     counter.unlink(missing_ok=True)
@@ -466,10 +479,9 @@ def guard_bash(data: dict) -> int:
             if not res.ok:
                 return _decide("deny", "Commit blocked: rustflow gates are RED. Fix them, then commit.\n\n"
                                        + res.feedback(max_diags=10, max_chars=6000))
-            ok, why = _integrity_verdict(root, cfg)
+            ok, why, internal = _integrity_verdict(root, cfg)
             if not ok:
-                return _decide("deny", f"Commit blocked - gate-affecting changes: {why}. Revert them, or ask "
-                                       "the user to commit them himself.")
+                return _decide("deny", "Commit blocked. " + _integrity_text(why, internal))
     return 0
 
 

@@ -180,6 +180,18 @@ def _git(root: Path, *args: str, env: dict | None = None) -> subprocess.Complete
     return gate_process(["git", *args], cwd=root, env=full_env, timeout_s=120)
 
 
+_CONTROL_CHARS = "\x00-\x1f\x7f-\x9f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069"
+_UNSAFE_CHARS = re.compile("[" + _CONTROL_CHARS + "`]")
+_UNSAFE_NO_TICK = re.compile("[" + _CONTROL_CHARS + "]")
+
+
+def display_safe(text: object, limit: int = 200, ellipsis: str = "\u2026", replacement: str = "?",
+                 backticks: bool = True) -> str:
+    """Display form of an implementer-controlled string: control/bidi chars (and backticks) replaced, capped."""
+    t = (_UNSAFE_CHARS if backticks else _UNSAFE_NO_TICK).sub(replacement, str(text))
+    return t if len(t) <= limit else t[:limit] + ellipsis
+
+
 class GateConfigError(RuntimeError):
     """The gate configuration could not be read from a git revision."""
 
