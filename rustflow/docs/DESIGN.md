@@ -1,5 +1,7 @@
 # rustflow: projekt workflow i recenzja proponowanego cyklu
 
+> Historical design notes and earlier live experiments (Polish). For supported behavior in the current checkout, use the [English documentation index](README.md), [usage](usage.md), and [architecture](architecture.md). Commands and external-tool observations below may describe an earlier implementation.
+
 ## 1. Recenzja proponowanego cyklu
 
 Propozycja: **Implementer → 2 recenzentów → Fixer → (powrót do 2, N razy) → sprawdzenie kompilacji.**
