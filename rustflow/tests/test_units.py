@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+from conftest import git
 
 from rustflow import findings as fnd
 from rustflow import gates, gitutil, hooks, procutil, schemas, triage
@@ -671,19 +672,29 @@ def test_integrity_extra_paths_default_is_empty():
     assert load_defaults()["gates"]["integrity_extra_paths"] == []
 
 
-def _git(repo, *args):
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
-
-
 def test_doctor_warns_when_rustflow_toml_is_not_committed(tmp_path):
     from rustflow.doctor import Doctor
-    _git(tmp_path, "init", "-q")
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "config", "user.email", "t@example.com")
+    git(tmp_path, "config", "user.name", "t")
     (tmp_path / "rustflow.toml").write_text("[gates]\n", encoding="utf-8")
     lines: list[str] = []
     Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
     assert any("[WARN]" in l and "rustflow.toml" in l for l in lines), lines
-    _git(tmp_path, "add", "rustflow.toml")
+    git(tmp_path, "add", "rustflow.toml")   # staged is not committed
     lines.clear()
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert any("[WARN]" in l and "rustflow.toml" in l for l in lines), lines
+    git(tmp_path, "commit", "-q", "-m", "c")
+    lines.clear()
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert lines == []
+
+
+def test_doctor_skips_tracking_check_outside_git(tmp_path):
+    from rustflow.doctor import Doctor
+    (tmp_path / "rustflow.toml").write_text("[gates]\n", encoding="utf-8")
+    lines: list[str] = []
     Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
     assert lines == []
 
@@ -691,5 +702,5 @@ def test_doctor_warns_when_rustflow_toml_is_not_committed(tmp_path):
 def test_doctor_flags_missing_integrity_script(tmp_path):
     from rustflow.doctor import Doctor
     lines: list[str] = []
-    Doctor(tmp_path, Config(load_defaults()), out=lines.append).run()
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_installed_scripts()
     assert any(("[FAIL]" in l or "[WARN]" in l) and "integrity.py" in l for l in lines), lines
