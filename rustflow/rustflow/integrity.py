@@ -81,6 +81,16 @@ def is_config_path(path: str, extra: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(c, pat) for pat in (*CONFIG_PATTERNS, *extra) for c in candidates)
 
 
+def _lines(text: str, keepends: bool = False) -> list[str]:
+    """Split on `\\n` only, like git numbers lines (`str.splitlines` also splits on \\x0c, \\x85, U+2028, ...)."""
+    parts = text.split("\n")
+    if keepends:
+        parts = [p + "\n" for p in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+    elif parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
 def _show(root: Path, rev: str, path: str) -> tuple[str | None, str]:
     r = gates._git(root, "show", f"{rev}:{path}")
     if r.returncode != 0:
@@ -173,7 +183,7 @@ def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None
     silence: dict[str, list[str]] = {}
     removed: dict[str, int] = {}
     path, in_header, new_no = None, False, 0
-    for line in diff.splitlines():
+    for line in _lines(diff):
         if line.startswith("diff --git"):
             path, in_header = None, True
         elif in_header:
@@ -304,14 +314,14 @@ def _attr_end(text: str, i: int) -> int:
     return -1
 
 
-def strip_attributes(text: str, added: list[int]) -> str:
+def _strip(text: str, added: list[int]) -> tuple[str, list[int]]:
     """Cut the silencing attributes (`#[...]` / `#![...]`, bracket-counted, literals skipped) that stand on the
-    `added` lines (1-based line numbers in `text`). A line left empty disappears."""
+    `added` lines (1-based line numbers in `text`, git numbering). A line left empty disappears. Also returns the
+    added line numbers that still carry a silencing attribute afterwards (a tokenizer miss)."""
     wanted = set(added)
     gone = bytearray(len(text))
-    touched: set[int] = set()
     pos = 0
-    for n, line in enumerate(text.splitlines(keepends=True)):
+    for n, line in enumerate(_lines(text, True)):
         start, end = pos, pos + len(line)
         pos = end
         if n + 1 not in wanted:
@@ -328,20 +338,23 @@ def strip_attributes(text: str, added: list[int]) -> str:
                         e += 1
                     for x in range(i, e):
                         gone[x] = 1
-                    touched.add(n)
                 i = max(e, i + 1)
                 continue
             i += 1
-    if not any(gone):
-        return text
-    out, pos = [], 0
-    for n, line in enumerate(text.splitlines(keepends=True)):
+    out, left, pos = [], [], 0
+    for n, line in enumerate(_lines(text, True)):
         kept = "".join(ch for x, ch in enumerate(line, pos) if not gone[x])
         pos += len(line)
+        if n + 1 in wanted and SILENCE_RE.search(kept.strip()):
+            left.append(n + 1)
         if kept != line and not kept.strip():
             continue  # the line held only removed attributes (possibly continued from an earlier line)
         out.append(kept)
-    return "".join(out)
+    return "".join(out), left
+
+
+def strip_attributes(text: str, added: list[int]) -> str:
+    return _strip(text, added)[0]
 
 
 def _cache_base() -> Path:
@@ -379,11 +392,10 @@ def _prepare_wt_parent(wt: Path) -> None:
     """Secure `<cache>/rustflow/wt/<scope>`, and refuse a cargo config in any ancestor (cargo would merge it
     into the proof and the scan never sees it). `$CARGO_HOME` is the user's own config and is allowed."""
     wt.parents[3].mkdir(parents=True, exist_ok=True)
-    wt.parents[2].mkdir(mode=0o700, exist_ok=True)
-    for d in (wt.parents[1], wt.parent):
+    for d in (wt.parents[2], wt.parents[1], wt.parent):
         _private_dir(d)
     home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo").resolve()
-    for anc in wt.parents:
+    for anc in wt.resolve().parents:  # cargo walks the physical directory, not the symlinked spelling
         cargo = anc / ".cargo"
         if cargo.resolve() == home:
             continue
@@ -403,15 +415,15 @@ def _added_attrs(root: Path, base_rev: str, head_tree: str) -> dict[str, list[in
 
 
 def _silence_lines(text: str) -> int:
-    return sum(1 for ln in text.splitlines()
+    return sum(1 for ln in _lines(text)
                if not ln.strip().startswith("//") and SILENCE_RE.search(ln.strip()))
 
 
 def _strip_verified(text: str, positions: list[int], path: str) -> str:
     """Strip the added attributes and check that exactly those silencing lines are gone (a tokenizer miss such as
     an odd quote inside a block comment would otherwise leave the attribute in and let the proof pass)."""
-    out = strip_attributes(text, positions)
-    if _silence_lines(out) != _silence_lines(text) - len(positions):
+    out, left = _strip(text, positions)
+    if left or _silence_lines(out) != _silence_lines(text) - len(positions):
         raise RuntimeError(f"could not strip every added attribute in {path}")
     return out
 
@@ -468,7 +480,10 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
                 f = wt / c.path
                 if c.path not in added or not f.is_file():
                     raise RuntimeError(f"cannot locate the added attributes of {c.path}")
-                f.write_text(_strip_verified(f.read_text(encoding="utf-8"), added[c.path], c.path), encoding="utf-8")
+                with open(f, encoding="utf-8", newline="") as fh:  # no newline translation: line numbers must match git's
+                    text = fh.read()
+                with open(f, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(_strip_verified(text, added[c.path], c.path))
         if not had_target:
             os.environ["CARGO_TARGET_DIR"] = str(root / "target")
         res = gates.run_gates(wt, profile, cfg=cfg, strict=(profile == "full"), use_cache=False,

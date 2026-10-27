@@ -430,3 +430,48 @@ def test_prove_wt_dir_mode_and_symlink_fail(rust_repo, tmp_path):
     scope.symlink_to(other)
     r = proof(rust_repo)
     assert r.status == "failed" and "symlink" in r.error, r
+
+
+def test_prove_form_feed_does_not_shift_stripping(rust_repo):
+    base = "//! demo\x0c crate\n#[allow(dead_code)]\npub fn a() -> i32 {\n    1\n}\n"
+    write(rust_repo, "src/lib.rs", base)
+    commit(rust_repo)
+    head_src = ("//! demo\x0c crate\n#[allow(dead_code)]\n#[allow(clippy::needless_return)]\n"
+                "pub fn a() -> i32 {\n    return 1;\n}\n")
+    write(rust_repo, "src/lib.rs", head_src)
+    r = proof(rust_repo)
+    assert r.status == "failed" and not r.error and "clippy=FAIL" in r.summary, r
+
+
+def test_scan_form_feed_and_cr_in_content(repo):
+    write(repo, "src/lib.rs", "pub fn a() {}\x0c\n\n#[test]\nfn t() {}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "ff")
+    write(repo, "src/lib.rs", "pub fn a() {}\x0c\n\x0b\n#[allow(dead_code)]\n#[test]\nfn t() {}\n")
+    assert kinds(run(repo)) == [("silence", "src/lib.rs")]
+    positions: dict = {}
+    d = gates._git(repo, "diff", "-U0", "--no-color", "HEAD", head(repo), "--", "*.rs").stdout
+    integrity._parse_rs_diff(d, positions)
+    assert positions == {"src/lib.rs": [3]}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks")
+def test_prove_symlinked_cache_with_real_ancestor_cargo_config_fails(rust_repo, monkeypatch, tmp_path):
+    write(rust_repo, "src/lib.rs", "#[allow(dead_code)]\n" + LIB_OK)
+    real = tmp_path / "real"
+    write(real, ".cargo/config.toml", '[build]\nrustflags = ["--cap-lints", "allow"]\n')
+    (real / "cache").mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real / "cache")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(link))
+    r = proof(rust_repo)
+    assert r.status == "failed" and "ancestor" in r.error, r
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode checks")
+def test_prove_rustflow_cache_dir_is_checked(rust_repo):
+    write(rust_repo, "src/lib.rs", "#[allow(dead_code)]\n" + LIB_OK)
+    assert proof(rust_repo).status == "passed"
+    integrity._wt_path(rust_repo.resolve(), "x").parents[2].chmod(0o777)
+    r = proof(rust_repo)
+    assert r.status == "failed" and "accessible" in r.error, r
