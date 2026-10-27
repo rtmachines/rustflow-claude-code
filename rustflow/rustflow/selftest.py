@@ -89,7 +89,7 @@ class SelfTest:
                      ["config", "user.name", "selftest"]):
             subprocess.run(["git", *args], cwd=self.proj, check=True, capture_output=True)
         (self.proj / ".gitignore").write_text("target/\n", encoding="utf-8")
-        Installer(self.proj, python_cmd=py, ci=False, out=lambda *_: None).run()
+        Installer(self.proj, python_cmd=py, ci=False, with_rust_skills=False, out=lambda *_: None).run()
         subprocess.run(["git", "add", "-A"], cwd=self.proj, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-qm", "probe"], cwd=self.proj, check=True, capture_output=True)
 

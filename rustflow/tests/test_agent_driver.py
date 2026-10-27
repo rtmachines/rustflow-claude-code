@@ -211,7 +211,7 @@ def test_installer_with_mcp_and_strict_agents(tmp_path, monkeypatch):
     from rustflow.installer import Installer
     from rustflow import procutil
     (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
-    Installer(tmp_path, python_cmd="python3", ci=False, with_mcp=True, out=lambda *_: None).run()
+    Installer(tmp_path, with_rust_skills=False, python_cmd="python3", ci=False, with_mcp=True, out=lambda *_: None).run()
     mcp = json.loads((tmp_path / ".mcp.json").read_text())["mcpServers"]["rustflow"]
     assert mcp["args"][-1] == "mcp"
     s = json.loads((tmp_path / ".claude" / "settings.json").read_text())
