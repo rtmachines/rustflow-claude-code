@@ -12,7 +12,7 @@ For handlers using `Config.load` (`run`, `review`, `resume`, `triage`, and ordin
 
 Command options override the corresponding defaults where provided: `--base`, `--difficulty`, `--isolation`, `--max-rounds`, `--no-plan`, `--max-agent-calls`, `--max-active-seconds`, and `--max-output-bytes`. The public review interfaces use `isolation = "none"` regardless of `[project].isolation` and never run the planner; `--isolation` is a run-only CLI option.
 
-**Gate configuration has a separate loader.** Standalone gates and hooks read `[gates]` and `[process].max_output_bytes` from `rustflow.toml` in their detected project root. The orchestrator also reloads gates from its working checkout. Consequently, an alternate `--config` file controls orchestration but does not replace the checkout's `[gates]` settings. The orchestrator does apply its effective output limit to its own gate runs. Put gate settings in the checkout's `rustflow.toml`, including when using worktree isolation. Invalid TOML makes the standalone loader warn and use gate defaults; the Stop hook surfaces this once per session. This differs from the orchestrator's configuration validation.
+**Gate configuration has a separate loader.** Standalone gates and hooks read `[gates]` and `[process].max_output_bytes` from `rustflow.toml` in their detected project root. Where `[gates]` comes from depends on the caller. Orchestrator runs read it from `rustflow.toml` at the run's base commit, and that value is frozen in the run state, including on resume. Interactive hooks read it from `HEAD`. Hooks of orchestrator agents read it from `$RUSTFLOW_BASE`. Only standalone `gates.py`, CI, and `rustflow lints` read the working tree. Consequently, an alternate `--config` file controls orchestration but does not replace `[gates]`. The orchestrator does apply its effective output limit to its own gate runs. Commit gate settings: an uncommitted `rustflow.toml` means default `[gates]` at the base, and `rustflow doctor` warns about it. Invalid TOML makes the standalone loader warn and use gate defaults; the Stop hook surfaces this once per session. This differs from the orchestrator's configuration validation.
 
 Configuration validation covers model and effort allowlists, the documented routing enums, review severity/confidence options, and positive execution limits. It is not a complete schema validator: unknown keys are retained, and many gate/provider settings are consumed without enum or type validation. A misspelled key can therefore have no effect. Use `rustflow doctor` after editing configuration. See [the loader](../rustflow/config.py) and [gate defaults and loader](../rustflow/gates.py) for exact behavior.
 
@@ -274,7 +274,7 @@ Both provider skill directories must contain explicitly requested skills when th
 
 ## Deterministic gates
 
-Gates are shared by hooks, orchestration, and CI. Their configuration comes from `rustflow.toml` as described under [Loading and precedence](#loading-and-precedence), but the source of that file depends on the caller: orchestrator runs read `[gates]` from the run's base commit (also on resume), and interactive hooks read it from `HEAD`. Editing `[gates]` in the working tree does not change the gates of a running task or the Stop hook until the change is committed.
+Gates are shared by hooks, orchestration, and CI. Their configuration comes from `rustflow.toml` as described under [Loading and precedence](#loading-and-precedence), but the source of that file depends on the caller: orchestrator runs read `[gates]` from the run's base commit (also on resume), and interactive hooks read it from `HEAD`. Editing `[gates]` in the working tree never changes a running task's gates; the Stop hook and commit gate pick it up once committed.
 
 | Key in `[gates]` | Default | Behavior |
 | --- | --- | --- |
@@ -293,13 +293,13 @@ Gates are shared by hooks, orchestration, and CI. Their configuration comes from
 | `semver` | `"auto"` | `auto`, `always`, or `off`; details below. |
 | `sqlx` | `"auto"` | `auto`, `require`, or `off`; details below. |
 | `extra` | `[]` (implicit) | Additional gate command definitions. |
-| `integrity_extra_paths` | `[]` (implicit) | List of globs. Matching changed files are treated as gate configuration (kind `config`) and need a proof; see below. |
+| `integrity_extra_paths` | `[]` | List of globs. Matching changed files are treated as gate configuration (kind `config`) and need a proof; see below. |
 
 There is no general gate-timeout TOML key. Most built-in gate commands use a one-hour timeout, subject to the run's remaining deadline; individual helpers have shorter fixed timeouts. Custom commands accept `timeout_s`.
 
 ### Gate integrity
 
-Changes to gate configuration can weaken the gates themselves, so the diff between the base and the current tree is scanned. Files named in the built-in list (`rustflow.toml`, `.cargo/config` and `.cargo/config.toml` at any depth, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`) and paths matching `integrity_extra_paths` are classified as `config`. Each such change needs a proof: the gates are re-run in a temporary worktree with the changed configuration restored to the base version. A red proof blocks the change. Projects without the key keep the default `[]`.
+Changes to gate configuration can weaken the gates themselves, so the diff between the base and the current tree is scanned. Files named in the built-in list (`rustflow.toml`, `.cargo/config`, `.cargo/config.toml`, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`; each name matches at any depth) and paths matching `integrity_extra_paths` are classified as `config`. The extra patterns are fnmatch globs in which `*` also matches `/`. Each such change needs a proof: the gates are re-run in a temporary worktree with the changed configuration restored to the base version. A red proof blocks the change. Projects without the key keep the default `[]`.
 
 ```toml
 [gates]

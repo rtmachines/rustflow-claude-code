@@ -120,7 +120,7 @@ The named test must actually run and pass on the checked tree. Short names match
 
 Rustflow also checks changes that could make the gates weaker than the base commit. Each such change has a kind:
 
-- `config`: `rustflow.toml`, `.cargo/config` and `.cargo/config.toml` at any depth, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`, and paths matched by `integrity_extra_paths`.
+- `config`: `rustflow.toml`, `.cargo/config`, `.cargo/config.toml`, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml` (each name matches at any depth), and paths matched by `integrity_extra_paths`.
 - `cargo-lints`: `[lints]`, `[workspace.lints]`, or `[profile.*]` in a `Cargo.toml`. Adding a dependency is not a change.
 - `silence`: an added `#[allow(`, `#![allow(`, `#[expect(`, `cfg_attr(…, allow/expect(`, or `#[ignore` attribute.
 - `tests-removed`: a net decrease in test attributes across the diff. Moving a test is fine.
@@ -129,7 +129,7 @@ Rustflow also checks changes that could make the gates weaker than the base comm
 Acceptance is automatic; no CLI or MCP option overrides it:
 
 - `config` and `silence` need a proof. Rustflow reruns the gates with the changed configuration restored to the base version and the added attributes stripped. Green accepts the change (`accepted_by: proof`). Red means the change hides a real failure and blocks it; reviewers cannot override that.
-- `cargo-lints` and `tests-removed` are accepted only when both reviewers vote `accept` for the current diff.
+- `cargo-lints` and `tests-removed` are accepted only when both reviewers vote `accept` for the current version of that change (a per-change digest).
 
 Every change that is not accepted becomes a blocking finding `G-<kind>-<path>`. Reviewers and the fixer cannot close it. When only these findings remain after a fix round, or at the final check, the run ends as `gate_changes_pending` (exit code 2, resumable). Its `next_actions` (`rustflow status <id> --json`) offers two recovery paths:
 
@@ -194,7 +194,7 @@ Compilation failures can skip redundant tests. nextest is preferred when install
 
 Initialization registers `PostToolUse` formatting/check feedback, a `Stop` gate, `PreToolUse` command/edit guards, and normally a `UserPromptSubmit` review router. Stop blocks at most three times by default, then emits a manual-review warning; this does not turn failed gates green. Orchestrated reviewers skip write-oriented interactive hooks; the driving session respects the active checkout.
 
-Stop and the commit gate read the gate configuration from `HEAD` and block unproven [gate-affecting changes](#gate-affecting-changes) in interactive sessions. Revert such a change, or ask the user to commit it. Agents started by the orchestrator are not checked by hooks; the orchestrator handles them instead.
+Stop and the commit gate read the gate configuration from `HEAD` and check for unproven [gate-affecting changes](#gate-affecting-changes) in interactive sessions. Stop blocks on them, but that block is capped by `stop_max_blocks`, after which the session ends with a notice. Only the commit gate denies unconditionally; revert such a change, or ask the user to commit it. Orchestrator agents are not checked for gate-affecting changes by hooks, although their Stop gates still run with the base configuration; the orchestrator performs the check itself.
 
 In a trusted Claude Code project, `/rustflow-pr-review [base]` invokes the installed interactive reviewer. This forked read-only interface is separate from the two-reviewer workflow. Hooks validate its Markdown report and can suggest a Trail of Bits audit for unsafe/FFI signals. `init --with-plugins` enables that optional plugin integration; an orchestrated plugin audit also needs auditor configuration. Folder trust and permissions affect hook activation. `doctor --selftest` replays local hook scenarios.
 

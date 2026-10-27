@@ -69,6 +69,7 @@ Domyślnie: reviewer_a = Claude (soczewka poprawności), reviewer_b = Codex (soc
 | `rustflow/criteria.py` | kryteria akceptacji, ocena wymaganych testów z wyniku bramek (bez LLM) |
 | `rustflow/gates.py` | bramki (standalone; kopiowane do `.rustflow/gates.py`) |
 | `rustflow/hooks.py` | hooki Claude Code (standalone; `.rustflow/hooks.py`) |
+| `rustflow/integrity.py` | scan zmian wpływających na bramki, dowód, zgody (standalone; kopiowane do `.rustflow/integrity.py`) |
 | `rustflow/triage.py` | heurystyka trudności + schemat triage LLM |
 | `rustflow/prompts.py` | prompty ról |
 | `rustflow/templates/` | rustflow.toml, skills, REVIEW.md, bloki AGENTS/CLAUDE.md, CI |
@@ -83,11 +84,12 @@ Domyślnie: reviewer_a = Claude (soczewka poprawności), reviewer_b = Codex (soc
 - Tryb interaktywny (bez `rustflow run`) gwarantuje tylko zielone bramki dla tego, co trafia do HEAD/merge; pełny cykl (triage, plan, dwie recenzje, fix, bramki final) jest opcjonalny.
 - Dowód sprawdza tylko bieżące drzewo: zaakceptowana zmiana konfiguracji może osłabić bramki dla przyszłych zmian po merge'u (widoczne w raporcie).
 - Zgoda recenzentów dla `cargo-lints` i `tests-removed` to osąd dwóch modeli; skorelowany błąd albo prompt injection w diffie może dać fałszywą zgodę (ślad w raporcie, status `approved_with_advisories`).
-- W trybie A zgodą dla zmian bez dowodu jest commit człowieka poza Claude Code; bramka commita rozpoznaje tylko komendy pasujące do wzorca `git commit` i ocenia drzewo robocze, nie indeks.
+- W trybie interaktywnym zgodą dla zmian bez dowodu jest commit człowieka poza Claude Code; bramka commita rozpoznaje tylko komendy pasujące do wzorca `git commit` i ocenia drzewo robocze, nie indeks.
 - `cargo-lints` bez parsera TOML (Python < 3.11 bez `tomli`) działa zachowawczo i może blokować zmiany neutralne.
 - Cache wyników bramek i dowodu w `.rustflow/cache/` nie jest chroniony przed zapisem przez agenta.
 - Reguły `--disallowedTools` dla ról piszących nie obejmują zapisu przez Bash; o blokadzie decyduje detekcja w diffie.
 - Przy `--accept-red-baseline` dowód nie uwzględnia czerwonej bazy, więc zmiany dowodliwe kończą się porażką dowodu (blokują zachowawczo).
+- Wygenerowane CI uruchamia `gates.py` na roboczym `rustflow.toml` PR-a i bez skanu integralności, więc PR, który osłabia `[gates]`, osłabia także własne bramki CI.
 
 ## 6. Prompt caching
 
