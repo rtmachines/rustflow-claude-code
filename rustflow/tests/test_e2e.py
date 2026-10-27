@@ -398,8 +398,11 @@ def test_resume_after_manual_revert_of_gate_change(rust_repo, monkeypatch):
     lib = wt / "src" / "lib.rs"
     text = lib.read_text(encoding="utf-8")
     assert "return 1;" in text
-    lib.write_text(text.replace("return 1;", "1").replace("    1\n}", "    1\n}"), encoding="utf-8")
+    lib.write_text(text.replace("return 1;", "1"), encoding="utf-8")
+    fixers_before = sum(1 for c in read_log(rust_repo) if c["role"] == "fixer")
     rc = Orchestrator(rust_repo, Config.load(rust_repo), Options()).resume(find_run(rust_repo, "latest"), extra_rounds=1)
     st = json.loads((find_run(rust_repo, "latest") / "state.json").read_text(encoding="utf-8"))
     assert st["status"] in ("approved", "approved_with_advisories"), st.get("stop_reason")
     assert rc == 0 and st["gate_changes"] == []
+    # the stale G-finding must not reach the fixer: the resume re-gates and re-reviews
+    assert sum(1 for c in read_log(rust_repo) if c["role"] == "fixer") == fixers_before
