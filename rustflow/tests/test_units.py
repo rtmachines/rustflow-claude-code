@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -552,3 +554,51 @@ def test_installer_interactive_review_files(tmp_path):
 ])
 def test_guard_handles_git_global_options(monkeypatch, capsys, role, cmd, decision):
     assert _guard(monkeypatch, role, cmd, capsys) == decision
+
+
+# ── gate config from a revision / multiset signatures ────────────────────────
+def _commit_toml(repo, text):
+    (repo / "rustflow.toml").write_text(text, encoding="utf-8")
+    subprocess.run(["git", "add", "rustflow.toml"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "cfg"], cwd=repo, check=True)
+
+
+def test_load_gate_config_at_missing(git_repo):
+    assert gates.load_gate_config_at(git_repo, "HEAD") == gates.DEFAULT_GATES
+
+
+def test_load_gate_config_at_reads_revision(git_repo):
+    _commit_toml(git_repo, '[gates]\ntests = "off"\n')
+    (git_repo / "rustflow.toml").write_text('[gates]\ntests = "auto"\n', encoding="utf-8")
+    assert gates.load_gate_config_at(git_repo, "HEAD")["tests"] == "off"
+
+
+def test_load_gate_config_at_invalid_toml(git_repo):
+    _commit_toml(git_repo, "[gates\n")
+    cfg = gates.load_gate_config_at(git_repo, "HEAD")
+    assert cfg["_config_error"] and cfg["tests"] == "auto"
+
+
+def test_load_gate_config_at_bad_rev(git_repo):
+    with pytest.raises(gates.GateConfigError):
+        gates.load_gate_config_at(git_repo, "nie-ma")
+
+
+def test_load_gate_config_at_not_a_repo(tmp_path):
+    with pytest.raises(gates.GateConfigError):
+        gates.load_gate_config_at(tmp_path, "HEAD")
+
+
+def test_new_failures_multiset():
+    a = "clippy|a|x|m"
+    assert gates.new_failures(Counter({a: 2}), Counter({a: 1})) == Counter({a: 1})
+    assert not gates.new_failures(Counter({a: 1}), Counter({a: 1}))
+    assert gates.new_failures(Counter({"fmt|*": 1}), Counter({"fmt|*": 1})) == Counter({"fmt|*": 1})
+
+
+def test_signature_counts_keeps_duplicates():
+    d = gates.Diagnostic("error", "unneeded `return` statement", "clippy::needless_return", "src/lib.rs", 3)
+    res = gates.GateResult("full", False, None, steps=[gates.Step("clippy", False, diagnostics=[d, d])])
+    key = "clippy|src/lib.rs|clippy::needless_return|unneeded `return` statement"
+    assert res.signature_counts()[key] == 2
+    assert res.signatures() == {key}

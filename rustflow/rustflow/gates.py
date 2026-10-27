@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PureWindowsPath
 
@@ -115,15 +116,22 @@ class GateResult:
     def failed_steps(self) -> list[Step]:
         return [s for s in self.steps if not s.ok and not s.skipped]
 
-    def signatures(self) -> set[str]:
-        """Identity of each failure, to compare against a red baseline."""
-        sig: set[str] = set()
+    def signature_counts(self) -> Counter[str]:
+        """Failure identities with multiplicity (identical diagnostics are counted separately)."""
+        sig: Counter[str] = Counter()
         for s in self.failed_steps():
             # No line numbers: they shift when unrelated code changes.
             items = [f"{d.file}|{d.code}|{d.message}" for d in s.diagnostics if d.level == "error"]
             items += s.failed_tests
-            sig.update(f"{s.name}|{i}" for i in items) if items else sig.add(f"{s.name}|*")
+            if items:
+                sig.update(f"{s.name}|{i}" for i in items)
+            else:
+                sig[f"{s.name}|*"] += 1
         return sig
+
+    def signatures(self) -> set[str]:
+        """Identity of each failure, to compare against a red baseline."""
+        return set(self.signature_counts())
 
     def summary_line(self) -> str:
         if self.cached:
@@ -172,6 +180,22 @@ def _git(root: Path, *args: str, env: dict | None = None) -> subprocess.Complete
     return gate_process(["git", *args], cwd=root, env=full_env, timeout_s=120)
 
 
+class GateConfigError(RuntimeError):
+    """The gate configuration could not be read from a git revision."""
+
+
+def new_failures(counts: Counter, baseline: Counter) -> Counter:
+    """Failures in `counts` beyond `baseline` (multiset difference).
+
+    An opaque "<step>|*" signature carries no identity, so it is always new.
+    """
+    result = counts - baseline
+    for sig, n in counts.items():
+        if sig.endswith("|*") and n > 0:
+            result[sig] = n
+    return result
+
+
 def find_root(start: Path | None = None) -> Path:
     env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
     if env_dir and Path(env_dir).is_dir():
@@ -189,28 +213,56 @@ def find_root(start: Path | None = None) -> Path:
     return start
 
 
-def load_gate_config(root: Path) -> dict:
+def _parse_gate_config(text: str) -> dict:
     cfg = dict(DEFAULT_GATES)
-    path = root / "rustflow.toml"
-    if path.is_file():
+    try:
+        import tomllib as toml  # Python 3.11+
+    except ImportError:
         try:
-            import tomllib as toml  # Python 3.11+
+            import tomli as toml  # type: ignore[no-redef]
         except ImportError:
-            try:
-                import tomli as toml  # type: ignore[no-redef]
-            except ImportError:
-                print("rustflow gates: Python < 3.11 without tomli - using default [gates] settings",
-                      file=sys.stderr)
-                return cfg
-        try:
-            with path.open("rb") as fh:
-                data = toml.load(fh)
-            cfg.update(data.get("gates", {}) or {})
-            cfg["max_output_bytes"] = data.get("process", {}).get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
-        except (OSError, ValueError) as exc:  # TOMLDecodeError subclasses ValueError
-            print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
-            cfg["_config_error"] = str(exc)   # hooks surface it: stderr of a passing hook reaches nobody
+            print("rustflow gates: Python < 3.11 without tomli - using default [gates] settings",
+                  file=sys.stderr)
+            return cfg
+    try:
+        data = toml.loads(text)
+        cfg.update(data.get("gates", {}) or {})
+        cfg["max_output_bytes"] = data.get("process", {}).get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+    except ValueError as exc:  # TOMLDecodeError subclasses ValueError
+        print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
+        cfg["_config_error"] = str(exc)   # hooks surface it: stderr of a passing hook reaches nobody
     return cfg
+
+
+def load_gate_config(root: Path) -> dict:
+    path = root / "rustflow.toml"
+    if not path.is_file():
+        return dict(DEFAULT_GATES)
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, ValueError) as exc:
+        print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
+        return {**DEFAULT_GATES, "_config_error": str(exc)}
+    return _parse_gate_config(text)
+
+
+def load_gate_config_at(root: Path, rev: str) -> dict:
+    """Like load_gate_config, but from `rustflow.toml` as committed at `rev`.
+
+    Missing file at `rev` -> defaults; invalid TOML -> defaults + "_config_error";
+    any other git failure (bad rev, git missing, ...) -> GateConfigError.
+    """
+    try:
+        if _git(root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").returncode != 0:
+            raise GateConfigError(f"cannot resolve revision {rev!r}")
+        if _git(root, "cat-file", "-e", f"{rev}:rustflow.toml").returncode != 0:
+            return dict(DEFAULT_GATES)   # revision is valid, the path is not in its tree
+        r = _git(root, "show", f"{rev}:rustflow.toml")
+    except (OSError, subprocess.SubprocessError, IncompleteGate) as exc:
+        raise GateConfigError(f"git failed reading rustflow.toml at {rev!r}: {exc}") from exc
+    if r.returncode != 0:
+        raise GateConfigError(f"git show {rev}:rustflow.toml failed: {(r.stderr or '').strip()}")
+    return _parse_gate_config(r.stdout)
 
 
 _FMT_DIFF = re.compile(r"^Diff in (.+?)(?::\d+:| at line \d+:)\s*$", re.M)
