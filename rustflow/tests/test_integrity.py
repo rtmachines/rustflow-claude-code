@@ -774,3 +774,61 @@ def test_tests_removed_votes_reset_by_more_removals(repo):
     entries = integrity.reconcile(entries, run(repo))
     integrity.decide(entries)
     assert entries[0]["status"] == "pending" and entries[0]["votes"] == {}
+
+
+# ── I2: gitignored config files ─────────────────────────────────────────────
+def _ignored_cargo(repo, text="[term]\nverbose = false\n"):
+    write(repo, ".gitignore", "target/\n.cargo/\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "ignore")
+    write(repo, ".cargo/config.toml", text)
+
+
+def test_ignored_config_is_a_change_in_mode_a(repo):
+    _ignored_cargo(repo)
+    c = only(run(repo))
+    assert (c.kind, c.path, c.provable) == ("config", ".cargo/config.toml", True)
+    assert c.digest == gates.ignored_config_files(repo)[".cargo/config.toml"]
+    write(repo, ".cargo/config.toml", "[term]\nverbose = true\n")
+    assert only(run(repo)).digest != c.digest
+
+
+def test_ignored_config_mode_b_only_new_or_changed(repo):
+    _ignored_cargo(repo)
+    baseline = gates.ignored_config_files(repo)
+    assert scan(repo, "HEAD", head(repo), CFG, baseline) == []
+    write(repo, ".cargo/config.toml", "[term]\nverbose = true\n")
+    assert only(scan(repo, "HEAD", head(repo), CFG, baseline)).path == ".cargo/config.toml"
+    write(repo, "clippy.toml", "x = 1\n")   # ignored too: new
+    write(repo, ".gitignore", "target/\n.cargo/\nclippy.toml\n")
+    assert sorted(c.path for c in scan(repo, "HEAD", head(repo), CFG, baseline)) == [".cargo/config.toml", "clippy.toml"]
+
+
+def test_ignored_non_config_and_runtime_are_not_listed(repo):
+    write(repo, ".gitignore", "target/\n*.log\n.rustflow/cache/\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "ignore")
+    write(repo, "x.log", "a\n")
+    write(repo, "target/clippy.toml", "a\n")
+    write(repo, ".rustflow/cache/deny.toml", "a\n")
+    assert gates.ignored_config_files(repo) == {}
+    assert run(repo) == []
+
+
+def test_ignored_config_extra_paths(repo):
+    write(repo, ".gitignore", "target/\nmy.conf\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "ignore")
+    write(repo, "my.conf", "a\n")
+    assert run(repo) == []
+    assert only(run(repo, dict(CFG, integrity_extra_paths=["my.conf"]))).path == "my.conf"
+
+
+def test_cache_key_covers_ignored_config(repo):
+    fp = head(repo)
+    assert gates.cache_key(repo, fp) == fp
+    _ignored_cargo(repo)
+    k1 = gates.cache_key(repo, head(repo))
+    assert k1 != head(repo) and k1.startswith(head(repo))
+    write(repo, ".cargo/config.toml", "[term]\nverbose = true\n")
+    assert gates.cache_key(repo, head(repo)) != k1

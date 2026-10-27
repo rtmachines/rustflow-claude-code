@@ -9,7 +9,6 @@ Fail-closed: any git or parse error becomes an `unknown` change, which blocks.
 from __future__ import annotations
 
 import bisect
-import fnmatch
 import hashlib
 import itertools
 import os
@@ -37,12 +36,7 @@ except ImportError:
     except ImportError:
         _toml = None  # type: ignore[assignment]
 
-CONFIG_PATTERNS: tuple[str, ...] = (
-    "rustflow.toml", ".cargo/config", ".cargo/config.toml", ".config/nextest.toml",
-    "clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml",
-    "rust-toolchain", "rust-toolchain.toml", "deny.toml",
-    ".gitattributes",   # changes how diffs (and checkout eol) are seen
-)
+CONFIG_PATTERNS = gates.CONFIG_PATTERNS
 CARGO_CONFIG_RULE = "**/.cargo/config*"
 RUSTFLOW_DIR_RULE = ".rustflow/**"
 LINT_SECTIONS = ("lints", "workspace.lints", "profile")
@@ -96,10 +90,7 @@ def _is_runtime(path: str) -> bool:
 
 
 def is_config_path(path: str, extra: list[str]) -> bool:
-    """True when `path` matches a config pattern on the path, its basename or any trailing sub-path."""
-    parts = path.split("/")
-    candidates = ["/".join(parts[i:]) for i in range(len(parts))]  # includes the basename
-    return any(fnmatch.fnmatchcase(c, pat) for pat in (*CONFIG_PATTERNS, *extra) for c in candidates)
+    return gates.is_config_path(path, extra)
 
 
 def _lines(text: str, keepends: bool = False) -> list[str]:
@@ -258,15 +249,21 @@ def _name_status(out: str) -> list[tuple[str, str]]:
     return [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
 
 
-def scan(root: Path, base_rev: str, head_tree: str, cfg: dict) -> list[GateChange]:
-    """Gate-affecting changes between `base_rev` and `head_tree`, sorted by id. Errors yield `unknown`."""
+def scan(root: Path, base_rev: str, head_tree: str, cfg: dict,
+         ignored_baseline: dict[str, str] | None = None) -> list[GateChange]:
+    """Gate-affecting changes between `base_rev` and `head_tree`, sorted by id. Errors yield `unknown`.
+
+    Gitignored config files (invisible to git, still read by cargo and the gates) are `config` changes too:
+    all of them when `ignored_baseline` is None (hooks: the base is a commit, which never holds them), else
+    those that are new or differ from that `{path: digest}` record (orchestrator: the starting environment)."""
     try:
-        return sorted(_scan(root, base_rev, head_tree, cfg), key=lambda c: c.id)
+        return sorted(_scan(root, base_rev, head_tree, cfg, ignored_baseline), key=lambda c: c.id)
     except Exception as e:  # fail closed: a scan that cannot run must block, not pass
         return [_unknown("*", f"integrity scan failed: {type(e).__name__}: {e}")]
 
 
-def _scan(root: Path, base_rev: str, head_tree: str, cfg: dict) -> list[GateChange]:
+def _scan(root: Path, base_rev: str, head_tree: str, cfg: dict,
+          ignored_baseline: dict[str, str] | None) -> list[GateChange]:
     if not head_tree:
         return [_unknown("*", "no head tree to compare (tree fingerprint unavailable)")]
     git = ("-c", "core.quotepath=false")
@@ -288,6 +285,10 @@ def _scan(root: Path, base_rev: str, head_tree: str, cfg: dict) -> list[GateChan
         if path.rsplit("/", 1)[-1] == "Cargo.toml":
             if change := _scan_cargo(root, base_rev, head_tree, path, status):
                 out.append(change)
+    seen = {c.id for c in out}
+    for path, digest in gates.ignored_config_files(root, extra).items():
+        if (ignored_baseline is None or ignored_baseline.get(path) != digest) and f"G-config-{path}" not in seen:
+            out.append(_change("config", path, "gitignored config file in use (git does not track it)", digest))
     d = _diff_u0(root, base_rev, head_tree)
     if d.returncode != 0:
         return out + [_unknown("*.rs", (d.stderr or "").strip() or "git diff -U0 failed")]

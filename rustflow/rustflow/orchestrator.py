@@ -644,7 +644,7 @@ class Orchestrator:
             return
         head = self.snapshot()
         cfg = self._gate_cfg()
-        changes = integrity.scan(self.workdir, self.state["base_sha"], head, cfg)
+        changes = integrity.scan(self.workdir, self.state["base_sha"], head, cfg, self.state.get("ignored_config"))
         entries = integrity.reconcile(self.state.get("gate_changes") or [], changes)
         for e in entries:   # a proof is about one tree: other code may now be hidden by the same config
             if e["provable"] and e["proof"] and e["proof_tree"] != head:
@@ -755,6 +755,11 @@ class Orchestrator:
             self._preflight_checks(review_mode)
             # Cargo.lock from baseline is part of the starting point, not agent work.
             self.state["start_tree"] = self.snapshot()
+            try:   # gitignored config files already in place are part of the environment, not a change
+                self.state["ignored_config"] = gates.ignored_config_files(
+                    self.workdir, list(self.state["gates_cfg"].get("integrity_extra_paths") or []))
+            except (OSError, RuntimeError, gates.IncompleteGate) as exc:
+                raise Abort("error", f"cannot list gitignored config files: {exc}") from exc
         except (Abort, BudgetExceeded, gates.IncompleteGate, gitutil.GitError, KeyboardInterrupt):
             # Cleanup gets its own bounded grace period after the run deadline.
             with execution_scope(deadline=time.monotonic() + 3, cancel=None,

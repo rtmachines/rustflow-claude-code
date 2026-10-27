@@ -122,6 +122,13 @@ def _proof_cache(root: Path) -> Path:
     return root / ".rustflow" / "cache" / "proof.json"
 
 
+def _extra_paths(root: Path) -> list[str]:
+    try:
+        return list(_hook_config(root).get("integrity_extra_paths") or [])
+    except gates.GateConfigError:
+        return []
+
+
 def _describe_changes(changes: list, limit: int = 5) -> str:
     items = [f"[{_safe(c.id, 120)}] {_safe(c.kind, 40)} {_safe(c.path, 120)} ({_safe(c.detail, 200)})"
              for c in changes[:limit]]
@@ -148,7 +155,9 @@ def _integrity_verdict(root: Path, cfg: dict) -> tuple[bool, str, bool]:
         unprovable = [c for c in changes if not c.provable]
         if unprovable:
             return False, "not provably harmless: " + _describe_changes(unprovable), False
-        key = f"{base}:{tree}"   # the same tree against another HEAD is another diff
+        # the same tree against another HEAD is another diff; ignored config files are not part of the tree
+        ignored = gates.ignored_digest(gates.ignored_config_files(root, list(cfg.get("integrity_extra_paths") or [])))
+        key = f"{base}:{tree}:{ignored}"
         try:
             cache = json.loads(_proof_cache(root).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -294,7 +303,10 @@ def _rust_changes_pending(root: Path, cfg: dict | None = None) -> bool:
                     return True
             except Exception:  # fail closed: cannot classify -> check
                 return True
-    return False
+    try:   # a gitignored config file is invisible to `status` but cargo and the gates read it
+        return bool(gates.ignored_config_files(root, extra))
+    except Exception:  # fail closed
+        return True
 
 
 def _config_notice(root: Path, cfg: dict, session: str) -> str:
@@ -518,7 +530,7 @@ def review_context(argv: list[str]) -> int:
         print("\n### Risk signals in added lines")
         print(gates.risk_signals(diff).describe())
         print("\n### Deterministic gates")
-        fp = gates.tree_fingerprint(root)
+        fp = gates.cache_key(root, gates.tree_fingerprint(root), _extra_paths(root))
         if gates.cache_lookup(root, "full", fp):
             print("GREEN (full profile) for exactly this tree - cached; no need to rerun.")
         else:

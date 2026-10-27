@@ -17,6 +17,8 @@ Profiles
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -55,6 +57,12 @@ DEFAULT_GATES = {
     "tree_stable": True,
 }
 RUNTIME_PATHS = ("target", ".rustflow/runs", ".rustflow/cache", ".rustflow/wt")
+CONFIG_PATTERNS: tuple[str, ...] = (
+    "rustflow.toml", ".cargo/config", ".cargo/config.toml", ".config/nextest.toml",
+    "clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml",
+    "rust-toolchain", "rust-toolchain.toml", "deny.toml",
+    ".gitattributes",   # changes how diffs (and checkout eol) are seen
+)
 MANIFEST_SPECS = ("Cargo.toml", "Cargo.lock", "*/Cargo.toml", "**/Cargo.toml")
 
 
@@ -387,6 +395,55 @@ def tree_fingerprint(root: Path) -> str | None:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def is_config_path(path: str, extra: list[str] | tuple[str, ...] = ()) -> bool:
+    """True when `path` matches a config pattern on the path, its basename or any trailing sub-path."""
+    parts = path.split("/")
+    candidates = ["/".join(parts[i:]) for i in range(len(parts))]  # includes the basename
+    return any(fnmatch.fnmatchcase(c, pat) for pat in (*CONFIG_PATTERNS, *extra) for c in candidates)
+
+
+def ignored_config_files(root: Path, extra: list[str] | tuple[str, ...] = ()) -> dict[str, str]:
+    """Gitignored (untracked) gate config files present in the working tree, `{path: sha256 of content}`.
+
+    Cargo and the gates read them although git (and so the tree fingerprint and the integrity scan) never
+    sees them. RUNTIME_PATHS are skipped. Raises RuntimeError when git cannot list them (callers fail closed).
+    """
+    r = _git(root, "-c", "core.quotepath=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "").strip() or "git ls-files failed")
+    out: dict[str, str] = {}
+    for path in r.stdout.split("\0"):
+        if not path or any(path == p or path.startswith(p + "/") for p in RUNTIME_PATHS):
+            continue
+        if not is_config_path(path, extra):
+            continue
+        try:
+            digest = hashlib.sha256((root / path).read_bytes()).hexdigest()
+        except OSError as exc:   # unreadable: still a distinct, fail-closed digest
+            digest = hashlib.sha256(f"unreadable: {exc.__class__.__name__}".encode()).hexdigest()
+        out[path] = digest
+    return out
+
+
+def ignored_digest(files: dict[str, str]) -> str:
+    """One short digest of `ignored_config_files` ("" when there are none)."""
+    if not files:
+        return ""
+    return hashlib.sha256("\n".join(f"{p}\t{d}" for p, d in sorted(files.items())).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def cache_key(root: Path, fp: str | None, extra: list[str] | tuple[str, ...] = ()) -> str | None:
+    """Gate-result cache key: the tree fingerprint plus a digest of the ignored config files that cargo still
+    reads. None (= no caching) when `fp` is missing or the ignored files cannot be listed."""
+    if not fp:
+        return None
+    try:
+        ig = ignored_digest(ignored_config_files(root, extra))
+    except (OSError, RuntimeError, subprocess.SubprocessError, IncompleteGate):
+        return None
+    return f"{fp}+{ig}" if ig else fp
 
 
 def manifests_changed(root: Path) -> bool:
@@ -999,8 +1056,13 @@ def _run_gates(root: Path, profile: str, *, ci: bool = False, strict: bool = Fal
               fix_fmt: bool | None = None) -> GateResult:
     root = root.resolve()
     strict = strict or ci
+    try:
+        extra = list((cfg or load_gate_config(root)).get("integrity_extra_paths") or [])
+    except GateConfigError:
+        extra = []   # the runner below reports the broken configuration
     fp = tree_fingerprint(root)
-    if use_cache and not strict and cache_lookup(root, profile, fp):
+    key = cache_key(root, fp, extra)
+    if use_cache and not strict and cache_lookup(root, profile, key):
         return GateResult(profile, True, fp, cached=True)
     runner = GateRunner(root, cfg, ci=ci, strict=strict, log_dir=log_dir)
     check_tree = profile == "full" and bool(runner.cfg.get("tree_stable", True))
@@ -1014,7 +1076,7 @@ def _run_gates(root: Path, profile: str, *, ci: bool = False, strict: bool = Fal
             steps.append(step)
     ok = all(s.output_complete and (s.ok or s.skipped) for s in steps)
     if ok and not strict:
-        cache_store(root, profile, fp_after)
+        cache_store(root, profile, cache_key(root, fp_after, extra))
     return GateResult(profile, ok, fp_after, steps=steps)
 
 

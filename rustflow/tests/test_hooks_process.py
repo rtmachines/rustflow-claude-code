@@ -201,3 +201,56 @@ def test_audit_regressions_mode_a(rust_repo):
     (rust_repo / ".cargo").mkdir(exist_ok=True)
     (rust_repo / ".cargo" / "config.toml").write_text('[build]\nrustflags = ["--cap-lints", "allow"]\n')
     assert json.loads(_stop(rust_repo, "w2").stdout)["decision"] == "block"
+
+
+# ── I2: gitignored config files are visible to the integrity check ──────────
+MASKED_LIB = "/// f\npub fn f() -> i32 {\n    return 1;\n}\n"
+CAP_LINTS = '[build]\nrustflags = ["--cap-lints", "allow"]\n'
+
+
+def _ignore_cargo_dir(repo):
+    gi = repo / ".gitignore"
+    gi.write_text(gi.read_text() + ".cargo/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore .cargo")
+
+
+def _ignored_config(repo, text):
+    (repo / ".cargo").mkdir(exist_ok=True)
+    (repo / ".cargo" / "config.toml").write_text(text)
+
+
+def test_ignored_cargo_config_masking_lints_blocks_stop(rust_repo):
+    _commit_lib(rust_repo, MASKED_LIB)
+    _ignore_cargo_dir(rust_repo)
+    _ignored_config(rust_repo, CAP_LINTS)
+    d = json.loads(_stop(rust_repo, "i1").stdout)
+    assert d["decision"] == "block" and "Gate-affecting" in d["reason"] and ".cargo/config.toml" in d["reason"]
+
+
+def test_ignored_cargo_config_blocks_commit_gate(rust_repo):
+    _commit_lib(rust_repo, MASKED_LIB)
+    _ignore_cargo_dir(rust_repo)
+    _ignored_config(rust_repo, CAP_LINTS)
+    (rust_repo / "README.md").write_text("x\n")
+    r = hook(rust_repo, "guard-bash", {"tool_input": {"command": "git commit -am x"}})
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "Commit blocked" in out["permissionDecisionReason"]
+
+
+def test_harmless_ignored_config_passes_with_a_note(rust_repo):
+    _commit_lib(rust_repo)
+    _ignore_cargo_dir(rust_repo)
+    _ignored_config(rust_repo, "[term]\nverbose = false\n")
+    d = json.loads(_stop(rust_repo, "i2").stdout)
+    assert d.get("decision") != "block" and "proven harmless" in d["systemMessage"]
+
+
+def test_gate_cache_not_reused_after_ignored_config_changes(rust_repo):
+    _commit_lib(rust_repo, MASKED_LIB)
+    _ignore_cargo_dir(rust_repo)
+    _ignored_config(rust_repo, CAP_LINTS)
+    assert json.loads(_stop(rust_repo, "i3a").stdout)["decision"] == "block"   # gates green under the mask, cached
+    (rust_repo / ".cargo" / "config.toml").unlink()
+    d = json.loads(_stop(rust_repo, "i3b").stdout)
+    assert d["decision"] == "block" and "rustflow gates failed" in d["reason"]   # not served from the cache

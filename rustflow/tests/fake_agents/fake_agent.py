@@ -81,7 +81,7 @@ mod tests {
 
 LINTS_SCENARIOS = ("lints_both_accept", "lints_one_reject", "lints_degraded")
 TR_SCENARIOS = ("tests_removed_accept", "tests_removed_more")   # the base holds tests/old_a.rs (+ old_b.rs)
-GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change") + LINTS_SCENARIOS + TR_SCENARIOS
+GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change", "ignored_harmless") + LINTS_SCENARIOS + TR_SCENARIOS
 CAP_LINTS = '[build]\nrustflags = ["--cap-lints", "allow"]\n'
 NEEDLESS_RETURN = "\npub fn answer() -> i32 {\n    return 1;\n}\n"
 MANY_ARGS = ("\npub fn many(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32) -> i32 {\n"
@@ -207,6 +207,12 @@ def act(prompt):
             toml.write_text(toml.read_text() + '\n[lints.clippy]\nneedless_return = "allow"\n')
             return {"summary": "implemented parse_kv; relaxed needless_return as the task requires",
                     "files_changed": ["src/lib.rs", "Cargo.toml"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO == "ignored_harmless":  # a (gitignored) cargo config that hides nothing
+            lib().write_text(BUGGY)
+            Path(".cargo").mkdir(exist_ok=True)
+            Path(".cargo/config.toml").write_text("[term]\nverbose = false\n")
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
                     "gates_green": True, "notes": ""}
         if SCENARIO in TR_SCENARIOS:  # an obsolete integration test is deleted along with the implementation
             lib().write_text(BUGGY)

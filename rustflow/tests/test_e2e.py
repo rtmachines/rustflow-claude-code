@@ -432,3 +432,33 @@ def test_more_removals_after_consent_reset_the_votes(rust_repo, monkeypatch):
     e = st["gate_changes"][0]
     assert e["kind"] == "tests-removed" and e["accepted_by"] == "" and e["status"] == "pending"
     assert "old_b.rs" in e["detail"]
+
+
+def _ignore_cargo_dir(repo):
+    (repo / ".gitignore").write_text((repo / ".gitignore").read_text() + ".cargo/\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "ignore .cargo")
+
+
+def test_ignored_config_created_by_the_implementer_is_a_change(rust_repo, monkeypatch):
+    _ignore_cargo_dir(rust_repo)
+    rc, st = run(rust_repo, "weaken", monkeypatch, difficulty="easy")
+    assert st["status"] == "gate_changes_pending" and rc == 2, st.get("stop_reason")
+    e = next(x for x in st["gate_changes"] if x["path"] == ".cargo/config.toml")
+    assert (e["kind"], e["proof"], e["status"]) == ("config", "failed", "blocked")
+
+
+def test_harmless_ignored_config_is_proven(rust_repo, monkeypatch):
+    _ignore_cargo_dir(rust_repo)
+    rc, st = run(rust_repo, "ignored_harmless", monkeypatch, difficulty="easy")
+    assert st["status"] == "approved_with_advisories", st.get("stop_reason")
+    assert [(e["path"], e["accepted_by"]) for e in st["gate_changes"]] == [(".cargo/config.toml", "proof")]
+
+
+def test_preexisting_ignored_config_is_environment(rust_repo, monkeypatch):
+    _ignore_cargo_dir(rust_repo)
+    (rust_repo / ".cargo").mkdir()
+    (rust_repo / ".cargo" / "config.toml").write_text("[term]\nverbose = false\n")
+    rc, st = run(rust_repo, "happy", monkeypatch)
+    assert st["status"] == "approved_with_advisories", st.get("stop_reason")
+    assert st["gate_changes"] == [] and list(st["ignored_config"]) == [".cargo/config.toml"]
