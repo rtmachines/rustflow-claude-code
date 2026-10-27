@@ -80,6 +80,96 @@ def _state_dir(root: Path) -> Path:
     return d
 
 
+_UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f`\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def _safe(text: object, limit: int = 200) -> str:
+    """Model-visible form of an implementer-controlled string: no control chars or backticks, bounded."""
+    t = _UNSAFE_CHARS.sub("?", str(text))
+    return t if len(t) <= limit else t[:limit] + "..."
+
+
+def _integrity():
+    """Imported lazily: a missing/broken integrity module must fail closed in the integrity path only."""
+    try:
+        import integrity  # type: ignore[import-not-found]   # .rustflow/integrity.py (installed layout)
+    except ImportError:  # running from the package
+        from rustflow import integrity  # type: ignore[no-redef]
+    return integrity
+
+
+def _has_head(root: Path) -> bool:
+    return gates._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").returncode == 0
+
+
+def _hook_config(root: Path) -> dict:
+    """Gate config the hooks enforce: never the (model-editable) working tree when a base exists.
+
+    Orchestrated roles: the config at $RUSTFLOW_BASE (the run's base commit). Interactive: HEAD.
+    GateConfigError propagates; callers turn it into block/deny.
+    """
+    if _role():
+        base = os.environ.get("RUSTFLOW_BASE", "").strip()
+        return gates.load_gate_config_at(root, base) if base else gates.load_gate_config(root)
+    if not _has_head(root):
+        return gates.load_gate_config(root)
+    return gates.load_gate_config_at(root, "HEAD")
+
+
+def _proof_cache(root: Path) -> Path:
+    return root / ".rustflow" / "cache" / "proof.json"
+
+
+def _describe_changes(changes: list, limit: int = 5) -> str:
+    items = [f"[{_safe(c.id, 120)}] {_safe(c.kind, 40)} {_safe(c.path, 120)} ({_safe(c.detail, 200)})"
+             for c in changes[:limit]]
+    more = f"; +{len(changes) - limit} more" if len(changes) > limit else ""
+    return "; ".join(items) + more
+
+
+def _integrity_verdict(root: Path, cfg: dict) -> tuple[bool, str]:
+    """Gate-integrity check of the working tree against HEAD (interactive sessions).
+
+    (True, "") nothing changed; (True, note) changes proven harmless / nothing to compare; (False, why) block.
+    Fail-closed: any exception becomes (False, ...).
+    """
+    try:
+        head = gates._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        if head.returncode != 0:
+            return True, "rustflow: no commit yet - gate integrity not checked"
+        base = head.stdout.strip()
+        integrity = _integrity()
+        tree = gates.tree_fingerprint(root) or ""
+        changes = integrity.scan(root, base, tree, cfg)
+        if not changes:
+            return True, ""
+        unprovable = [c for c in changes if not c.provable]
+        if unprovable:
+            return False, "not provably harmless: " + _describe_changes(unprovable)
+        key = f"{base}:{tree}"   # the same tree against another HEAD is another diff
+        try:
+            cache = json.loads(_proof_cache(root).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+        status = cache.get(key) if isinstance(cache, dict) else None
+        detail = "cached result for this exact tree"
+        if status not in ("passed", "failed"):
+            res = integrity.prove(root, base, tree, changes, "stop", cfg)
+            status = "passed" if res.status == "passed" else "failed"
+            detail = "; ".join(x for x in (_safe(res.summary, 300), _safe(res.error or "", 300)) if x)
+            if tree:
+                try:
+                    _proof_cache(root).parent.mkdir(parents=True, exist_ok=True)
+                    _proof_cache(root).write_text(json.dumps({key: status}), encoding="utf-8")
+                except OSError:
+                    pass
+        if status == "passed":
+            return True, "rustflow: gate-affecting changes proven harmless: " + _describe_changes(changes, 3)
+        return False, "proof with the HEAD configuration failed (" + detail + "): " + _describe_changes(changes)
+    except Exception as exc:  # fail closed
+        return False, f"gate integrity check could not run: {_safe(type(exc).__name__)}: {_safe(exc, 300)}"
+
+
 # ── post-edit ────────────────────────────────────────────────────────────────
 def post_edit(data: dict) -> int:
     if _role() in READ_ONLY_ROLES | AUDIT_ROLES or os.environ.get("RUSTFLOW_HOOKS") == "0":
@@ -92,7 +182,11 @@ def post_edit(data: dict) -> int:
     if "/target/" in norm or not RUST_RELEVANT.search(norm):
         return 0
     root = gates.find_root()
-    cfg = gates.load_gate_config(root)
+    try:
+        cfg = _hook_config(root)
+    except gates.GateConfigError as exc:
+        sys.stderr.write(f"rustflow: cannot read the gate configuration: {_safe(exc, 300)}\n")
+        return 2
     if not (root / cfg.get("cargo_dir", ".") / "Cargo.toml").is_file():
         return 0
     runner = gates.GateRunner(root, cfg)
@@ -170,13 +264,21 @@ def guard_edit(data: dict) -> int:
                            f"`rustflow cancel {act['run_id']}`.")
 
 
-def _rust_changes_pending(root: Path) -> bool:
+def _rust_changes_pending(root: Path, cfg: dict | None = None) -> bool:
     r = gates._git(root, "status", "--porcelain", "--untracked-files=all")
     if r.returncode != 0:
         return True
+    extra = list((cfg or {}).get("integrity_extra_paths", []) or [])
     for line in r.stdout.splitlines():
-        path = line[3:].strip().strip('"')
-        if RUST_RELEVANT.search(path) and not path.startswith(".rustflow/"):
+        path = line[3:].split(" -> ")[-1].strip().strip('"')
+        if path.startswith(".rustflow/"):
+            continue
+        if RUST_RELEVANT.search(path):
+            return True
+        try:
+            if _integrity().is_config_path(path, extra):
+                return True
+        except Exception:  # fail closed: cannot classify -> check
             return True
     return False
 
@@ -199,15 +301,34 @@ def stop(data: dict) -> int:
     if role in READ_ONLY_ROLES | AUDIT_ROLES or os.environ.get("RUSTFLOW_HOOKS") == "0":
         return 0
     root = gates.find_root()
-    cfg = gates.load_gate_config(root)
     session = re.sub(r"[^A-Za-z0-9_-]", "_", str(data.get("session_id") or "nosession"))
-    notice = _config_notice(root, cfg, session)
+    counter = _state_dir(root) / f"stop-blocks-{session}"
+    notice = ""
 
     def finish(obj: dict | None = None) -> int:
         if notice:
             obj = {**(obj or {}), "systemMessage": " ".join(x for x in (notice, (obj or {}).get("systemMessage")) if x)}
         return _emit(obj) if obj else 0
 
+    def block(max_blocks: int, what: str, reason) -> int:
+        try:
+            n = int(counter.read_text(encoding="utf-8")) + 1
+        except (OSError, ValueError):
+            n = 1
+        counter.write_text(str(n), encoding="utf-8")
+        if n > max_blocks:
+            counter.unlink(missing_ok=True)
+            return finish({"systemMessage": f"rustflow: {what} still failing after {max_blocks} attempts - "
+                                            "review manually (logs: .rustflow/cache/logs/)."})
+        return finish({"decision": "block", "reason": reason(n)})
+
+    try:
+        cfg = _hook_config(root)
+    except gates.GateConfigError as exc:
+        err = _safe(exc, 300)
+        return block(3, "gate configuration unreadable", lambda n: (
+            f"rustflow cannot read the gate configuration ({err}); gates cannot be checked (attempt {n}/3)."))
+    notice = _config_notice(root, cfg, session)
     if not (root / cfg.get("cargo_dir", ".") / "Cargo.toml").is_file():
         return finish()
     # Interactive sessions: only when Rust-relevant files differ from HEAD. Orchestrated: always
@@ -216,27 +337,25 @@ def stop(data: dict) -> int:
         act = gates.find_active_for(root)
         if act and _same_dir(act.get("workdir", ""), root):
             return finish()  # a rustflow run owns this checkout; its own gates decide, not the driving session's
-    if role not in ORCHESTRATED_WRITE_ROLES and not _rust_changes_pending(root):
+    if role not in ORCHESTRATED_WRITE_ROLES and not _rust_changes_pending(root, cfg):
         return finish()
-    counter = _state_dir(root) / f"stop-blocks-{session}"
     max_blocks = int(cfg.get("stop_max_blocks", 3))
     res = gates.run_gates(root, "stop", cfg=cfg)
     baseline = _baseline_signatures(root)
-    if res.ok or (baseline and not gates.new_failures(res.signature_counts(), baseline)):
+    if not (res.ok or (baseline and not gates.new_failures(res.signature_counts(), baseline))):
+        return block(max_blocks, "gates", lambda n: (
+            f"rustflow gates failed (attempt {n}/{max_blocks}). Fix them before finishing. Do not "
+            "silence lints with #[allow] or skip/weaken tests.\n\n" + res.feedback(max_diags=10, max_chars=8000)))
+    if not role:  # the orchestrator owns gate-affecting changes of orchestrated roles
+        ok, why = _integrity_verdict(root, cfg)
+        if not ok:
+            return block(max_blocks, "gate integrity", lambda n: (
+                f"Gate-affecting changes: {why}. Revert them, or ask the user to commit them himself."
+                f" (attempt {n}/{max_blocks})"))
         counter.unlink(missing_ok=True)
-        return finish()
-    try:
-        n = int(counter.read_text(encoding="utf-8")) + 1
-    except (OSError, ValueError):
-        n = 1
-    counter.write_text(str(n), encoding="utf-8")
-    if n > max_blocks:
-        counter.unlink(missing_ok=True)
-        return finish({"systemMessage": f"rustflow: gates still RED after {max_blocks} attempts - "
-                                        "review manually (logs: .rustflow/cache/logs/)."})
-    reason = (f"rustflow gates failed (attempt {n}/{max_blocks}). Fix them before finishing. Do not "
-              "silence lints with #[allow] or skip/weaken tests.\n\n" + res.feedback(max_diags=10, max_chars=8000))
-    return finish({"decision": "block", "reason": reason})
+        return finish({"systemMessage": why} if why else None)
+    counter.unlink(missing_ok=True)
+    return finish()
 
 
 # ── guard-bash ───────────────────────────────────────────────────────────────
@@ -338,12 +457,19 @@ def guard_bash(data: dict) -> int:
                                    f"changes until it finishes (`rustflow wait {act['run_id']}`).")
     if not role and _COMMIT.search(cmd):
         root = gates.find_root()
-        cfg = gates.load_gate_config(root)
+        try:
+            cfg = _hook_config(root)
+        except gates.GateConfigError as exc:
+            return _decide("deny", f"Commit blocked: cannot read the gate configuration ({_safe(exc, 300)}).")
         if (root / cfg.get("cargo_dir", ".") / "Cargo.toml").is_file():
             res = gates.run_gates(root, "stop", cfg=cfg)
             if not res.ok:
                 return _decide("deny", "Commit blocked: rustflow gates are RED. Fix them, then commit.\n\n"
                                        + res.feedback(max_diags=10, max_chars=6000))
+            ok, why = _integrity_verdict(root, cfg)
+            if not ok:
+                return _decide("deny", f"Commit blocked - gate-affecting changes: {why}. Revert them, or ask "
+                                       "the user to commit them himself.")
     return 0
 
 
