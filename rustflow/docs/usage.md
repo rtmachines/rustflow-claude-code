@@ -120,7 +120,7 @@ The named test must actually run and pass on the checked tree. Short names match
 
 Rustflow also checks changes that could make the gates weaker than the base commit. Each such change has a kind:
 
-- `config`: `rustflow.toml`, `.cargo/config`, `.cargo/config.toml`, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml` (each name matches at any depth), and paths matched by `integrity_extra_paths`.
+- `config`: `rustflow.toml`, `.cargo/config`, `.cargo/config.toml`, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`, `.gitattributes` (each name matches at any depth), and paths matched by `integrity_extra_paths`. Files of these names that `.gitignore` hides count as well (see [configuration](configuration.md#gate-integrity)).
 - `cargo-lints`: `[lints]`, `[workspace.lints]`, or `[profile.*]` in a `Cargo.toml`. Adding a dependency is not a change.
 - `silence`: an added `#[allow(`, `#![allow(`, `#[expect(`, `cfg_attr(…, allow/expect(`, or `#[ignore` attribute.
 - `tests-removed`: a net decrease in test attributes across the diff. Moving a test is fine.
@@ -235,7 +235,7 @@ Responses include text and `structuredContent`. `next_actions` supplies CLI acti
 
 ## CLI reference
 
-Use `rustflow --help`, `rustflow --version`, or `rustflow <command> --help`. Put options after the subcommand. All except `mcp` accept `--repo PATH` and `--config PATH`; repo defaults to the current Git toplevel, or the supplied directory outside Git. Some handlers read repository-local configuration directly: `init`, `doctor --selftest`, `lints`, and `gates` do not apply alternate `--config` files. Gates inside a run also read its checkout's file. Keep gate settings there; see [configuration](configuration.md).
+Use `rustflow --help`, `rustflow --version`, or `rustflow <command> --help`. Put options after the subcommand. All except `mcp` accept `--repo PATH` and `--config PATH`; repo defaults to the current Git toplevel, or the supplied directory outside Git. Some handlers read repository-local configuration directly: `init`, `doctor --selftest`, `lints`, and `gates` do not apply alternate `--config` files. Gates inside a run read `[gates]` from the run's base commit, not from the checkout; commit gate settings before you start. See [configuration](configuration.md).
 
 | Command | Specific arguments/options |
 | --- | --- |

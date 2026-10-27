@@ -60,6 +60,10 @@ already show it - instead of translating the CLI `command`. Do the ones without 
 - `criteria_unmet` -> reviewers approved but a required test did not pass on the final tree; show which
   (`T-<id>` findings / `mechanical` in the summary) and ask: fix round (`rustflow resume <id> --extra-rounds 2
   --detach`), fix by hand, or drop the criterion.
+- `gate_changes_pending` -> the run changed what the gates check (config, lints, `#[allow]`, removed tests) and no proof or
+  unanimous reviewer consent covers it. List the changes from the summary and ask the user: revert them (then
+  `rustflow resume <id> --extra-rounds 1 --detach`), or fix by hand. Never revert, accept or commit gate policy on your
+  own; there is no accept flag.
 - `tree_changed` -> files changed while reviewers worked (someone edited the checkout); make sure nobody
   edits it, then `rustflow resume <id> --detach` (re-runs gates and review).
 - `max_rounds` / `stalled` / `final_gates_red` -> list the blocking findings; ask: another fix round of the

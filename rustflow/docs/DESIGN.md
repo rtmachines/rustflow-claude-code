@@ -89,6 +89,9 @@ Domyślnie: reviewer_a = Claude (soczewka poprawności), reviewer_b = Codex (soc
 - Cache wyników bramek i dowodu w `.rustflow/cache/` nie jest chroniony przed zapisem przez agenta.
 - Reguły `--disallowedTools` dla ról piszących nie obejmują zapisu przez Bash; o blokadzie decyduje detekcja w diffie.
 - Przy `--accept-red-baseline` dowód nie uwzględnia czerwonej bazy, więc zmiany dowodliwe kończą się porażką dowodu (blokują zachowawczo).
+- Wykrywanie w diffie to stały zestaw wzorców, nie analiza semantyczna. Znane luki poza specyfikacją: test zakomentowany blokowo (`/* #[test] ... */`), `#[should_panic]` dodane do padającego testu, `#[cfg(any())]` / `#[cfg(all(test, any()))]` na module testów, `#[cfg_attr(x, ignore)]`, `# [allow(..)]` i atrybut rozbity na wiele linii (rustfmt zwykle to normalizuje), `[lib] test = false` / `autotests = false` w `Cargo.toml` oraz osłabienie ciała testu (`assert!(true)`).
+- Hook Stop i bramka commita (bramki + dowód) mają limit czasu 1800 s; po jego przekroczeniu Claude Code traktuje hook jako niekrytyczny błąd (fail-open) i nic nie trafia do cache.
+- Pliki konfiguracji ukryte w `.gitignore` (np. `.cargo/config.toml`) są traktowane jak zmiany `config`: w trybie interaktywnym każdy obecny, w orkiestratorze nowy lub zmieniony względem stanu z preflightu. Dowód uruchamia bramki w worktree bez nich, więc projekt, który faktycznie wymaga takiego pliku do budowy, zostanie zablokowany.
 - Wygenerowane CI uruchamia `gates.py` na roboczym `rustflow.toml` PR-a i bez skanu integralności, więc PR, który osłabia `[gates]`, osłabia także własne bramki CI.
 
 ## 6. Prompt caching
