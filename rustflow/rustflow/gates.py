@@ -255,7 +255,10 @@ def load_gate_config_at(root: Path, rev: str) -> dict:
     try:
         if _git(root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").returncode != 0:
             raise GateConfigError(f"cannot resolve revision {rev!r}")
-        if _git(root, "cat-file", "-e", f"{rev}:rustflow.toml").returncode != 0:
+        ls = _git(root, "ls-tree", rev, "--", "rustflow.toml")
+        if ls.returncode != 0:
+            raise GateConfigError(f"git ls-tree {rev} failed: {(ls.stderr or '').strip()}")
+        if not ls.stdout.strip():
             return dict(DEFAULT_GATES)   # revision is valid, the path is not in its tree
         r = _git(root, "show", f"{rev}:rustflow.toml")
     except (OSError, subprocess.SubprocessError, IncompleteGate) as exc:

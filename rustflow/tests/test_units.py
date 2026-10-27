@@ -602,3 +602,14 @@ def test_signature_counts_keeps_duplicates():
     key = "clippy|src/lib.rs|clippy::needless_return|unneeded `return` statement"
     assert res.signature_counts()[key] == 2
     assert res.signatures() == {key}
+
+
+def test_load_gate_config_at_missing_blob_fails_closed(git_repo):
+    _commit_toml(git_repo, '[gates]\ntests = "off"\n')
+    blob = subprocess.run(["git", "rev-parse", "HEAD:rustflow.toml"], cwd=git_repo, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    obj = git_repo / ".git" / "objects" / blob[:2] / blob[2:]
+    obj.chmod(0o644)
+    obj.unlink()
+    with pytest.raises(gates.GateConfigError):
+        gates.load_gate_config_at(git_repo, "HEAD")
