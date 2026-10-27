@@ -101,7 +101,7 @@ def checkpoint(root: Path, message: str) -> str | None:
 
 
 def diff(root: Path, a: str, b: str, *, stat: bool = False, paths: tuple[str, ...] = ()) -> str:
-    args = ["diff", "--no-color", "--no-ext-diff"]
+    args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text"]
     if stat:
         args.append("--stat=160")
     else:

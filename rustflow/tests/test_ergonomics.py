@@ -318,6 +318,6 @@ def test_write_roles_get_path_deny_rules(tmp_path, fake_defaults):
 def test_protected_edit_rules_exact_list():
     from rustflow import integrity
     names = ["rustflow.toml", ".config/nextest.toml", "clippy.toml", ".clippy.toml", "rustfmt.toml",
-             ".rustfmt.toml", "rust-toolchain", "rust-toolchain.toml", "deny.toml"]
+             ".rustfmt.toml", "rust-toolchain", "rust-toolchain.toml", "deny.toml", ".gitattributes"]
     paths = [q for n in names for q in (n, f"**/{n}")] + ["**/.cargo/config*", ".rustflow/**"]
     assert integrity.protected_edit_rules() == [f"{t}({p})" for p in paths for t in ("Edit", "Write")]

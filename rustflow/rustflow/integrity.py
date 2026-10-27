@@ -15,6 +15,7 @@ import itertools
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from copy import deepcopy
@@ -40,6 +41,7 @@ CONFIG_PATTERNS: tuple[str, ...] = (
     "rustflow.toml", ".cargo/config", ".cargo/config.toml", ".config/nextest.toml",
     "clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml",
     "rust-toolchain", "rust-toolchain.toml", "deny.toml",
+    ".gitattributes",   # changes how diffs (and checkout eol) are seen
 )
 CARGO_CONFIG_RULE = "**/.cargo/config*"
 RUSTFLOW_DIR_RULE = ".rustflow/**"
@@ -240,6 +242,14 @@ def _parse_rs_diff(diff: str, positions: dict[str, list[int]] | None = None,
     return silence, removed
 
 
+def _diff_u0(root: Path, base_rev: str, head_tree: str) -> subprocess.CompletedProcess:
+    """The one `git diff -U0` over `*.rs` the scan and the proof both parse. Immune to user git config
+    (`diff.external`, `diff.noprefix`, textconv) and to in-tree attributes (`-diff`, `binary`)."""
+    return gates._git(root, "-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-textconv", "--text",
+                      "--src-prefix=a/", "--dst-prefix=b/", "--no-renames", "--no-color", "-U0",
+                      base_rev, head_tree, "--", "*.rs")
+
+
 def _name_status(out: str) -> list[tuple[str, str]]:
     parts = out.split("\0")
     return [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
@@ -275,7 +285,7 @@ def _scan(root: Path, base_rev: str, head_tree: str, cfg: dict) -> list[GateChan
         if path.rsplit("/", 1)[-1] == "Cargo.toml":
             if change := _scan_cargo(root, base_rev, head_tree, path, status):
                 out.append(change)
-    d = gates._git(root, *git, "diff", "--no-renames", "--no-color", "-U0", base_rev, head_tree, "--", "*.rs")
+    d = _diff_u0(root, base_rev, head_tree)
     if d.returncode != 0:
         return out + [_unknown("*.rs", (d.stderr or "").strip() or "git diff -U0 failed")]
     silence, removed = _parse_rs_diff(d.stdout)
@@ -471,8 +481,7 @@ def _prepare_wt_parent(wt: Path) -> None:
 
 
 def _added_attrs(root: Path, base_rev: str, head_tree: str) -> tuple[dict[str, list[int]], dict[str, set[int]]]:
-    d = gates._git(root, "-c", "core.quotepath=false", "diff", "--no-renames", "--no-color", "-U0",
-                   base_rev, head_tree, "--", "*.rs")
+    d = _diff_u0(root, base_rev, head_tree)
     if d.returncode != 0:
         raise RuntimeError((d.stderr or "").strip() or "git diff -U0 failed")
     positions: dict[str, list[int]] = {}

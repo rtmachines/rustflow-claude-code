@@ -689,3 +689,59 @@ def test_votes_ignored_for_provable_and_unknown():
     assert p["votes"] == {} and u["votes"] == {}
     assert p["status"] == "pending" and u["status"] == "blocked"
     integrity.apply_votes([p], "reviewer_a", [{"id": "G-none", "decision": "accept", "reason": ""}])
+
+
+# ── C1: the diff reading is immune to git config and in-tree attributes ─────
+def _weaken(repo):
+    write(repo, "src/lib.rs", "#![allow(warnings)]\npub fn a() {}\n")   # silence added, #[test] removed
+
+
+def _assert_detected(repo):
+    assert sorted(c.kind for c in run(repo)) == ["silence", "tests-removed"]
+
+
+def test_diff_external_does_not_hide_changes(repo):
+    git(repo, "config", "diff.external", "/bin/true")
+    _weaken(repo)
+    _assert_detected(repo)
+
+
+def test_gitattributes_nodiff_does_not_hide_changes(repo):
+    for attr in ("*.rs -diff", "*.rs binary"):
+        write(repo, ".gitattributes", attr + "\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "attr")
+        _weaken(repo)
+        _assert_detected(repo)
+        git(repo, "checkout", "-q", "--", ".")
+
+
+def test_diff_noprefix_does_not_break_attribution(repo):
+    git(repo, "config", "diff.noprefix", "true")
+    _weaken(repo)
+    _assert_detected(repo)
+
+
+def test_gitattributes_is_config(repo):
+    write(repo, "sub/.gitattributes", "*.rs -diff\n")
+    c = only(run(repo))
+    assert (c.kind, c.path) == ("config", "sub/.gitattributes")
+
+
+def test_added_attrs_uses_hardened_diff(repo):
+    git(repo, "config", "diff.external", "/bin/true")
+    git(repo, "config", "diff.noprefix", "true")
+    write(repo, "src/lib.rs", "#![allow(warnings)]\npub fn a() {}\n")
+    positions, _ = integrity._added_attrs(repo, "HEAD", head(repo))
+    assert positions == {"src/lib.rs": [1]}
+
+
+def test_reviewer_diff_shows_text_despite_attributes(repo):
+    from rustflow import gitutil
+    write(repo, ".gitattributes", "*.rs binary\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "attr")
+    write(repo, "src/lib.rs", "pub fn changed() {}\n")
+    git(repo, "add", "-A")
+    out = gitutil.diff(repo, "HEAD", gates.tree_fingerprint(repo))
+    assert "pub fn changed" in out and "Binary files" not in out
