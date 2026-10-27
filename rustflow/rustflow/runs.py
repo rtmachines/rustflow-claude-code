@@ -183,13 +183,19 @@ def _mcp(tool: str, **arguments) -> dict:
 MAX_GATE_ITEMS = 15
 
 
+def _display_safe(text, limit: int = 200) -> str:
+    """Driver-facing form of a file name or id: no backticks or control chars, capped. State keeps the real value."""
+    t = re.sub(r"[\x00-\x1f\x7f`]", "?", str(text))
+    return t if len(t) <= limit else t[:limit] + "…"
+
+
 def _gate_changes_question(state: dict) -> str:
     """Driver-facing text: scanner-generated fields only (no justification or vote reasons), bounded in size."""
     entries = integrity.pending(state.get("gate_changes") or [])
     items = []
     for e in entries[:MAX_GATE_ITEMS]:
         votes = ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "none"
-        items.append(f"[{e.get('id')}] {e.get('kind')} `{str(e.get('path', ''))[:200]}` "
+        items.append(f"[{_display_safe(e.get('id'))}] {e.get('kind')} `{_display_safe(e.get('path', ''))}` "
                      f"({str(e.get('detail') or '')[:300]}; proof: {e.get('proof') or 'none'}; votes: {votes})")
     more = f"; +{len(entries) - MAX_GATE_ITEMS} more - see report.md" if len(entries) > MAX_GATE_ITEMS else ""
     return ("The change touches files that decide what the gates check, and it is not accepted: "
@@ -198,7 +204,7 @@ def _gate_changes_question(state: dict) -> str:
 
 
 def _accepted_gate_note(state: dict) -> str:
-    ids = [str(e.get("id")) for e in state.get("gate_changes") or [] if e.get("status") == "accepted"]
+    ids = [_display_safe(e.get("id")) for e in state.get("gate_changes") or [] if e.get("status") == "accepted"]
     if not ids:
         return ""
     more = f", +{len(ids) - MAX_GATE_ITEMS} more" if len(ids) > MAX_GATE_ITEMS else ""

@@ -37,6 +37,10 @@ def _table(rows: list[list[str]], head: list[str]) -> str:
     return "\n".join(out)
 
 
+def _cell(text) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(text))
+
+
 def render(state: dict, repo: Path) -> str:
     st = state.get("status", "running")
     lines = [f"# rustflow: raport `{state.get('run_id')}`", ""]
@@ -221,10 +225,10 @@ def render(state: dict, repo: Path) -> str:
 
     gate_changes = state.get("gate_changes") or []
     if gate_changes:
-        rows = [[e.get("id", ""), e.get("kind", ""), e.get("path", ""), e.get("status", ""),
+        rows = [[_cell(e.get("id", "")), e.get("kind", ""), _cell(e.get("path", "")), e.get("status", ""),
                  e.get("accepted_by") or "-", e.get("proof") or "-",
                  ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "-",
-                 (e.get("justification") or "-").replace("\r", " ")[:500]] for e in gate_changes]
+                 _cell((e.get("justification") or "-")[:500])] for e in gate_changes]
         lines += ["## Zmiany wpływające na bramki", "",
                   _table(rows, ["id", "rodzaj", "ścieżka", "status", "accepted_by", "dowód", "głosy",
                                 "uzasadnienie"]), ""]
