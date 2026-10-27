@@ -37,8 +37,11 @@ def _table(rows: list[list[str]], head: list[str]) -> str:
     return "\n".join(out)
 
 
+_UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
 def _cell(text) -> str:
-    return re.sub(r"[\x00-\x1f\x7f]", " ", str(text))
+    return _UNSAFE_CHARS.sub(" ", str(text))
 
 
 def render(state: dict, repo: Path) -> str:

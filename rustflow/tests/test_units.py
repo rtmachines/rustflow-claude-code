@@ -660,6 +660,7 @@ def test_report_gate_changes_pending_resume_line():
 def test_report_gate_changes_row_survives_cr():
     from pathlib import Path
     from rustflow import report
-    entry = {"id": "G-config-a\rb", "path": "a\rb\x0bc", "kind": "config", "status": "pending"}
+    entry = {"id": "G-config-a\rb", "path": "a\rb\x0bc\u2028d\x85e", "kind": "config", "status": "pending"}
     text = report.render({"run_id": "r", "status": "gate_changes_pending", "gate_changes": [entry]}, Path("."))
     assert len([ln for ln in text.splitlines() if "G-config-a" in ln]) == 1
+    assert "G-config-a" in next(ln for ln in text.splitlines() if "G-config-a" in ln) and "d" in text

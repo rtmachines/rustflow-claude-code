@@ -183,9 +183,12 @@ def _mcp(tool: str, **arguments) -> dict:
 MAX_GATE_ITEMS = 15
 
 
+_UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f`\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
 def _display_safe(text, limit: int = 200) -> str:
     """Driver-facing form of a file name or id: no backticks or control chars, capped. State keeps the real value."""
-    t = re.sub(r"[\x00-\x1f\x7f`]", "?", str(text))
+    t = _UNSAFE_CHARS.sub("?", str(text))
     return t if len(t) <= limit else t[:limit] + "…"
 
 
@@ -196,7 +199,7 @@ def _gate_changes_question(state: dict) -> str:
     for e in entries[:MAX_GATE_ITEMS]:
         votes = ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "none"
         items.append(f"[{_display_safe(e.get('id'))}] {e.get('kind')} `{_display_safe(e.get('path', ''))}` "
-                     f"({str(e.get('detail') or '')[:300]}; proof: {e.get('proof') or 'none'}; votes: {votes})")
+                     f"({_display_safe(e.get('detail') or '', 300)}; proof: {e.get('proof') or 'none'}; votes: {votes})")
     more = f"; +{len(entries) - MAX_GATE_ITEMS} more - see report.md" if len(entries) > MAX_GATE_ITEMS else ""
     return ("The change touches files that decide what the gates check, and it is not accepted: "
             + "; ".join(items) + more + ". Either revert it by hand in the work tree and run `resume --extra-rounds 1` "
