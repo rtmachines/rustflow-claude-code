@@ -41,6 +41,8 @@ CONFIG_PATTERNS: tuple[str, ...] = (
     "clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml",
     "rust-toolchain", "rust-toolchain.toml", "deny.toml",
 )
+CARGO_CONFIG_RULE = "**/.cargo/config*"
+RUSTFLOW_DIR_RULE = ".rustflow/**"
 LINT_SECTIONS = ("lints", "workspace.lints", "profile")
 SILENCE_RE = re.compile(r"#!?\[\s*(allow|expect)\s*\(|cfg_attr\s*\(.*\b(allow|expect)\s*\(|#\[\s*ignore\b")
 TEST_RE = re.compile(r"#\[\s*(\w+::)*test\b")
@@ -71,6 +73,13 @@ def _change(kind: str, path: str, detail: str, digest: str) -> GateChange:
 
 def _unknown(path: str, detail: str) -> GateChange:
     return _change("unknown", path, detail, _sha(detail))
+
+
+def protected_edit_rules() -> list[str]:
+    """`--disallowedTools` rules denying Edit/Write on the fixed gate config paths and `.rustflow/**`."""
+    paths = [p for p in CONFIG_PATTERNS if not p.startswith(".cargo/config")]
+    paths += [CARGO_CONFIG_RULE, RUSTFLOW_DIR_RULE]
+    return [f"{tool}({p})" for p in paths for tool in ("Edit", "Write")]
 
 
 def _is_runtime(path: str) -> bool:

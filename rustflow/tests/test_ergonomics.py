@@ -298,3 +298,18 @@ def test_write_roles_may_run_read_only_shell_commands(tmp_path, fake_defaults):
     off = _arg(agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path, "implementer", write=True)),
                "--allowedTools").split(",")
     assert "Bash(ls *)" not in off
+
+
+# ── gate config paths are denied to write roles ─────────────────────────────
+def test_write_roles_get_path_deny_rules(tmp_path, fake_defaults):
+    runner = agents.ClaudeRunner(Config(fake_defaults))
+    write = runner.build_argv(_call(tmp_path, "implementer", write=True))
+    assert write.count("--disallowedTools") == 1
+    rules = _arg(write, "--disallowedTools").split(",")
+    assert "Edit(rustflow.toml)" in rules and "Write(.rustflow/**)" in rules
+    assert "Edit(**/.cargo/config*)" in rules and "Write(clippy.toml)" in rules
+    read = runner.build_argv(_call(tmp_path))
+    assert read.count("--disallowedTools") == 1
+    assert not any("(" in r for r in _arg(read, "--disallowedTools").split(","))
+    tob = runner.build_argv(_call(tmp_path, "tob_audit", write=True, allowed_tools=["Agent", "Read"]))
+    assert "--disallowedTools" not in tob

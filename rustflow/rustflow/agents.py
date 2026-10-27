@@ -341,6 +341,10 @@ class ClaudeRunner(BaseRunner):
                 tools += readonly_shell_rules()
             argv += ["--permission-mode", p.get("permission_mode_write", "acceptEdits"),
                      "--allowedTools", ",".join(with_rtk_twins(tools, p.get("rtk_compat", True)))]
+            if call.allowed_tools is None:
+                # Defense in depth (gate integrity): the agent cannot edit gate config or .rustflow/**.
+                from rustflow import integrity
+                argv += ["--disallowedTools", ",".join(integrity.protected_edit_rules())]
         else:
             argv += ["--permission-mode", p.get("permission_mode_read", "dontAsk"),
                      "--allowedTools", ",".join(with_rtk_twins(list(p.get("allowed_tools_read", [])),
