@@ -104,7 +104,7 @@ class Doctor:
                 p = self.repo / base / skill / "SKILL.md"
                 if not p.is_file():
                     self.line("WARN", f"skill {base}/{skill}", "missing (rustflow init)")
-        for name in ("gates.py", "hooks.py"):
+        for name in ("gates.py", "hooks.py", "integrity.py"):
             inst = self.repo / ".rustflow" / name
             if not inst.is_file():
                 self.line("FAIL", f".rustflow/{name}", "missing - run `rustflow init`")
@@ -112,6 +112,7 @@ class Doctor:
                 self.line("WARN", f".rustflow/{name}", "differs from installed rustflow - rerun `rustflow init`")
             else:
                 self.line("OK", f".rustflow/{name}")
+        self.check_config_tracked()
         settings = self.repo / ".claude" / "settings.json"
         local = self.repo / ".claude" / "settings.local.json"
         found = False
@@ -135,6 +136,15 @@ class Doctor:
         if not (self.repo / "REVIEW.md").is_file():
             self.line("WARN", "REVIEW.md", "missing")
         return self.finish()
+
+    def check_config_tracked(self) -> None:
+        """Gate integrity reads the policy from the base commit; an untracked rustflow.toml means default [gates]."""
+        if not (self.repo / "rustflow.toml").is_file():
+            return
+        r = procutil.run(["git", "ls-files", "--error-unmatch", "rustflow.toml"], cwd=self.repo, timeout_s=30)
+        if r.returncode != 0:
+            self.line("WARN", "rustflow.toml", "not committed - gate-integrity bases use the default [gates] "
+                      "(commit rustflow.toml)")
 
     def check_user_settings(self) -> None:
         """User-level hooks (rtk, personal gates) and ~/.claude/CLAUDE.md also run inside rustflow agents."""

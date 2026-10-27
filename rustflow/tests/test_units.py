@@ -664,3 +664,32 @@ def test_report_gate_changes_row_survives_cr():
     text = report.render({"run_id": "r", "status": "gate_changes_pending", "gate_changes": [entry]}, Path("."))
     assert len([ln for ln in text.splitlines() if "G-config-a" in ln]) == 1
     assert "G-config-a" in next(ln for ln in text.splitlines() if "G-config-a" in ln) and "d" in text
+
+
+def test_integrity_extra_paths_default_is_empty():
+    from rustflow.config import load_defaults
+    assert load_defaults()["gates"]["integrity_extra_paths"] == []
+
+
+def _git(repo, *args):
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+def test_doctor_warns_when_rustflow_toml_is_not_committed(tmp_path):
+    from rustflow.doctor import Doctor
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "rustflow.toml").write_text("[gates]\n", encoding="utf-8")
+    lines: list[str] = []
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert any("[WARN]" in l and "rustflow.toml" in l for l in lines), lines
+    _git(tmp_path, "add", "rustflow.toml")
+    lines.clear()
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert lines == []
+
+
+def test_doctor_flags_missing_integrity_script(tmp_path):
+    from rustflow.doctor import Doctor
+    lines: list[str] = []
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).run()
+    assert any(("[FAIL]" in l or "[WARN]" in l) and "integrity.py" in l for l in lines), lines

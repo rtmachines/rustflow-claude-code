@@ -199,6 +199,7 @@ fmt_fix_scope = "changed"   # bramki bez --check i hook po edycji formatują: ch
 stop_max_blocks = 3         # hook Stop: ile razy z rzędu może zablokować koniec tury
 tree_stable = true          # pełne bramki: zmiana plików źródłowych W TRAKCIE bramek (build.rs/test piszący
                             # do drzewa) = czerwone; Cargo.lock może się zmienić tylko bez --locked
+integrity_extra_paths = []   # dodatkowe ścieżki (glob), których zmiana wymaga dowodu albo zgody recenzentów
 log_lines = 60
 
 semver = "auto"             # cargo semver-checks dla publikowalnych crate'ów lib (auto | always | off)
