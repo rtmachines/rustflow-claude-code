@@ -1,7 +1,7 @@
 """Extra skills that every agent of a role gets *for sure* - not left to the model's discretion.
 
 Model-invoked skills are loaded only when the model decides a description matches, so a stack skill or
-Apollo's rust-best-practices may silently never be read. rustflow therefore attaches them
+rust-skills may silently never be read. rustflow therefore attaches them
 deterministically:
 
 - Claude: `--append-system-prompt-file` (stable per role -> prompt-cache friendly, no command-line
@@ -9,7 +9,7 @@ deterministically:
 - Codex: inlined at the top of the prompt (stdin);
 - interactive `rustflow-reviewer` subagent: `skills:` preload in its frontmatter (installed by init).
 
-Only SKILL.md is attached; files it references (e.g. Apollo's references/chapter_*.md) stay on disk and
+Only SKILL.md is attached; files it references (e.g. rust-skills rules/*.md) stay on disk and
 the header tells the agent where they are.
 """
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 AUTO = "auto"
-APOLLO = "rust-best-practices"
+KNOWLEDGE_SKILLS = ("rust-skills", "rust-best-practices")
 ROLE_GROUP = {"planner": "planner", "implementer": "implementer", "fixer": "fixer",
               "reviewer_a": "reviewer", "reviewer_b": "reviewer", "auditor": "reviewer", "reviewer": "reviewer"}
 SKILL_BASE = {"claude": ".claude/skills", "codex": ".agents/skills"}
@@ -38,8 +38,7 @@ def auto_names(cwd: Path, provider: str) -> list[str]:
         return []
     names = sorted(p.name for p in base.iterdir()
                    if p.name.startswith("rustflow-stack-") and (p / "SKILL.md").is_file())
-    if (base / APOLLO / "SKILL.md").is_file():
-        names.append(APOLLO)
+    names.extend(name for name in KNOWLEDGE_SKILLS if (base / name / "SKILL.md").is_file())
     return names
 
 
@@ -70,8 +69,8 @@ def resolve(section: dict, role: str, cwd: Path, provider: str, *, strict: bool 
                 paths.append(path)
             elif strict:
                 raise SkillError(f"[skills] lists '{n}' for {ROLE_GROUP.get(role, role)}, but "
-                                 f"{path.relative_to(cwd).as_posix()} does not exist (rustflow init / --with-apollo / --stack)")
-    limit = int(section.get("max_kb", 32)) * 1024
+                                 f"{path.relative_to(cwd).as_posix()} does not exist (rustflow init / --stack)")
+    limit = int(section.get("max_kb", 64)) * 1024
     total = sum(p.stat().st_size for p in paths)
     if strict and total > limit:
         raise SkillError(f"extra skills for {role} are {total // 1024} KB > [skills].max_kb = {limit // 1024} KB "

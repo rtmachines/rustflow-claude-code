@@ -281,7 +281,7 @@ def test_installer_idempotent_and_preserves_user_settings(tmp_path):
     (tmp_path / ".claude" / "settings.json").write_text(json.dumps(user))
     (tmp_path / "CLAUDE.md").write_text("# My project\n\nRules here.\n")
     out: list[str] = []
-    inst = Installer(tmp_path, python_cmd="py -3", ci=False, out=out.append)
+    inst = Installer(tmp_path, with_rust_skills=False, python_cmd="py -3", ci=False, out=out.append)
     inst.run()
     inst.run()
     s = json.loads((tmp_path / ".claude" / "settings.json").read_text())
@@ -529,7 +529,7 @@ def test_tob_mode_requires_claude_spec():
 
 def test_installer_interactive_review_files(tmp_path):
     (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
-    Installer(tmp_path, python_cmd="py -3", ci=False, with_plugins=True, out=lambda *_: None).run()
+    Installer(tmp_path, with_rust_skills=False, python_cmd="py -3", ci=False, with_plugins=True, out=lambda *_: None).run()
     agent = (tmp_path / ".claude" / "agents" / "rustflow-reviewer.md").read_text()
     assert 'args: ["-3", "${CLAUDE_PROJECT_DIR}/.rustflow/hooks.py", "guard-bash", "--role", "reviewer"]' in agent
     assert "py -3 .rustflow/gates.py run --profile full --check" in agent and "{{" not in agent

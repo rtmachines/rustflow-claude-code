@@ -32,10 +32,15 @@ def _cfg(repo: Path, args: argparse.Namespace) -> Config:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    from rustflow.installer import Installer
-    Installer(_repo(args.repo), force=args.force, python_cmd=args.python_cmd, local_settings=args.local,
-              ci=not args.no_ci, with_apollo=args.with_apollo, with_plugins=args.with_plugins,
-              router=not args.no_router, stack=args.stack, with_mcp=args.with_mcp).run()
+    from rustflow.installer import Installer, InstallationError
+    try:
+        Installer(_repo(args.repo), force=args.force, python_cmd=args.python_cmd, local_settings=args.local,
+                  ci=not args.no_ci, with_rust_skills=not args.no_rust_skills,
+                  with_apollo=args.with_apollo, with_plugins=args.with_plugins,
+                  router=not args.no_router, stack=args.stack, with_mcp=args.with_mcp).run()
+    except InstallationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -280,6 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--python-cmd", help='interpreter for hooks, e.g. "py -3" or "python3"')
     p.add_argument("--local", action="store_true", help="register hooks in .claude/settings.local.json")
     p.add_argument("--no-ci", action="store_true", help="do not add the GitHub Actions workflow")
+    p.add_argument("--no-rust-skills", action="store_true",
+                   help="skip downloading the default rtmachines/rust-skills knowledge base (offline init)")
     p.add_argument("--with-apollo", action="store_true", help="also install Apollo rust-best-practices skill")
     p.add_argument("--with-plugins", action="store_true",
                    help="enable the Trail of Bits rust-review plugin (soundness audit for ESCALATE)")

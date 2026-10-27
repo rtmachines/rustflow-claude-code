@@ -21,7 +21,12 @@ TOB_MARKETPLACE = {"source": {"source": "github", "repo": "trailofbits/skills"}}
 SKILL_DIRS = (".claude/skills", ".agents/skills")
 BEGIN, END = "<!-- rustflow:begin", "<!-- rustflow:end -->"
 HOOK_MARK = ".rustflow/hooks.py"
+RUST_SKILLS_REPO = "https://github.com/rtmachines/rust-skills"
 APOLLO_REPO = "https://github.com/apollographql/skills"
+
+
+class InstallationError(RuntimeError):
+    """Required installation input could not be obtained."""
 
 
 def python_command(explicit: str | None = None) -> tuple[str, list[str]]:
@@ -41,13 +46,14 @@ class Installer:
     def __init__(self, repo: Path, *, force: bool = False, python_cmd: str | None = None,
                  local_settings: bool = False, ci: bool = True, with_apollo: bool = False,
                  with_plugins: bool = False, router: bool = True, stack: str | None = None,
-                 with_mcp: bool = False, out=print):
+                 with_mcp: bool = False, with_rust_skills: bool = True, out=print):
         self.repo = repo.resolve()
         self.force = force
         self.py, self.py_args = python_command(python_cmd)
         self.local_settings = local_settings
         self.ci = ci
         self.with_apollo = with_apollo
+        self.with_rust_skills = with_rust_skills
         self.with_plugins = with_plugins
         self.router = router
         if stack and stack not in STACKS:
@@ -122,6 +128,8 @@ class Installer:
             self.note("updated" if have else "created", ".rustflow/.gitignore")
         if gitutil.ensure_gitignore(self.repo, ["target/", ".rust-review-results/"]):
             self.note("updated", ".gitignore (target/, .rust-review-results/)")
+        if self.with_rust_skills:
+            self._rust_skills()
         if self.with_apollo:
             self._apollo()  # before the agent template, which preloads it when present
         for skill in SKILLS:
@@ -268,6 +276,33 @@ class Installer:
         existed = path.exists()
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         self.note("updated" if existed else "created", f".mcp.json (rustflow MCP server: {cmd} {' '.join(args)})")
+
+    def _rust_skills(self) -> None:
+        destinations = [self.repo / base / "rust-skills" for base in SKILL_DIRS]
+        if not self.force and all((dst / "SKILL.md").is_file() for dst in destinations):
+            for dst in destinations:
+                self.note("kept", str(dst.relative_to(self.repo)))
+            return
+        with tempfile.TemporaryDirectory(prefix="rustflow-skills-") as tmp:
+            src = Path(tmp) / "repo"
+            try:
+                result = subprocess.run(
+                    ["git", "clone", "--depth", "1", RUST_SKILLS_REPO, str(src)],
+                    capture_output=True, text=True, timeout=120,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise InstallationError(f"cannot install rust-skills: {exc}; use --no-rust-skills for offline init") from exc
+            if result.returncode != 0 or not (src / "SKILL.md").is_file() or not (src / "rules").is_dir():
+                raise InstallationError("cannot install rust-skills: "
+                                   + (result.stderr.strip()[:200] or "missing SKILL.md or rules/")
+                                   + "; use --no-rust-skills for offline init")
+            for dst in destinations:
+                if dst.exists() and not self.force:
+                    self.note("kept", str(dst.relative_to(self.repo)) + " (--force to overwrite)")
+                    continue
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
+                self.note("created", f"{dst.relative_to(self.repo)} (rtmachines/rust-skills, local copy)")
 
     def _apollo(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="rustflow-apollo-"))

@@ -97,21 +97,21 @@ def test_sqlx_revert_guard(monkeypatch, capsys, tmp_path, cmd, env, decision):
 def test_installer_stack_and_nextest(tmp_path):
     (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
     (tmp_path / ".config").mkdir()
-    Installer(tmp_path, python_cmd="python3", stack="axum-sqlx", out=lambda *_: None).run()
+    Installer(tmp_path, with_rust_skills=False, python_cmd="python3", stack="axum-sqlx", out=lambda *_: None).run()
     assert "slow-timeout" in (tmp_path / ".config" / "nextest.toml").read_text()
     for base in (".claude/skills", ".agents/skills"):
         assert (tmp_path / base / "rustflow-stack-axum-sqlx" / "SKILL.md").is_file()
     assert "rustflow-stack-axum-sqlx" in (tmp_path / "AGENTS.md").read_text()
     assert "postgres:17" in (tmp_path / ".github" / "workflows" / "rustflow-gates.yml").read_text()
     with pytest.raises(ValueError):
-        Installer(tmp_path, stack="django", out=lambda *_: None)
+        Installer(tmp_path, with_rust_skills=False, stack="django", out=lambda *_: None)
 
 
 def test_existing_nextest_config_is_kept(tmp_path):
     (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
     (tmp_path / ".config").mkdir()
     (tmp_path / ".config" / "nextest.toml").write_text("[profile.default]\nretries = 2\n")
-    Installer(tmp_path, python_cmd="python3", ci=False, out=lambda *_: None).run()
+    Installer(tmp_path, with_rust_skills=False, python_cmd="python3", ci=False, out=lambda *_: None).run()
     assert (tmp_path / ".config" / "nextest.toml").read_text() == "[profile.default]\nretries = 2\n"
 
 
@@ -184,7 +184,7 @@ def test_claude_gets_system_prompt_file_codex_gets_inline(tmp_path, monkeypatch)
 def test_installer_preloads_always_on_skills_in_reviewer_agent(tmp_path):
     (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
     _skill(tmp_path, ".claude/skills", "rust-best-practices")
-    Installer(tmp_path, python_cmd="python3", ci=False, stack="axum-sqlx", out=lambda *_: None).run()
+    Installer(tmp_path, with_rust_skills=False, python_cmd="python3", ci=False, stack="axum-sqlx", out=lambda *_: None).run()
     agent = (tmp_path / ".claude" / "agents" / "rustflow-reviewer.md").read_text()
     head = agent.split("hooks:")[0]
     assert "  - rustflow-review\n  - rustflow-stack-axum-sqlx\n  - rust-best-practices\n" in head

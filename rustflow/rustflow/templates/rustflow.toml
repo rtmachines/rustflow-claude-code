@@ -159,7 +159,7 @@ extra_args = []
 
 # ── Skille dołączane NA PEWNO (nie "jeśli model zechce") ─────────────────────
 # Oprócz skilla roli (rustflow-implement/-review/-fix/-plan). "auto" = wszystkie zainstalowane
-# rustflow-stack-* oraz rust-best-practices (Apollo). Claude: --append-system-prompt-file,
+# rustflow-stack-*, rust-skills i opcjonalny rust-best-practices (Apollo). Claude: --append-system-prompt-file,
 # Codex: początek promptu, interaktywny rustflow-reviewer: preload `skills:` (rustflow init).
 # Brakujący jawnie wymieniony skill = błąd na starcie runu.
 [skills]
@@ -168,7 +168,7 @@ planner = []
 implementer = []
 reviewer = []               # reviewer_a, reviewer_b, auditor, interaktywny rustflow-reviewer
 fixer = []
-max_kb = 32                 # limit łącznego rozmiaru na rolę (trafia do każdego wywołania)
+max_kb = 64                 # limit łącznego rozmiaru na rolę (trafia do każdego wywołania)
 
 # ── Recenzja: dodatkowe sygnały dla recenzentów ──────────────────────────────
 [review]

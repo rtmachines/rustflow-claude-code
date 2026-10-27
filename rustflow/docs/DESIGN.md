@@ -158,7 +158,7 @@ Interaktywne `/rust-pr-review` i eskalacja do Trail of Bits działają jak wcze�
 
 | Kit | rustflow | Co się zmieniło |
 |---|---|---|
-| `/rust-pr-review` + `rust-reviewer` | `/rustflow-pr-review` + `rustflow-reviewer` | bramki przez `gates.py --check` (deterministyczne, te same co CI, zero zmian w drzewie) zamiast 4 ręcznych komend; preload `rustflow-review` (+ Apollo, jeśli zainstalowany) |
+| `/rust-pr-review` + `rust-reviewer` | `/rustflow-pr-review` + `rustflow-reviewer` | bramki przez `gates.py --check` (deterministyczne, te same co CI, zero zmian w drzewie) zamiast 4 ręcznych komend; preload `rustflow-review` (+ rust-skills; także Apollo, jeśli zainstalowany) |
 | `context.sh` (bash) | `hooks.py review-context` | Python (Windows), diff obejmuje też nieśledzone pliki, informacja o zielonych bramkach z cache, jawny komunikat gdy bazy nie ma |
 | `check-review-report.sh` | `hooks.py check-report` | ten sam kontrakt + linie doctests/semver; testy jednostkowe |
 | `review-router.sh` | `hooks.py route-review` | pomija agentów orkiestratora, bez fałszywych trafień na samo słowo "pr" |
@@ -219,7 +219,7 @@ Zweryfikowane na żywo (Claude Code 2.1.310, haiku jako dyspozytor i recenzenci)
 ## 12. Skille zawsze aktywne
 
 Skill wywoływany przez model ładuje się tylko wtedy, gdy model uzna, że opis pasuje do zadania, więc skill
-stacku czy Apollo może nie zostać przeczytany wcale. `[skills]` (domyślnie `all = ["auto"]`) dołącza je
+stacku czy rust-skills może nie zostać przeczytany wcale. `[skills]` (domyślnie `all = ["auto"]`) dołącza je
 deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (plik stały dla roli, więc
 zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
 Brak jawnie wymienionego skilla to błąd w preflight, a `max_kb` chroni kontekst. Zweryfikowane na żywo:

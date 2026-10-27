@@ -58,7 +58,7 @@ def rust_repo(tmp_path, shared_target, monkeypatch, fake_bin):
     git(repo, "config", "user.name", "Test")
     (repo / ".gitignore").write_text("target/\n", encoding="utf-8")
     from rustflow.installer import Installer
-    Installer(repo, ci=False, out=lambda *_: None, python_cmd=sys.executable).run()
+    Installer(repo, with_rust_skills=False, ci=False, out=lambda *_: None, python_cmd=sys.executable).run()
     cfg = (repo / "rustflow.toml").read_text(encoding="utf-8")
     # TOML literal strings + forward slashes: valid on Windows and Linux
     cfg = cfg.replace('bin = "claude"', f"bin = '{(fake_bin / 'claude.py').as_posix()}'")

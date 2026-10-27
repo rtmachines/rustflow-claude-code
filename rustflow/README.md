@@ -24,7 +24,13 @@ git add -A && git commit -m "rustflow"
 
 Wymagane: Python 3.11+ dla CLI (hooki i `gates.py` działają już od 3.9; `doctor` sprawdza interpreter hooków), `git`, `cargo` + `rustfmt` + `clippy`, `claude` (Claude Code ≥ 2.1.259) i/lub `codex`
 (≥ 0.16x), zalogowane. Zalecane: `rust-analyzer`, `cargo-nextest`, `cargo-deny`.
-`rustflow init --with-apollo` dokłada skill Apollo `rust-best-practices` (kopia przypięta w repo).
+`rustflow init` domyślnie pobiera [rtmachines/rust-skills](https://github.com/rtmachines/rust-skills)
+(lokalną kopię repozytorium bez `.git`) do `.claude/skills/rust-skills` i `.agents/skills/rust-skills`.
+Wymaga dostępu do GitHub; błąd pobrania zatrzymuje instalację. `--no-rust-skills` pomija pobieranie
+(np. offline). Ponowne `init` zachowuje lokalną kopię; `--force` pobiera ją ponownie i nadpisuje.
+W istniejącym projekcie uruchom ponownie `rustflow init`, aby dodać nową bazę wiedzy. Jeśli stary `rustflow.toml` ma `[skills].max_kb = 32`,
+podnieś ten limit do `64` (sam indeks nowej bazy zajmuje około 39 KB).
+`--with-apollo` nadal opcjonalnie dokłada Apollo `rust-best-practices`.
 
 ## Użycie
 
@@ -210,19 +216,18 @@ Claude Code rozwija wtedy SKILL.md), Codex dostaje `$rustflow-review`, a do tego
 | review ×2, audytor | `rustflow-review` |
 
 Dodatkowo **zawsze aktywne** skille z `[skills]` w `rustflow.toml` (domyślnie `all = ["auto"]`: każdy
-zainstalowany `rustflow-stack-*` oraz Apollo `rust-best-practices`) trafiają do każdego agenta danej roli
+zainstalowany `rustflow-stack-*`, `rust-skills` oraz opcjonalny Apollo `rust-best-practices`) trafiają do każdego agenta danej roli
 deterministycznie, a nie wtedy, gdy model uzna, że opis pasuje:
 Claude przez `--append-system-prompt-file` (stały plik na rolę, więc trafia do prompt cache, bez limitu
 długości linii poleceń na Windows), Codex na początku promptu, interaktywny `rustflow-reviewer` przez preload
-`skills:` (ustawiany przy `rustflow init`). Dołączany jest SKILL.md; pliki, do których odsyła (np. rozdziały
-Apollo), agent czyta na żądanie. Jawnie wymieniony, a nieobecny skill zatrzymuje run na starcie; `doctor`
+`skills:` (ustawiany przy `rustflow init`). Dołączany jest SKILL.md; pliki, do których odsyła (np. `rules/*.md` w `rust-skills`), agent czyta na żądanie. Jawnie wymieniony, a nieobecny skill zatrzymuje run na starcie; `doctor`
 pokazuje listę dla każdej roli.
 
 ```toml
 [skills]
 all = ["auto"]
-reviewer = ["rust-best-practices"]   # przykład: Apollo dla recenzentów nawet bez "auto"
-max_kb = 32
+reviewer = ["rust-skills"]   # baza wiedzy dla recenzentów nawet bez "auto"
+max_kb = 64
 ```
 
 ## Zapadka lintów
