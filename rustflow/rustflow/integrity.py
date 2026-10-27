@@ -8,8 +8,10 @@ Fail-closed: any git or parse error becomes an `unknown` change, which blocks.
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import hashlib
+import itertools
 import os
 import re
 import shutil
@@ -277,82 +279,123 @@ class ProofResult:
     error: str = ""
 
 
+_RAW_RE = re.compile(r'(?:br|cr|r)(#*)"')    # raw (byte / C) string: no escapes, closed by `"` + the same #s
+_STR_RE = re.compile(r'[bc]?"')                # (byte / C) string with escapes
+_CHAR_RE = re.compile(r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]*\}|[^\n])|[^\\'\n\r])'")  # else a lifetime
+CODE_TOKENS = "{};"  # never inside a silencing attribute (allow / expect / ignore / cfg_attr) outside literals
+
+
+def _is_ident_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
 def _skip_literal(text: str, i: int) -> int:
-    """Index just past a string / char literal / line comment starting at `i`; `i` itself when none starts there."""
+    """Index just past the string / char literal or comment starting at `i`; `i` itself when none starts there
+    (a lifetime such as `'a` is no literal). Rust lexing: raw strings `r#"…"#` (any number of `#`, no escapes),
+    byte / C strings `b"…"` `c"…"`, raw byte / C strings `br#"…"#` `cr#"…"#`, byte chars `b'…'`, char literals
+    (`'a'`, `'\\n'`, `'\\u{..}'`) vs lifetimes, `//` comments (up to the newline) and nested `/* … */` comments.
+    An unterminated literal or comment runs to the end of `text`."""
+    n = len(text)
     c = text[i]
-    if c == '"':
-        j = i + 1
-        while j < len(text) and text[j] != '"':
-            j += 2 if text[j] == "\\" else 1
-        return j + 1
-    if c == "'":  # char literal, not a lifetime: 'x' or '\n'
-        m = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^\\'])'").match(text, i)
-        return m.end() if m else i
-    if text.startswith("//", i):
+    if c == "/" and text.startswith("//", i):
         j = text.find("\n", i)
-        return len(text) if j < 0 else j
-    return i
+        return n if j < 0 else j
+    if c == "/" and text.startswith("/*", i):
+        depth, j = 1, i + 2
+        while j < n and depth:
+            if text.startswith("/*", j):
+                depth, j = depth + 1, j + 2
+            elif text.startswith("*/", j):
+                depth, j = depth - 1, j + 2
+            else:
+                j += 1
+        return j if not depth else n
+    if c in "brc" and i > 0 and _is_ident_char(text[i - 1]):
+        return i  # inside an identifier (`bar"x"`, `for'a'`): a prefix letter only starts a token
+    m = _RAW_RE.match(text, i)
+    if m:
+        j = text.find('"' + m.group(1), m.end())
+        return n if j < 0 else j + 1 + len(m.group(1))
+    m = _STR_RE.match(text, i)
+    if m:
+        j = m.end()
+        while j < n and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return min(j + 1, n)
+    m = _CHAR_RE.match(text, i) if c in "b'" else None
+    return m.end() if m else i
 
 
-def _attr_end(text: str, i: int) -> int:
-    """`i` is at `#`; index just past the matching `]` of `#[...]` / `#![...]`, or -1 when it is no attribute."""
+def _attr_end(text: str, i: int) -> tuple[int, str]:
+    """`i` is at `#`; index just past the matching `]` of `#[...]` / `#![...]` (-1 when it is no attribute) and,
+    when the span holds code-like tokens, why: `{`, `}` or `;` outside literals and comments, or a literal / comment
+    that crosses a line break and holds one of them (what a lexer miss swallowing code would look like)."""
     j = i + 1
     if text.startswith("!", j):
         j += 1
     if not text.startswith("[", j):
-        return -1
-    depth = 0
+        return -1, ""
+    depth, bad = 0, ""
     while j < len(text):
         k = _skip_literal(text, j)
         if k != j:
+            chunk = text[j:k]
+            if not bad and "\n" in chunk and any(t in chunk for t in CODE_TOKENS):
+                bad = f"a literal or comment crossing a line break holds code tokens: {chunk[:60]!r}"
             j = k
             continue
-        if text[j] == "[":
+        ch = text[j]
+        if ch == "[":
             depth += 1
-        elif text[j] == "]":
+        elif ch == "]":
             depth -= 1
             if depth == 0:
-                return j + 1
+                return j + 1, bad
+        elif ch in CODE_TOKENS and not bad:
+            bad = f"`{ch}` outside literals and comments"
         j += 1
-    return -1
+    return -1, ""
 
 
 def _strip(text: str, added: list[int], allowed: set[int] | None = None) -> tuple[str, list[int]]:
-    """Cut the silencing attributes (`#[...]` / `#![...]`, bracket-counted, literals skipped) that stand on the
-    `added` lines (1-based line numbers in `text`, git numbering). A line left empty disappears. Also returns the
-    added line numbers that still carry a silencing attribute afterwards (a tokenizer miss) and, when `allowed`
-    (every added line) is given, the lines outside it that were cut (a span running into pre-existing code)."""
+    """Cut the silencing attributes (`#[...]` / `#![...]`, bracket-counted, Rust-lexed) that start on the `added`
+    lines (1-based line numbers in `text`, git numbering). The whole file is lexed, so a line inside a multi-line
+    literal or comment holds no attribute. A line left empty disappears. Raises RuntimeError when a silencing
+    attribute's span holds code tokens (it would swallow code). Also returns the added line numbers that still
+    carry a silencing attribute afterwards (a tokenizer miss) and, when `allowed` (every added line) is given, the
+    lines outside it that were cut (a span running into pre-existing code)."""
     wanted = set(added)
+    lines = _lines(text, True)
+    ends = list(itertools.accumulate(len(ln) for ln in lines))
     gone = bytearray(len(text))
-    pos = 0
-    for n, line in enumerate(_lines(text, True)):
-        start, end = pos, pos + len(line)
-        pos = end
-        if n + 1 not in wanted:
+    i, n = 0, len(text)
+    while i < n:
+        k = _skip_literal(text, i)
+        if k != i:
+            i = k
             continue
-        i = start
-        while i < end:
-            k = _skip_literal(text, i)
-            if k != i:
-                i = k
-                continue
-            if text[i] == "#" and (e := _attr_end(text, i)) > 0:
+        if text[i] == "#" and bisect.bisect_right(ends, i) + 1 in wanted:
+            e, bad = _attr_end(text, i)
+            if e > 0:
                 if SILENCE_RE.search(text[i:e]):
-                    while e < len(text) and text[e] in " \t":
+                    if bad:
+                        line = bisect.bisect_right(ends, i) + 1
+                        raise RuntimeError(f"the silencing attribute on line {line} would swallow code ({bad})")
+                    while e < n and text[e] in " \t":
                         e += 1
                     for x in range(i, e):
                         gone[x] = 1
-                i = max(e, i + 1)
+                i = e
                 continue
-            i += 1
+        i += 1
     out, left, pos = [], [], 0
-    for n, line in enumerate(_lines(text, True)):
+    for no, line in enumerate(lines, 1):
         kept = "".join(ch for x, ch in enumerate(line, pos) if not gone[x])
         pos += len(line)
-        if n + 1 in wanted and SILENCE_RE.search(kept.strip()):
-            left.append(n + 1)
-        if allowed is not None and kept != line and n + 1 not in allowed:
-            left.append(n + 1)
+        if no in wanted and SILENCE_RE.search(kept.strip()):
+            left.append(no)
+        if allowed is not None and kept != line and no not in allowed:
+            left.append(no)
         if kept != line and not kept.strip():
             continue  # the line held only removed attributes (possibly continued from an earlier line)
         out.append(kept)

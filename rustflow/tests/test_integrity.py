@@ -388,12 +388,13 @@ def test_prove_only_added_ignore_is_stripped(rust_repo):
     '/* " */ #[allow(clippy::needless_return)] pub fn a() -> i32 {\n    return 1;\n}\n',
     'pub const P: &str = r"C:\\"; #[allow(clippy::needless_return)] pub fn a() -> i32 {\n    return 1;\n}\n',
 ])
-def test_prove_unstrippable_attribute_fails(rust_repo, src):
+def test_prove_attribute_after_tricky_literal_is_stripped(rust_repo, src):
+    # round 1-3 failed these closed ("could not strip"); the Rust lexer now strips them, so clippy sees the lint
     write(rust_repo, "src/lib.rs", LIB_OK)
     commit(rust_repo)
     write(rust_repo, "src/lib.rs", src)
     r = proof(rust_repo)
-    assert r.status == "failed" and "strip" in r.error, r
+    assert r.status == "failed" and not r.error and "clippy=FAIL" in r.summary, r
 
 
 def test_prove_unlocatable_silence_fails(rust_repo):
@@ -483,7 +484,7 @@ def test_prove_raw_string_overstrip_fails(rust_repo):
     write(rust_repo, "src/lib.rs",
           '#[allow(clippy::needless_return, reason = r"\\")]\npub fn a() -> i32 {\n    return 1;\n}\n// "]\npub fn b() {}\n')
     r = proof(rust_repo)
-    assert r.status == "failed" and "strip" in r.error, r
+    assert r.status == "failed" and not r.error and "clippy=FAIL" in r.summary, r
 
 
 def test_prove_multiline_added_attribute_is_stripped(rust_repo):
@@ -493,5 +494,120 @@ def test_prove_multiline_added_attribute_is_stripped(rust_repo):
     r = proof(rust_repo)
     assert r.status == "failed" and not r.error and "clippy=FAIL" in r.summary, r
     write(rust_repo, "src/lib.rs", "#[allow(\n    dead_code,\n)]\n" + LIB_OK)
+    r = proof(rust_repo)
+    assert r.status == "passed", r
+
+
+# ── fix round 4: Rust lexing of attribute spans ──────────────────────────────
+@pytest.mark.parametrize("src, start, end", [
+    ('r"\\"; x', 0, 4),                       # raw string: no escapes
+    ('r#"x"]"#)]', 0, 8),                     # raw string with hashes, `"` and `]` inside
+    ('br##"a"#b"##;', 0, 12),                 # raw byte string, fewer hashes inside
+    ('cr#"a"#;', 0, 7),                       # raw C string
+    ('br"\\";', 0, 5),                        # raw byte string: no escapes
+    ('b"\\"";', 0, 5),                        # byte string with an escaped quote
+    ("b'\\'';", 0, 5),                        # byte char with an escaped quote
+    ("'a';", 0, 3),
+    ("'\\n';", 0, 4),
+    ("'\\u{1F600}';", 0, 11),
+    ("'\"';", 0, 3),                          # char literal holding a quote
+    ("'a, 'b>", 0, 0),                        # lifetime, not a literal
+    ("'static str", 0, 0),
+    ("/* a /* b */ \" */x", 0, 17),           # nested block comment
+    ("/**/x", 0, 4),
+    ("// c \"\nx", 0, 6),
+    ('xr"a"', 1, 1),                          # `r` inside an identifier is no prefix
+    ('r#"abc', 0, 6),                         # unterminated: runs to the end
+    ("/* /* */", 0, 8),                       # unterminated nested comment
+    ("r#raw", 0, 0),                          # raw identifier
+])
+def test_skip_literal_lexes_rust(src, start, end):
+    assert integrity._skip_literal(src, start) == end
+
+
+@pytest.mark.parametrize("attr", [
+    '#[allow(x, reason = r"\\")]',
+    '#[allow(x, reason = br"\\")]',
+    '#[allow(x, reason = r#"x"]"#)]',
+    '#[allow(x /* " ] */)]',
+    '#[allow(x /* /* */ " ] */)]',
+    "#[allow(x, reason = ']')]",
+])
+def test_strip_attributes_tricky_literals(attr):
+    src = "pub fn a() {}\n" + attr + '\npub fn c() -> i32 {\n    return 1;\n}\n// "]\n'
+    assert strip_attributes(src, [2]) == 'pub fn a() {}\npub fn c() -> i32 {\n    return 1;\n}\n// "]\n'
+
+
+def test_strip_attributes_lifetimes_next_to_attribute():
+    src = "pub struct W<'a>(#[allow(dead_code)] &'a u8, char);\nconst Q: char = ']';\n"
+    assert strip_attributes(src, [1]) == "pub struct W<'a>(&'a u8, char);\nconst Q: char = ']';\n"
+
+
+def test_strip_attributes_continues_literals_across_lines():
+    # line 2 lies inside a raw string opened on line 1: nothing there is an attribute
+    src = 'const S: &str = r#"\n#[allow(x)] "]\n"#;\n#[allow(y)]\nfn f() {}\n'
+    out, left = integrity._strip(src, [2, 4])
+    assert out == 'const S: &str = r#"\n#[allow(x)] "]\n"#;\nfn f() {}\n' and left == [2]
+
+
+def test_strip_rejects_span_with_code_tokens():
+    for attr in ("#[allow(dead_code, reason = {})]", "#[allow(dead_code); ]", "#[allow(dead_code)} ]"):
+        with pytest.raises(RuntimeError, match="swallow"):
+            strip_attributes(attr + "\npub fn a() {}\n", [1])
+
+
+def test_strip_reports_cut_outside_allowed_lines():
+    src = "#[allow(\n    dead_code,\n)]\npub fn a() {}\n"
+    assert integrity._strip(src, [1], {1})[1] == [2, 3]
+
+
+def _naive_skip_literal(text, i):  # the pre-round-4 lexer: no raw strings, no block comments
+    c = text[i]
+    if c == '"':
+        j = i + 1
+        while j < len(text) and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return j + 1
+    if text.startswith("//", i):
+        j = text.find("\n", i)
+        return len(text) if j < 0 else j
+    return i
+
+
+EXPLOIT_TAIL = '\npub fn c() -> i32 {\n    return 1;\n}\n// "]\n'
+
+
+def test_prove_span_check_catches_lexer_miss(rust_repo, monkeypatch):
+    write(rust_repo, "src/lib.rs", LIB_OK)
+    commit(rust_repo)
+    write(rust_repo, "src/lib.rs", LIB_OK + '#[allow(clippy::needless_return, reason = r"\\")]' + EXPLOIT_TAIL)
+    monkeypatch.setattr(integrity, "_skip_literal", _naive_skip_literal)
+    r = proof(rust_repo)
+    assert r.status == "failed" and "swallow" in r.error, r
+
+
+@pytest.mark.parametrize("attr", [
+    '#[allow(clippy::needless_return, reason = r"\\")]',
+    '#[allow(clippy::needless_return, reason = br"\\")]',
+    '#[allow(clippy::needless_return, reason = r#"x"]"#)]',
+    '#[allow(clippy::needless_return /* " ] */)]',
+    '#[allow(clippy::needless_return /* /* */ " ] */)]',
+])
+def test_prove_all_added_tricky_attribute_fails(rust_repo, attr):
+    write(rust_repo, "src/lib.rs", LIB_OK)
+    commit(rust_repo)
+    write(rust_repo, "src/lib.rs", LIB_OK + attr + EXPLOIT_TAIL)
+    r = proof(rust_repo)
+    assert r.status == "failed" and not r.error and "clippy=FAIL" in r.summary, r
+
+
+def test_prove_lifetime_next_to_attribute(rust_repo):
+    write(rust_repo, "src/lib.rs", LIB_OK)
+    commit(rust_repo)
+    masked = "#[allow(clippy::needless_lifetimes)]\npub fn f<'a>(x: &'a u8) -> &'a u8 {\n    x\n}\n"
+    write(rust_repo, "src/lib.rs", LIB_OK + masked)
+    r = proof(rust_repo)
+    assert r.status == "failed" and not r.error and "clippy=FAIL" in r.summary, r
+    write(rust_repo, "src/lib.rs", LIB_OK + "pub struct W<'a>(#[allow(dead_code)] pub &'a u8);\n")
     r = proof(rust_repo)
     assert r.status == "passed", r
