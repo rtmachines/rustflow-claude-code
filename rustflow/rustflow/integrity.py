@@ -76,8 +76,15 @@ def _unknown(path: str, detail: str) -> GateChange:
 
 
 def protected_edit_rules() -> list[str]:
-    """`--disallowedTools` rules denying Edit/Write on the fixed gate config paths and `.rustflow/**`."""
-    paths = [p for p in CONFIG_PATTERNS if not p.startswith(".cargo/config")]
+    """`--disallowedTools` rules denying Edit/Write on the fixed gate config paths and `.rustflow/**`.
+
+    Each fixed path gets a root-anchored form and a `**/<path>` form (rules with a slash are anchored to
+    the cwd, so workspace subdirectories need the second one); `.rustflow/**` is root-anchored only.
+    """
+    paths = []
+    for p in CONFIG_PATTERNS:
+        if not p.startswith(".cargo/config"):
+            paths += [p, f"**/{p}"]
     paths += [CARGO_CONFIG_RULE, RUSTFLOW_DIR_RULE]
     return [f"{tool}({p})" for p in paths for tool in ("Edit", "Write")]
 

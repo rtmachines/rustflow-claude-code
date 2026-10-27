@@ -313,3 +313,11 @@ def test_write_roles_get_path_deny_rules(tmp_path, fake_defaults):
     assert not any("(" in r for r in _arg(read, "--disallowedTools").split(","))
     tob = runner.build_argv(_call(tmp_path, "tob_audit", write=True, allowed_tools=["Agent", "Read"]))
     assert "--disallowedTools" not in tob
+
+
+def test_protected_edit_rules_exact_list():
+    from rustflow import integrity
+    names = ["rustflow.toml", ".config/nextest.toml", "clippy.toml", ".clippy.toml", "rustfmt.toml",
+             ".rustfmt.toml", "rust-toolchain", "rust-toolchain.toml", "deny.toml"]
+    paths = [q for n in names for q in (n, f"**/{n}")] + ["**/.cargo/config*", ".rustflow/**"]
+    assert integrity.protected_edit_rules() == [f"{t}({p})" for p in paths for t in ("Edit", "Write")]
