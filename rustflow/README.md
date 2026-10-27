@@ -47,7 +47,48 @@ rustflow init --stack axum-sqlx                           # skill stacku Axum/SQ
 
 Wynik runu: `.rustflow/runs/<id>/report.md` (status, routing, koszty, findingi z każdej rundy,
 sporne punkty do decyzji, ESCALATE, komendy merge), plus `state.json`, prompty, argv i surowe
-wyjścia każdego agenta w `agents/`, wyniki bramek w `gates/`.
+wyjścia każdego agenta w `agents/`, wyniki bramek w `gates/` oraz rejestr prób w `attempts/`.
+
+### Koszty i próby agentów
+
+Jedno wywołanie logiczne (np. recenzja) pozostaje jednym wpisem `agents` w stanie runu.
+Każde uruchomienie CLI providera ma osobny rekord `attempts/<id>.json`: `initial`, `retry`
+lub `json_repair`. Rekord powstaje atomowo przed wywołaniem i otrzymuje wynik po zakończeniu;
+zawiera identyfikator wywołania logicznego, rolę, żądany model, czas, surowe usage,
+znormalizowane tokeny, pomiar kosztu, osobną estymację i ścieżki artefaktów.
+Wpis `agents` odsyła do tych rekordów przez `attempt_ids`. Wynik merytoryczny pochodzi
+z ostatniej próby; czas, koszty i tokeny obejmują wszystkie próby, także nieudane.
+
+`cost_usd` zachowuje dotychczasowe znaczenie kwoty księgowanej do budżetu Claude:
+znane koszty **wszystkich** prób Claude plus limit roli zastosowany po timeout.
+To nie zawsze całkowity zmierzony koszt. Codex obecnie raportuje tokeny bez pomiaru USD.
+Budżet nadal jest sprawdzany przed wywołaniem logicznym; retry i naprawa JSON nie otrzymują
+nowego limitu ani rezerwacji budżetu.
+
+`usage_summary` (wersja `schema_version = 1`) w stanie, JSON CLI i MCP podaje liczbę prób,
+kompletność pomiarów i agregaty per provider. `cost_usd.known` jest znaną częścią pomiarów,
+`cost_usd.total` jest `null`, jeżeli brakuje choć jednego kosztu albo kompletność historii
+jest nieznana; `missing_attempts` liczy brakujące pomiary w zarejestrowanych próbach.
+`estimated_cost_usd` obejmuje wyłącznie estymacje timeoutów. Zestawienia tokenów stosują
+te same pola `known`, `total`, `missing_attempts`. Pomiary `complete` mają koszt i wszystkie
+liczniki danego providera; `partial` mają część danych, a `unknown` nie mają pomiaru.
+Jawne zero jest pomiarem; brak, błędny typ, liczba ujemna, NaN i nieskończoność nim nie są.
+Cache Codex mieści się w `input_tokens`; Claude ma oddzielne liczniki wejścia z cache,
+które wchodzą do sumy tokenów. Brak licznika cache Claude oznacza niepełną sumę tokenów.
+Dotychczasowe `tokens` pozostają dostępne; do porównań providerów używaj `usage_summary`.
+
+Pełny raport pokazuje poszczególne próby, pomiary i estymacje. Brief oraz MCP status/JSON
+pokazują agregaty. Przy resume zakończone próby zachowują swoje identyfikatory i artefakty;
+niezakończone próby poprzedniego procesu stają się `interrupted` z nieznanym pomiarem.
+Sam rejestr nie odtwarza wywołań; o dalszej pracy decyduje istniejący mechanizm resume.
+Stare runy można czytać bez migracji; przy wznowieniu ich kwoty i tokeny są zachowane
+w `usage_baseline`, a kompletność historii pozostaje nieznana. Dry-run nie tworzy prób providera.
+W `agents/` dotychczasowe nazwy plików nadal pokazują ostatni wynik; rejestr wskazuje
+unikalne pliki z identyfikatorem próby, których kolejne wywołanie nie nadpisuje.
+
+Estymator `triage` dla nowych runów używa tylko kompletnych **pomiarów kosztu Claude**,
+uwzględnia też jawne zero. Pomija nieznane koszty i estymacje timeoutów. Starsza historia
+pozostaje dostępna z oznaczeniem nieznanej kompletności danych.
 
 Statusy: `approved`, `approved_with_advisories`, `max_rounds`, `stalled`, `gates_red`,
 `final_gates_red`, `criteria_unmet`, `baseline_red`, `changes_requested` (review bez `--fix`), `budget`,
@@ -261,14 +302,70 @@ Szczegóły i pomiary: [docs/DESIGN.md](docs/DESIGN.md#7-optymalizatory-wyjścia
 ## Testy
 
 ```bash
-pip install -e ".[test]" && pytest      # 157 testów: jednostkowe, hooki jako procesy, e2e na prawdziwym cargo
+cd rustflow
+pip install -e ".[dev]"
+pytest
+ruff check .
 ```
 
-E2E używają atrap `claude`/`codex` (`tests/fake_agents/`), ale prawdziwego `git` i `cargo`.
+Wszystkie testy używają atrap `claude`/`codex` (`tests/fake_agents/`) lub kontrolowanych
+odpowiedzi procesów. E2E uruchamiają prawdziwy `git` i `cargo`, bez płatnych sesji agentów.
+Workflow w głównym [`.github/workflows/test.yml`](../.github/workflows/test.yml) testuje
+Ubuntu/Windows × Python 3.11/3.13. Buduje wheel, instaluje go razem z pytest i uruchamia
+cały zestaw z katalogu tymczasowego bez odziedziczonego `PYTHONPATH`, w tym detached,
+start/wait/cancel/resume i MCP. Sprawdza CLI, zasoby szablonów i obecność narzędzi Rust.
+Ruff blokuje tylko `E9,F63,F7,F82`; jest zależnością deweloperską. Lokalny raport reviewdog
+można otrzymać z katalogu głównego repozytorium:
+
+```bash
+set -o pipefail
+rtk bypass ruff check rustflow --output-format=rdjson | reviewdog -f=rdjson -reporter=local -filter-mode=nofilter -fail-level=warning
+```
+
 Dodatkowo zweryfikowane na żywo z Claude Code 2.1.310 (haiku): dwa pełne `run` (implement → hooki → review → approve),
 `review` (raport) i `review --fix` (4 blokujące → fix z resolutions per ID → re-review przyrostowa → approve).
 Kod przeszedł też niezależny przegląd (19 uwag, m.in. Windows: kodowanie stdin hooków, ubijanie drzew procesów,
 Ctrl+C przy równoległych recenzentach) - wszystkie naniesione i pokryte testami regresyjnymi.
 Codex 0.164: argv zaakceptowany (`thread.started`), wywołanie modelu niezweryfikowane (brak sieci do OpenAI
-w środowisku testowym). Windows: zaprojektowane i obsłużone w kodzie, ale nie uruchomione - workflow CI
-`.github/workflows/test.yml` odpala testy na `windows-latest`.
+w środowisku testowym). Aktualny wynik sprawdzenia obu systemów jest dostępny w GitHub Actions.
+
+### Execution limits and resume
+
+Rustflow captures at most `process.max_output_bytes` raw bytes of combined stdout
+and stderr from each process (default **16 MiB**). The first excess byte stops the
+process tree. Logs retain the captured prefix and explicit completeness, byte
+counts and termination reason. Exactly the configured number of bytes is allowed.
+A truncated response, even if it contains valid JSON or passing test names, cannot
+approve a run, satisfy acceptance criteria, enter the gate cache or be accepted as
+a baseline failure. The run stops in its current phase for resume; it does not
+send an output-limit failure to the fixer or approve a degraded review.
+
+`budget.max_agent_calls` defaults to **40 physical provider attempts**, including
+retries and JSON repairs. Each durable `started` attempt consumes one slot even
+if the process crashes. Preparing an invalid command consumes none. Parallel
+reviewers reserve their initial slots together; if the whole group cannot fit,
+none starts. Retries cannot use another reviewer's reserved slot.
+
+`budget.max_active_seconds` defaults to **7200 seconds** of active wall time for
+the whole run, including gates, preparation and retry waits. Parallel reviewers
+share that clock. Local role timeouts still apply. Active time is saved at phase
+transitions, session exit and every second. After an unclean exit, resume adds
+one second conservatively to the last saved time; the offline interval is excluded.
+Cleanup and diagnostic writes may exceed the deadline by a bounded grace period;
+this is not a hard real-time guarantee for arbitrary operating-system operations.
+
+Limits must be positive. They are saved when the run starts, and changing the
+configuration does not reset or replace them on resume. Raise them explicitly:
+
+```console
+rustflow resume latest --max-agent-calls 80 --max-active-seconds 14400 --max-output-bytes 33554432
+```
+
+The same options are available for `run`/`review`, detached execution and MCP
+start/resume tools. Resume rejects decreases and records increases as events.
+The attempt ledger, CLI/MCP summary and report show usage, remaining allowances,
+termination reasons and log completeness. For runs migrated from older versions,
+usage before migration is explicitly unknown. Financial budgets remain separate.
+Resume also accepts an unchanged `Cargo.lock` generated by interrupted baseline
+gates; subsequent user edits still trigger the usual dirty-tree protection.
+Run `rustflow init` again to update copied standalone gates and `process.py`.

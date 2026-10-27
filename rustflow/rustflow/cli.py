@@ -84,6 +84,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
 def _options(args: argparse.Namespace, mode: str):
     from rustflow.orchestrator import Options
     return Options(mode=mode, difficulty=args.difficulty, base=args.base,
+                   **{k: getattr(args, k, None) for k in ("max_agent_calls", "max_active_seconds", "max_output_bytes")},
                    isolation=getattr(args, "isolation", None), allow_dirty=getattr(args, "allow_dirty", False),
                    accept_red_baseline=getattr(args, "accept_red_baseline", False),
                    max_rounds=args.max_rounds, dry_run=args.dry_run, no_plan=getattr(args, "no_plan", False),
@@ -96,7 +97,8 @@ def forward_args(args: argparse.Namespace, mode: str) -> list[str]:
     out = [mode]
     for flag, attr in (("--repo", "repo"), ("--config", "config"), ("--difficulty", "difficulty"),
                        ("--base", "base"), ("--max-rounds", "max_rounds"), ("--isolation", "isolation"),
-                       ("--criteria", "criteria")):
+                       ("--criteria", "criteria"), ("--max-agent-calls", "max_agent_calls"),
+                       ("--max-active-seconds", "max_active_seconds"), ("--max-output-bytes", "max_output_bytes")):
         val = getattr(args, attr, None)
         if val is not None:
             out += [flag, str(Path(val).resolve()) if attr == "criteria" else str(val)]
@@ -149,10 +151,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
     repo = _repo(args.repo)
     run_dir = find_run(repo, args.run)
     more = ["--extra-rounds", str(args.extra_rounds)] if args.extra_rounds else []
+    limits = {k: getattr(args, k, None) for k in ("max_agent_calls", "max_active_seconds", "max_output_bytes")}
+    for key, value in limits.items():
+        if value is not None:
+            more += ["--" + key.replace("_", "-"), str(value)]
     if args.detach:
         extra = (["--repo", args.repo] if args.repo else []) + (["--config", args.config] if args.config else [])
         return _detach(repo, ["resume", run_dir.name, *more, *extra], None, run_id=run_dir.name)
-    return Orchestrator(repo, _cfg(repo, args), Options(dry_run=args.dry_run)).resume(
+    return Orchestrator(repo, _cfg(repo, args), Options(dry_run=args.dry_run, **limits)).resume(
         run_dir, extra_rounds=args.extra_rounds or 0)
 
 
@@ -298,7 +304,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_triage)
 
+    def limitopts(p):
+        def positive(text):
+            value = int(text)
+            if value <= 0:
+                raise argparse.ArgumentTypeError("limit must be positive")
+            return value
+        for flag in ("--max-agent-calls", "--max-active-seconds", "--max-output-bytes"):
+            p.add_argument(flag, type=positive, help="execution limit (resume may only raise saved limits)")
+
     def runopts(p: argparse.ArgumentParser) -> None:
+        limitopts(p)
         p.add_argument("--detach", action="store_true",
                        help="run in the background, print {run_id,...} as JSON and return (for agents)")
         p.add_argument("--run-id", help=argparse.SUPPRESS)
@@ -331,6 +347,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("resume", help="continue an interrupted run")
     common(p)
+    limitopts(p)
     p.add_argument("run", nargs="?", default="latest")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--detach", action="store_true", help="resume in the background")

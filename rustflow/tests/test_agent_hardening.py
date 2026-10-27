@@ -1,15 +1,38 @@
 """Permanent vs transient agent failures, observed model, duplicate evidence, review lenses."""
 
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
-from conftest import read_log
+from conftest import read_log, skip_agent_sleep
 from rustflow import agents, findings as fnd
 from rustflow.config import Config, ConfigError
 from rustflow.orchestrator import Options, Orchestrator, find_run
 
 TASK = "Add `parse_kv(input: &str) -> Vec<(String, String)>` to src/lib.rs. Trim whitespace. Add tests."
+
+
+def test_fake_agent_log_records_concurrent_invocations(tmp_path, fake_bin):
+    env = {**os.environ, "FAKE_LOG": str(tmp_path / "fake.log"), "FAKE_SCENARIO": "codex_auth"}
+    procs = [subprocess.Popen([sys.executable, str(fake_bin / "codex.py"), str(i), "x" * 20000],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=env) for i in range(12)]
+    try:
+        for proc in procs:
+            proc.communicate(timeout=30)
+            assert proc.returncode == 1
+        calls = read_log(tmp_path / "demo")
+        assert len(calls) == 12
+        assert {c["argv"][0] for c in calls} == {str(i) for i in range(12)}
+        assert all(c["argv"][1] == "x" * 20000 for c in calls)
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 @pytest.mark.parametrize("text,status,permanent", [
@@ -42,7 +65,7 @@ def _call(tmp_path):
 
 
 def test_run_with_retry_skips_permanent_failures(tmp_path, monkeypatch):
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     perm = agents.AgentResult("x", "reviewer_a", "s", ok=False, error="not logged in", retryable=False)
     r = _Runner([perm])
     assert agents.run_with_retry(r, _call(tmp_path), retries=1) is perm and r.calls == 1
@@ -116,9 +139,9 @@ def test_model_mismatch_is_reported(rust_repo, monkeypatch):
     assert any(e["kind"] == "model_mismatch" for e in st["events"])
 
 
-def test_setting_sources_option(tmp_path):
-    from rustflow.config import AgentSpec, load_defaults
-    d = load_defaults()
+def test_setting_sources_option(tmp_path, fake_defaults):
+    from rustflow.config import AgentSpec
+    d = fake_defaults
     call = agents.AgentCall("reviewer_a", "x", AgentSpec.parse("claude:opus:high"), "p", False, None, tmp_path,
                             tmp_path / "logs")
     assert "--setting-sources" not in agents.ClaudeRunner(Config(d)).build_argv(call)

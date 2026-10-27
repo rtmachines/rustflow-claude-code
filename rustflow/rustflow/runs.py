@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from rustflow import gates
+from rustflow import gates, usage
 
 RUNS = Path(".rustflow") / "runs"
 APPROVED = ("approved", "approved_with_advisories")
@@ -35,6 +35,7 @@ def acquire(repo: Path, state: dict) -> None:
     if act and act.get("run_id") != state["run_id"]:
         raise RunLocked(f"run {act['run_id']} is still active in this repo (pid {act['pid']}). "
                         f"Wait: `rustflow wait {act['run_id']}`, stop: `rustflow cancel {act['run_id']}`.")
+    state["private_console"] = os.name == "nt" and os.environ.get("RUSTFLOW_PRIVATE_CONSOLE") == "1"
     path = gates.active_lock_path(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -96,12 +97,19 @@ def spawn_detached(repo: Path, cli_args: list[str], task: str | None = None, run
     log = (run_dir / "console.log").open("a", encoding="utf-8")
     kwargs: dict = {}
     if os.name == "nt":
-        kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-                                   | subprocess.DETACHED_PROCESS)      # type: ignore[attr-defined]
+        # A private, hidden console survives the caller and can receive cancellation signals.
+        # DETACHED_PROCESS has no console, so console signals cannot reach the orchestrator.
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+        startup = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+        startup.wShowWindow = subprocess.SW_HIDE  # type: ignore[attr-defined]
+        kwargs["startupinfo"] = startup
     else:
         kwargs["start_new_session"] = True
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    if os.name == "nt":
+        env["RUSTFLOW_PRIVATE_CONSOLE"] = "1"
     proc = subprocess.Popen(argv, cwd=repo, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                             env=env, close_fds=True, **kwargs)
     log.close()
@@ -251,9 +259,13 @@ def next_actions(state: dict) -> list[dict]:
                 "formats only the files the change touches)?")}]
         return [{"action": "ask_user", "question": "The base branch is already red. Fix it first, or continue "
                  "with --accept-red-baseline (only new failures block)?"}]
-    if st in ("budget", "interrupted", "crashed", "tree_changed", "agent_failed"):
+    if st in ("budget", "interrupted", "crashed", "tree_changed", "agent_failed", "incomplete"):
         failed = state.get("failed_agent") or {}
-        hint = {"budget": "raise [budget].max_total_usd in rustflow.toml, then",
+        reason = state.get("termination_reason")
+        limit_hint = {"agent_call_limit": "--max-agent-calls", "active_time_limit": "--max-active-seconds",
+                      "output_limit": "--max-output-bytes"}.get(reason)
+        hint = {"budget": (f"resume with a larger {limit_hint}" if limit_hint else "raise [budget].max_total_usd in rustflow.toml, then"),
+                "incomplete": (f"resume with a larger {limit_hint}" if limit_hint else "inspect incomplete process logs, then resume"),
                 "interrupted": "", "crashed": "check console.log / stop_reason, then",
                 "tree_changed": "files changed during the review; stop editing this checkout, then",
                 "agent_failed": (f"{failed.get('name', 'an agent')} failed, nothing changed - likely transient "
@@ -279,6 +291,10 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
     return {
         "run_id": state.get("run_id"), "status": st, "phase": state.get("phase"), "round": state.get("round"),
         "difficulty": state.get("difficulty"), "cost_usd": state.get("cost_usd", 0.0),
+        "usage_summary": usage.summary_for_state(state),
+        "execution_budget": state.get("execution_budget", {"history_complete": False}),
+        "termination_reason": state.get("termination_reason"),
+        "output_complete": state.get("output_complete", True),
         "isolation": state.get("isolation"), "branch": state.get("branch"), "workdir": state.get("workdir"),
         "blocking": [brief(f) for f in fs if f.get("status") == "open"][:findings_limit],
         "disputed": [brief(f) for f in fs if f.get("status") == "disputed"][:findings_limit],
@@ -294,7 +310,17 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
 def brief_markdown(s: dict, mcp: bool = False) -> str:
     """Compact run summary for a model. mcp=True: next steps as MCP tool calls instead of CLI commands."""
     lines = [f"rustflow {s['run_id']}: **{s['status']}** (phase {s['phase']}, round {s['round']}, "
-             f"{s['difficulty']}, ${s['cost_usd']:.2f})"]
+             f"{s['difficulty']}, booked ${s['cost_usd']:.2f})"]
+    lines.append(usage.brief(s.get("usage_summary") or usage.summarize([], history_complete=False)))
+    budget = s.get("execution_budget") or {}
+    if budget.get("limits"):
+        lines.append(f"execution: {budget.get('agent_calls_used', 0)}/{budget['limits']['max_agent_calls']} calls; "
+                     f"{budget.get('active_seconds_used', 0):.1f}s used, {budget.get('active_seconds_remaining', 0):.1f}s remaining; "
+                     f"output limit {budget['limits']['max_output_bytes']} bytes; complete={s.get('output_complete', True)}")
+        if not budget.get("history_complete"):
+            lines.append("execution usage before migration is unknown")
+        if budget.get("crash_estimate_seconds"):
+            lines.append(f"active time includes {budget['crash_estimate_seconds']}s estimated after crash")
     if s.get("branch"):
         lines.append(f"branch: {s['branch']} ({s['isolation']})")
     if s.get("final_gates"):
@@ -364,19 +390,50 @@ def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channe
         time.sleep(poll_s)
 
 
+def _windows_interrupt(pid: int, private_console: bool = False) -> None:
+    """Run in a helper process: attach to the target console without detaching the caller's console."""
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.FreeConsole()
+    if not kernel.AttachConsole(pid):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if private_console:
+            # CREATE_NEW_CONSOLE does not create a process group with id == pid.
+            # Broadcast only within the run's private console; ignore Ctrl+C in this helper.
+            # Provider children use CREATE_NEW_PROCESS_GROUP and have Ctrl+C disabled.
+            if not kernel.SetConsoleCtrlHandler(None, True):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel.GenerateConsoleCtrlEvent(signal.CTRL_C_EVENT, 0):  # type: ignore[attr-defined]
+                raise ctypes.WinError(ctypes.get_last_error())
+            time.sleep(0.1)  # keep this helper attached (and ignoring Ctrl+C) during signal delivery
+        else:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+    finally:
+        kernel.FreeConsole()
+
+
 def cancel(repo: Path, run_dir: Path, grace_s: float = 20.0) -> dict:
     """Graceful stop: the orchestrator gets an interrupt, kills its agents, saves state (resumable)."""
     state = load_state(run_dir)
     pid = int(state.get("pid") or 0)
     if not gates.pid_alive(pid):
         return {"run_id": state.get("run_id"), "status": effective_status(state), "note": "not running"}
+    interrupt_error = ""
     try:
         if os.name == "nt":
-            os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+            result = subprocess.run([sys.executable, "-c",
+                            "import sys; from rustflow.runs import _windows_interrupt; "
+                            "_windows_interrupt(int(sys.argv[1]), sys.argv[2] == 'private')",
+                            str(pid), "private" if state.get("private_console") else "group"],
+                           creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+            if result.returncode:
+                interrupt_error = result.stderr[-1000:] or f"interrupt helper exited {result.returncode}"
         else:
             os.kill(pid, signal.SIGINT)
-    except OSError:
-        pass
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        interrupt_error = str(exc)
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline and gates.pid_alive(pid):
         time.sleep(0.5)
@@ -393,4 +450,5 @@ def cancel(repo: Path, run_dir: Path, grace_s: float = 20.0) -> dict:
         release(repo, state.get("run_id", ""))
     state = load_state(run_dir)
     return {"run_id": state.get("run_id"), "status": effective_status(state), "forced": forced,
-            "next": f"rustflow resume {state.get('run_id')} --detach"}
+            "next": f"rustflow resume {state.get('run_id')} --detach",
+            **({"interrupt_error": interrupt_error} if interrupt_error else {})}

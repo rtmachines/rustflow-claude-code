@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import git, read_log
+from conftest import git, read_log, skip_agent_sleep
 from rustflow import agents, gates, hooks, runs
 from rustflow.config import AgentSpec, Config, ConfigError, load_defaults
 from rustflow.orchestrator import Options, Orchestrator, find_run
@@ -18,7 +18,7 @@ TASK = "Add `parse_kv(input: &str) -> Vec<(String, String)>` to src/lib.rs. Trim
 
 def _run(repo, scenario, monkeypatch, **opts):
     monkeypatch.setenv("FAKE_SCENARIO", scenario)
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     cfg = Config.load(repo, opts.pop("config", None))
     rc = Orchestrator(repo, cfg, Options(**opts)).start(TASK)
     return rc, _state(repo)
@@ -44,9 +44,9 @@ def _arg(argv, flag):
 
 
 # ── tool set in the prompt (--tools) ─────────────────────────────────────────
-def test_builtin_tool_set_is_restricted_per_role(tmp_path, monkeypatch):
+def test_builtin_tool_set_is_restricted_per_role(tmp_path, monkeypatch, fake_defaults):
     monkeypatch.setattr(agents, "IS_WINDOWS", False)
-    runner = agents.ClaudeRunner(Config(load_defaults()))
+    runner = agents.ClaudeRunner(Config(fake_defaults))
     read = runner.build_argv(_call(tmp_path))
     assert _arg(read, "--tools") == "Read,Glob,Grep,LSP,Bash"          # no Skill: /skill expands without it
     write = runner.build_argv(_call(tmp_path, "implementer", write=True))
@@ -56,16 +56,16 @@ def test_builtin_tool_set_is_restricted_per_role(tmp_path, monkeypatch):
     assert "--tools" not in tob
 
 
-def test_powershell_added_on_windows_and_empty_list_disables_flag(tmp_path, monkeypatch):
+def test_powershell_added_on_windows_and_empty_list_disables_flag(tmp_path, monkeypatch, fake_defaults):
     monkeypatch.setattr(agents, "IS_WINDOWS", True)
-    d = load_defaults()
+    d = fake_defaults
     assert _arg(agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path)), "--tools").endswith(",Bash,PowerShell")
     d["providers"]["claude"]["tools_read"] = []
     assert "--tools" not in agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path))
 
 
-def test_fallback_model_flag_and_allowlist(tmp_path):
-    d = load_defaults()
+def test_fallback_model_flag_and_allowlist(tmp_path, fake_defaults):
+    d = fake_defaults
     assert "--fallback-model" not in agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path))
     d["providers"]["claude"]["fallback_model"] = "sonnet"
     assert _arg(agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path)), "--fallback-model") == "sonnet"
@@ -270,7 +270,7 @@ def test_failed_json_repair_is_not_retried_a_second_time(tmp_path, fake_bin, mon
     log = tmp_path / "fake.log"
     monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("FAKE_SCENARIO", "json_always")
-    monkeypatch.setattr(agents.time, "sleep", lambda s: None)
+    skip_agent_sleep(monkeypatch)
     from rustflow import schemas
     call = agents.AgentCall("reviewer_a", "r1-reviewer_a", AgentSpec.parse("claude:opus:high"), "p", False,
                             schemas.REVIEW_SCHEMA, tmp_path, tmp_path / "logs")
@@ -282,10 +282,10 @@ def test_failed_json_repair_is_not_retried_a_second_time(tmp_path, fake_bin, mon
 
 
 # ── read-only shell for write roles ─────────────────────────────────────────
-def test_write_roles_may_run_read_only_shell_commands(tmp_path):
+def test_write_roles_may_run_read_only_shell_commands(tmp_path, fake_defaults):
     """Measured live: `ls` / `wc` / `rtk read` were denied to the implementer (each denial costs a turn);
     chained `cargo check && cargo test` was fine - every part of a chain is matched on its own."""
-    d = load_defaults()
+    d = fake_defaults
     write = _arg(agents.ClaudeRunner(Config(d)).build_argv(_call(tmp_path, "implementer", write=True)),
                  "--allowedTools").split(",")
     for rule in ("Bash(ls *)", "Bash(ls)", "Bash(wc *)", "Bash(cat *)", "Bash(head *)", "Bash(grep *)",

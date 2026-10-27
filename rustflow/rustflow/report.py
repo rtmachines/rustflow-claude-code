@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from rustflow import usage
+
 STATUS_TEXT = {
     "approved": "ZATWIERDZONE - bramki zielone, brak blokujących uwag",
     "approved_with_advisories": "ZATWIERDZONE z uwagami doradczymi / spornymi do przejrzenia",
@@ -19,6 +21,7 @@ STATUS_TEXT = {
     "review_failed": "RECENZJA NIEUDANA - żaden recenzent nie zwrócił wyniku",
     "agent_failed": "AGENT NIEUDANY - wywołanie modelu nie powiodło się, drzewo bez zmian (można wznowić)",
     "budget": "PRZEKROCZONY BUDŻET",
+    "incomplete": "NIEKOMPLETNE WYKONANIE",
     "error": "BŁĄD",
     "interrupted": "PRZERWANE (można wznowić)",
     "tree_changed": "PLIKI ZMIENIONE W TRAKCIE RECENZJI - wyniki odrzucone (można wznowić)",
@@ -57,7 +60,7 @@ def render(state: dict, repo: Path) -> str:
     lines.append(f"- Baza: `{state.get('base_ref')}` = `{(state.get('base_sha') or '')[:12]}`; "
                  f"izolacja: {state.get('isolation')}" +
                  (f", gałąź `{state['branch']}`" if state.get("branch") else ""))
-    lines.append(f"- Rundy recenzji: {len(state.get('rounds', []))}; koszt Claude: "
+    lines.append(f"- Rundy recenzji: {len(state.get('rounds', []))}; kwota księgowana (budżet Claude): "
                  f"${state.get('cost_usd', 0):.2f}; tokeny Codex/Claude: "
                  + ", ".join(f"{k}={v}" for k, v in sorted((state.get('tokens') or {}).items())
                              if isinstance(v, (int, float)) and k.endswith("tokens")))
@@ -68,6 +71,51 @@ def render(state: dict, repo: Path) -> str:
                       "uruchom dedykowany audyt soundness (np. `/rust-review:rust-review` Trail of Bits) "
                       "na plikach z sygnałami."]
     lines.append("")
+
+    budget = state.get("execution_budget") or {}
+    if budget.get("limits"):
+        limits = budget["limits"]
+        lines += ["## Budżet wykonania", "",
+                  f"- Próby providera: {budget.get('agent_calls_used', 0)}/{limits['max_agent_calls']}; "
+                  f"pozostało {budget.get('agent_calls_remaining', 0)}.",
+                  f"- Aktywny czas: {budget.get('active_seconds_used', 0):.2f}s; "
+                  f"pozostało {budget.get('active_seconds_remaining', 0):.2f}s z {limits['max_active_seconds']}s.",
+                  f"- Limit stdout + stderr procesu: {limits['max_output_bytes']} surowych bajtów.",
+                  f"- Kompletność wyjścia: {state.get('output_complete', True)}; "
+                  f"przyczyna zatrzymania: {state.get('termination_reason') or '—'}.",
+                  f"- Oszacowanie po awarii: +{budget.get('crash_estimate_seconds', 0)}s.", ""]
+        if not budget.get("history_complete"):
+            lines += ["Wcześniejsze zużycie sprzed migracji jest nieznane; licznik działa od migracji.", ""]
+
+    measured = usage.summary_for_state(state)
+    lines += ["## Zużycie providerów", "", usage.brief(measured), ""]
+    if measured["providers"]:
+        rows = []
+        for provider, group in measured["providers"].items():
+            cost = group["cost_usd"]
+            counts = group["measurements"]
+            tokens = group["tokens"]["total_tokens"]
+            rows.append([provider, str(group["attempt_count"]),
+                         f"{counts['complete']}/{counts['partial']}/{counts['unknown']}",
+                         f"${cost['known']:.6f}" + (f" + ? ({cost['missing_attempts']} braków)" if cost["total"] is None else ""),
+                         f"${group['estimated_cost_usd']:.6f}",
+                         str(tokens["known"]) + (" + ?" if tokens["total"] is None else "")])
+        lines += [_table(rows, ["provider", "próby", "pełne/częściowe/nieznane", "zmierzony koszt",
+                               "estymacje timeoutów", "tokeny (bez podwójnego cache)"]), ""]
+    attempts_dir = repo / ".rustflow" / "runs" / state.get("run_id", "") / "attempts"
+    attempts = usage.load_attempts(attempts_dir)
+    if attempts:
+        def amount(value):
+            return "nieznany" if value is None else f"${value:.6f}"
+        rows = [[a["attempt_id"], a["logical_call_id"], f"{a['attempt_number']}: {a['kind']}",
+                 f"{a['role']} / {a['provider']} / {a['requested_model']}", a["status"],
+                 a["started_at"], f"{a['duration_s']:.2f}s" if a.get("duration_s") is not None else "?",
+                 amount(a.get("measured_cost_usd")), amount(a.get("estimated_cost_usd")),
+                 a["measurement_status"] + f"; logs={a.get('output_complete', True)}; {a.get('termination_reason', 'unknown')} "
+                 + f"({a.get('stdout_bytes', '?')}+{a.get('stderr_bytes', '?')} bytes / {a.get('max_output_bytes', '?')})", (a.get("error") or "")[:120],
+                 ", ".join(a.get("artifacts", {}).values())] for a in attempts]
+        lines += ["## Próby agentów", "", _table(rows, ["id próby", "id wywołania", "numer/rodzaj", "rola/provider/model",
+                  "wynik", "start (UTC)", "czas", "pomiar USD", "estymacja USD", "kompletność", "błąd", "artefakty"]), ""]
 
     audit = state.get("audit")
     if audit:
@@ -83,6 +131,10 @@ def render(state: dict, repo: Path) -> str:
     agents = state.get("agents") or []
     if agents:
         def cost(a: dict) -> str:
+            if a.get("attempt_ids"):
+                measured = a.get("measured_cost_usd")
+                return ((f"pomiar ${measured:.6f}" if measured is not None else "pomiar niepełny")
+                        + (f"; estymacja ${a['estimated_cost_usd']:.6f}" if a.get("estimated_cost_usd") is not None else ""))
             if not a.get("cost_usd"):
                 return "-"
             return f"≤${a['cost_usd']:.2f} (limit roli, timeout)" if a.get("cost_estimated") else f"${a['cost_usd']:.2f}"
@@ -182,7 +234,7 @@ def render(state: dict, repo: Path) -> str:
     elif state.get("isolation") == "worktree":
         lines += [f"- Worktree: `{state.get('workdir')}` (gałąź `{state.get('branch')}`)",
                   f"- Usuń: `git worktree remove {state.get('workdir')}`"]
-    if st in ("interrupted", "budget", "tree_changed"):
+    if st in ("interrupted", "budget", "tree_changed", "incomplete"):
         lines.append(f"- Wznów: `rustflow resume {state.get('run_id')}`")
     lines.append(f"- Logi agentów: `.rustflow/runs/{state.get('run_id')}/agents/`")
     return "\n".join(lines) + "\n"

@@ -2,12 +2,20 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 HERE = Path(__file__).resolve().parent
 FAKE = HERE / "fake_agents" / "fake_agent.py"
+
+
+def skip_agent_sleep(monkeypatch):
+    """Skip unbudgeted retry backoff without changing other modules' polling."""
+    from rustflow import agents
+    monkeypatch.setattr(agents, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None))
 
 
 def git(cwd, *args):
@@ -26,6 +34,16 @@ def fake_bin(tmp_path):
     for name in ("claude", "codex"):
         shutil.copy(FAKE, d / f"{name}.py")
     return d
+
+
+@pytest.fixture
+def fake_defaults(fake_bin):
+    """Default configuration with only the provider executables replaced by local fakes."""
+    from rustflow.config import load_defaults
+    data = load_defaults()
+    for provider in ("claude", "codex"):
+        data["providers"][provider]["bin"] = str(fake_bin / f"{provider}.py")
+    return data
 
 
 @pytest.fixture

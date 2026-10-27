@@ -93,7 +93,12 @@ rereview = "both"           # both | first  (kto robi re-recenzję w rundach >= 
 allow_reject = true         # fixer może odrzucić finding z uzasadnieniem
 min_confidence_single = "medium"  # finding zgłoszony przez 1 recenzenta poniżej progu -> doradczy
 
+[process]
+max_output_bytes = 16777216  # combined raw stdout + stderr per process; positive
+
 [budget]
+max_agent_calls = 40        # physical provider attempts, including retry and JSON repair
+max_active_seconds = 7200   # active wall time across resume; offline time excluded
 max_total_usd = 60.0        # suma kosztu wywołań Claude (Codex raportuje tylko tokeny)
 
 # ── Narzędzia dostawców ──────────────────────────────────────────────────────

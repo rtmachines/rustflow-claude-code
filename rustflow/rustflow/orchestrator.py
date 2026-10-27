@@ -8,6 +8,7 @@ Every phase transition is persisted in <run>/state.json so `rustflow resume` can
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -15,20 +16,24 @@ import shutil
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from copy import deepcopy
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from rustflow import criteria as crit_mod
 from rustflow import findings as fnd
-from rustflow import gates, gitutil, procutil, prompts, report, runs, schemas, triage
+from rustflow import gates, gitutil, procutil, prompts, report, runs, schemas, triage, usage
 from rustflow.agents import AgentCall, AgentResult, make_runners, run_with_retry
 from rustflow.config import AgentSpec, Config, bump, gates_command, max_difficulty
+from rustflow.budget import BudgetManager, BudgetExceeded, DEFAULT_LIMITS, validate_limits
+from rustflow.process import execution_scope
 
 RUNS_DIR = Path(".rustflow") / "runs"
 RUNTIME_GITIGNORE = "runs/\ncache/\nwt/\n__pycache__/\n"
-RESUMABLE = ("interrupted", "budget", "crashed", "tree_changed", "agent_failed")
+RESUMABLE = ("interrupted", "budget", "crashed", "tree_changed", "agent_failed", "incomplete")
 # Finished, but another fix round can still help: `rustflow resume <run> --extra-rounds N`.
 CONTINUABLE = ("max_rounds", "stalled", "final_gates_red", "criteria_unmet")
 
@@ -46,6 +51,9 @@ class Options:
     no_plan: bool = False
     fix: bool = True                  # review mode: run the fix loop?
     verbose: bool = False
+    max_agent_calls: int | None = None
+    max_active_seconds: float | None = None
+    max_output_bytes: int | None = None
     criteria_file: str | None = None  # TOML with [[criteria]] text/test (mechanical acceptance criteria)
 
 
@@ -56,6 +64,14 @@ def _now() -> str:
 def _slug(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", text.lower())[:32].strip("-")
     return s or "task"
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError:
+        return None
 
 
 class Abort(Exception):
@@ -75,6 +91,9 @@ class Orchestrator:
         prompts.GATES = gates_command(cfg)
         self.state: dict[str, Any] = {}
         self.run_dir: Path = Path()
+        self._state_lock = threading.RLock()
+        self._attempts: dict[str, dict] = {}
+        self.budget = None
 
     # ── logging / state ──────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -88,13 +107,81 @@ class Orchestrator:
             pass
 
     def event(self, kind: str, **data: Any) -> None:
-        self.state.setdefault("events", []).append({"at": _now(), "kind": kind, **data})
+        with self._state_lock:
+            self.state.setdefault("events", []).append({"at": _now(), "kind": kind, **data})
 
     def save(self) -> None:
-        tmp = self.run_dir / "state.json.tmp"
-        tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.run_dir / "state.json")
-        runs.update_lock(self.repo, self.state)
+        with self._state_lock:
+            if self.budget:
+                self.budget.checkpoint()
+            tmp = self.run_dir / "state.json.tmp"
+            tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.run_dir / "state.json")
+            runs.update_lock(self.repo, self.state)
+
+    def _prepare_usage(self, *, resume: bool = False) -> None:
+        with self._state_lock:
+            self.state.setdefault("usage_baseline", {"cost_usd": self.state.get("cost_usd", 0.0),
+                                                     "tokens": deepcopy(self.state.get("tokens", {})),
+                                                     "history_complete": False})
+            self._attempts = {r["attempt_id"]: r for r in usage.load_attempts(self.run_dir / "attempts",
+                                                                           interrupt_started=resume)}
+            self._refresh_usage()
+
+    def _prepare_budget(self, *, resume=False):
+        limits = {k: self.cfg.get(("process." if k == "max_output_bytes" else "budget.") + k, v)
+                  for k, v in DEFAULT_LIMITS.items()}
+        changes = {k: getattr(self.opts, k) for k in DEFAULT_LIMITS if getattr(self.opts, k) is not None}
+        # Validate decreases before changing any persisted session state.
+        validate_limits(changes)
+        saved = self.state.get("execution_budget", {}).get("limits", {})
+        for key, value in changes.items():
+            if resume and key in saved and value < saved[key]:
+                raise ValueError(f"cannot lower {key} on resume ({value} < {saved[key]})")
+        if not resume:
+            limits.update(changes)
+        self.budget = BudgetManager(self.state, limits, attempts=self._attempts.values(),
+                                    history_complete=not resume,
+                                    lock=self._state_lock, persist=self.save, event=self.event)
+        if resume:
+            self.budget.raise_limits(changes)
+
+    def _check_budget(self):
+        if self.budget:
+            self.budget.check()
+
+    def _incomplete_abort(self, reason, **metadata):
+        self.state["termination_reason"] = reason
+        self.state["output_complete"] = False
+        self.event("incomplete_output", reason=reason, **metadata)
+        self.save()
+        status = "budget" if reason in ("agent_call_limit", "active_time_limit") else "incomplete"
+        return Abort(status, f"incomplete execution: {reason}; inspect diagnostics, raise the applicable limit and resume")
+
+    def _incomplete(self, reason, **metadata):
+        raise self._incomplete_abort(reason, **metadata)
+
+    def _refresh_usage(self) -> None:
+        """Recompute from the ledger, making replay after a crash/resume idempotent. Lock held by caller."""
+        baseline = self.state["usage_baseline"]
+        rows = list(self._attempts.values())
+        self.state["usage_summary"] = usage.summarize(rows, history_complete=baseline["history_complete"])
+        if not baseline["history_complete"]:
+            self.state["usage_summary"]["legacy_baseline"] = deepcopy(baseline)
+        self.state["cost_usd"] = round(baseline["cost_usd"] + sum(
+            (r.get("measured_cost_usd") or 0) + (r.get("estimated_cost_usd") or 0)
+            for r in rows if r["provider"] == "claude"), 4)
+        tokens = deepcopy(baseline["tokens"])
+        for row in rows:
+            for key, value in usage.raw_tokens(row["raw_usage"]).items():
+                tokens[key] = tokens.get(key, 0) + value
+        self.state["tokens"] = tokens
+
+    def _record_attempt(self, record: dict) -> None:
+        with self._state_lock:
+            self._attempts[record["attempt_id"]] = deepcopy(record)
+            self._refresh_usage()
+            self.save()
 
     @property
     def workdir(self) -> Path:
@@ -124,6 +211,7 @@ class Orchestrator:
             "cost_usd": 0.0, "tokens": {}, "status": "running", "dry_run": self.opts.dry_run,
             "options": self.opts.__dict__.copy(), "pid": os.getpid(),
             "criteria": [c.to_dict() for c in criteria], "mechanical": [], "seen_trees": [],
+            "usage_baseline": {"cost_usd": 0.0, "tokens": {}, "history_complete": True},
         }
         try:
             runs.acquire(self.repo, self.state)
@@ -132,6 +220,8 @@ class Orchestrator:
             return 2
         (self.run_dir / "task.md").write_text(task, encoding="utf-8")
         (self.repo / RUNS_DIR / "LATEST").write_text(run_id, encoding="utf-8")
+        self._prepare_usage()
+        self._prepare_budget()
         self.save()
         self.log(f"run {run_id}  ({self.run_dir.relative_to(self.repo).as_posix()})")
         return self.loop()
@@ -141,7 +231,7 @@ class Orchestrator:
         self.state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         saved = self.state.get("options", {})
         for k, v in saved.items():
-            if hasattr(self.opts, k) and k not in ("dry_run", "verbose"):
+            if hasattr(self.opts, k) and k not in ("dry_run", "verbose", *DEFAULT_LIMITS):
                 setattr(self.opts, k, v)
         status = self.state.get("status")
         if extra_rounds:
@@ -175,6 +265,14 @@ class Orchestrator:
             return 2
         try:
             # A failed previous resume may already have re-created this checkout.
+            self._prepare_usage(resume=True)
+            try:
+                self._prepare_budget(resume=True)
+            except ValueError as exc:
+                self.log(str(exc))
+                return 2
+            self.state.pop("termination_reason", None)
+            self.state.pop("output_complete", None)
             if self.state.get("isolation") == "worktree":
                 self.state["worktree_removed"] = False
             try:
@@ -213,11 +311,27 @@ class Orchestrator:
         self.log(f"continuing with up to {extra_rounds} more round(s) (max_rounds {limit})")
 
     def loop(self) -> int:
+        if self.budget is None:
+            self._prepare_usage()
+            self._prepare_budget(resume="execution_budget" in self.state)
         _install_interrupt_handlers()
+        heartbeat_stop = threading.Event()
+        def heartbeat():
+            while not heartbeat_stop.wait(1):
+                self.save()
+        heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+        heartbeat_thread.start()
         try:
-            return self._loop()
+            with execution_scope(max_output_bytes=self.budget.limits["max_output_bytes"],
+                                 deadline=self.budget.deadline, cancel=self.budget.cancel):
+                return self._loop()
         finally:
+            self.budget.cancel.set()
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=2)
             try:
+                self.budget.close()
+                self._write_report()
                 if self.state.get("status") not in ("running", *RESUMABLE):
                     self._remove_finished_worktree()
             finally:
@@ -283,9 +397,21 @@ class Orchestrator:
     def _loop(self) -> int:
         try:
             while self.state["phase"] != "done":
+                self._check_budget()
                 phase = self.state["phase"]
                 getattr(self, f"phase_{phase}")()
                 self.save()
+            self._check_budget()
+        except gates.IncompleteGate as exc:
+            abort = self._incomplete_abort(exc.step.termination_reason, step=exc.step.name)
+            self.state.update(status=abort.status, stop_reason=abort.message)
+            self._write_report()
+        except BudgetExceeded as exc:
+            if self.state["phase"] == "done":
+                self.state["phase"] = phase
+            self.state.update(status="budget", termination_reason=exc.reason, output_complete=False,
+                              stop_reason=f"execution budget exhausted: {exc.reason}")
+            self._write_report()
         except Abort as exc:
             self.log(f"STOP: {exc.message}")
             self.state["status"] = exc.status
@@ -294,12 +420,16 @@ class Orchestrator:
                 self.state["phase"] = "done"
             self._write_report()
         except KeyboardInterrupt:
+            if self.budget:
+                self.budget.cancel.set()
             procutil.kill_all()
             self.state["status"] = "interrupted"
             self.save()
             self.log(f"interrupted - continue with: rustflow resume {self.state['run_id']}")
             return 130
         except Exception as exc:  # never lose agent work/cost bookkeeping on an unexpected error
+            if self.budget:
+                self.budget.cancel.set()
             procutil.kill_all()
             self.state["status"] = "crashed"
             self.state["stop_reason"] = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-3000:]}"
@@ -325,10 +455,15 @@ class Orchestrator:
     # ── agent plumbing ───────────────────────────────────────────────────
     def call_agent(self, role: str, name: str, spec: AgentSpec, prompt: str, *, write: bool,
                    schema: dict | None, skill: str | None, retry: bool = True,
-                   tools: list[str] | None = None) -> AgentResult:
+                   tools: list[str] | None = None, reservation: str | None = None,
+                   defer_limits: bool = False) -> AgentResult:
+        self._check_budget()
         budget_total = float(self.cfg.get("budget.max_total_usd", 0) or 0)
-        if budget_total and self.state["cost_usd"] >= budget_total:
-            raise Abort("budget", f"total budget ${budget_total:.2f} exhausted")
+        with self._state_lock:
+            if "usage_baseline" not in self.state:
+                self._prepare_usage()
+            if budget_total and self.state["cost_usd"] >= budget_total:
+                raise Abort("budget", f"total budget ${budget_total:.2f} exhausted")
         self.cfg.check_spec(spec, f"{role}")
         cfg_role = "auditor" if role in ("auditor", "tob_audit") else role
         call = AgentCall(
@@ -337,6 +472,7 @@ class Orchestrator:
             timeout_s=float(self.cfg.role_opt(cfg_role, "timeout_min", 30)) * 60,
             max_budget_usd=self.cfg.role_opt(cfg_role, "max_budget_usd") if spec.provider == "claude" else None,
             env=self._agent_env(), allowed_tools=tools, extra_skills=self._extra_skills(role, spec.provider),
+            on_attempt=self._record_attempt, budget=self.budget, reservation=reservation,
         )
         self.log(f"> {name}: {spec}{'  [write]' if write else ''}")
         runner = self.runners[spec.provider]
@@ -345,10 +481,6 @@ class Orchestrator:
         before = self.snapshot() if write and retry and not self.opts.dry_run else None
         res = run_with_retry(runner, call, retries=1 if retry else 0,
                              may_retry=(lambda: self.snapshot() == before) if before is not None else None)
-        self.state["cost_usd"] = round(self.state["cost_usd"] + res.cost_usd, 4)
-        for k, v in (res.tokens or {}).items():
-            if isinstance(v, (int, float)):
-                self.state["tokens"][k] = self.state["tokens"].get(k, 0) + v
         if res.model_mismatch:
             self.log(f"WARNING {name}: {res.model_mismatch} (model fallback/reroute?)")
             self.event("model_mismatch", agent=name, detail=res.model_mismatch)
@@ -357,12 +489,16 @@ class Orchestrator:
             self.log(f"WARNING {name}: {len(res.permission_denials)} denied tool call(s), e.g. "
                      + ", ".join(res.permission_denials[:3]))
         if res.cost_estimated:
-            self.log(f"WARNING {name}: no cost reported (timeout) - booked the role cap ${res.cost_usd:.2f}")
-        self.state["agents"].append({k: v for k, v in res.to_dict().items() if k not in ("data", "text", "argv")})
-        self.state["agents"][-1]["skills"] = [skill] if skill else []
-        self.state["agents"][-1]["skills"] += [p.parent.name for p in call.extra_skills]
+            self.log(f"WARNING {name}: no cost reported (timeout) - booked the role cap ${res.estimated_cost_usd:.2f}")
+        entry = {k: v for k, v in res.to_dict().items() if k not in ("data", "text", "argv", "raw_usage")}
+        entry["skills"] = ([skill] if skill else []) + [p.parent.name for p in call.extra_skills]
+        with self._state_lock:
+            self.state["agents"].append(entry)
+            self.save()
         cost = f" ${res.cost_usd:.2f}" if res.cost_usd else ""
         self.log(f"< {name}: {'ok' if res.ok else 'FAILED: ' + res.error[:300]} ({res.duration_s:.0f}s{cost})")
+        if not res.output_complete and not defer_limits:
+            self._incomplete(res.termination_reason, agent=name)
         return res
 
     def _agent_failed(self, res: AgentResult, who: str) -> Abort:
@@ -411,6 +547,7 @@ class Orchestrator:
 
     def run_gates(self, label: str, *, strict: bool = False, fix_fmt: bool | None = None,
                   use_cache: bool = True) -> gates.GateResult:
+        self._check_budget()
         if self.opts.dry_run:
             self.log(f"gates [{label}]: skipped (dry run)")
             return gates.GateResult("full", True, None)
@@ -420,8 +557,10 @@ class Orchestrator:
             overrides["CARGO_TARGET_DIR"] = self.state["cargo_target_dir"]
         saved = {k: os.environ.get(k) for k in overrides}
         os.environ.update(overrides)
+        gate_cfg = gates.load_gate_config(self.workdir)
+        gate_cfg["max_output_bytes"] = self.budget.limits["max_output_bytes"] if self.budget else self.cfg.get("process.max_output_bytes", 16777216)
         try:
-            res = gates.run_gates(self.workdir, "full", strict=strict, use_cache=use_cache and not strict,
+            res = gates.run_gates(self.workdir, "full", cfg=gate_cfg, strict=strict, use_cache=use_cache and not strict,
                                   log_dir=self.run_dir / "gates" / label, fix_fmt=fix_fmt)
         finally:
             for k, v in saved.items():
@@ -432,6 +571,10 @@ class Orchestrator:
         (self.run_dir / "gates").mkdir(exist_ok=True)
         (self.run_dir / "gates" / f"{label}.json").write_text(json.dumps(res.to_dict(), indent=2), encoding="utf-8")
         self.log(f"gates [{label}]: {res.summary_line()}")
+        incomplete = next((s for s in res.steps if not s.output_complete), None)
+        if incomplete:
+            self._incomplete(incomplete.termination_reason, gate=label, step=incomplete.name)
+        self._check_budget()
         return res
 
     def snapshot(self) -> str:
@@ -494,7 +637,9 @@ class Orchestrator:
             raise Abort("error", "no Cargo.toml found")
         review_mode = self.opts.mode == "review"
         isolation = self.opts.isolation or ("none" if review_mode else self.cfg.get("project.isolation", "branch"))
-        dirty = gitutil.dirty_files(repo)
+        artifacts = self.state.get("preflight_artifacts", {})
+        dirty = [path for path in gitutil.dirty_files(repo)
+                 if not (artifacts.get(path) and _file_sha256(repo / path) == artifacts[path])]
         if dirty and not (self.opts.allow_dirty or review_mode) and isolation != "none":
             raise Abort("error", f"working tree is dirty ({len(dirty)} files, e.g. {dirty[0]}). "
                                  "Commit/stash first, or pass --allow-dirty.")
@@ -506,27 +651,46 @@ class Orchestrator:
                           original_branch=gitutil.head_branch(repo), isolation=isolation,
                           checkpoints=bool(self.cfg.get("project.checkpoint_commits", True)) and isolation != "none")
         branch = f"rustflow/{self.state['run_id']}"
-        if self.opts.dry_run:
-            self.log(f"isolation: {isolation} (dry run: not creating {branch})")
-        elif isolation == "branch":
-            gitutil.create_branch(repo, branch)
-            self.state["branch"] = branch
-            self.log(f"isolation: branch {branch} (from {self.state['original_branch']})")
-        elif isolation == "worktree":
-            wt = repo / ".rustflow" / "wt" / self.state["run_id"]
-            gitutil.add_worktree(repo, wt, branch, "HEAD")
-            self.state.update(branch=branch, workdir=str(wt), cargo_target_dir=str(repo / "target"))
-            self.log(f"isolation: worktree {wt} (branch {branch}, shared target/)")
-        else:
-            self.log("isolation: none (working in place, no checkpoint commits)")
+        if not self.opts.dry_run and isolation in ("branch", "worktree"):
+            # Never roll back a branch that existed before this preflight.
+            if gitutil.git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).strip():
+                raise Abort("error", f"isolation branch already exists: {branch}")
+        baseline_lock = None
+        lock_was_present = True
         try:
+            if self.opts.dry_run:
+                self.log(f"isolation: {isolation} (dry run: not creating {branch})")
+            elif isolation == "branch":
+                self.state["branch"] = branch
+                gitutil.create_branch(repo, branch)
+                self.log(f"isolation: branch {branch} (from {self.state['original_branch']})")
+            elif isolation == "worktree":
+                wt = repo / ".rustflow" / "wt" / self.state["run_id"]
+                self.state.update(branch=branch, workdir=str(wt), cargo_target_dir=str(repo / "target"))
+                gitutil.add_worktree(repo, wt, branch, "HEAD")
+                self.log(f"isolation: worktree {wt} (branch {branch}, shared target/)")
+            else:
+                self.log("isolation: none (working in place, no checkpoint commits)")
+            if isolation == "branch":
+                baseline_lock = (self.workdir / self.cfg.get("gates.cargo_dir", ".") / "Cargo.lock").resolve()
+                lock_was_present = baseline_lock.exists()
             self._preflight_checks(review_mode)
-        except Abort:
-            self._undo_isolation()
+            # Cargo.lock from baseline is part of the starting point, not agent work.
+            self.state["start_tree"] = self.snapshot()
+        except (Abort, BudgetExceeded, gates.IncompleteGate, gitutil.GitError, KeyboardInterrupt):
+            # Cleanup gets its own bounded grace period after the run deadline.
+            with execution_scope(deadline=time.monotonic() + 3, cancel=None,
+                                 max_output_bytes=DEFAULT_LIMITS["max_output_bytes"]):
+                # A lockfile generated by baseline cargo commands belongs to the
+                # starting tree. Preserve it, and trust it on resume only while
+                # its contents still match the stopped preflight's artifact.
+                if baseline_lock is not None and not lock_was_present and baseline_lock.is_relative_to(repo):
+                    digest = _file_sha256(baseline_lock)
+                    if digest:
+                        self.state.setdefault("preflight_artifacts", {})[
+                            baseline_lock.relative_to(repo).as_posix()] = digest
+                self._undo_isolation()
             raise
-        # Starting point of the work = base tree plus anything already in the tree (review mode), taken
-        # after the baseline gates: a Cargo.lock they create is not the implementer's work.
-        self.state["start_tree"] = self.snapshot()
         self.state["phase"] = "triage"
 
     def _undo_isolation(self) -> None:
@@ -543,7 +707,7 @@ class Orchestrator:
                 gitutil.git(self.repo, "switch", *(["--detach", self.state["base_sha"]] if orig == "HEAD" else [orig]))
             gitutil.git(self.repo, "branch", "-D", branch)
             self.log(f"isolation undone: {branch} removed, checkout unchanged")
-        except gitutil.GitError as exc:
+        except (gitutil.GitError, gates.IncompleteGate) as exc:
             self.log(f"could not undo isolation ({exc}); remove {branch} by hand")
 
     def _preflight_checks(self, review_mode: bool) -> None:
@@ -699,7 +863,6 @@ class Orchestrator:
         if attempts >= max_attempts:
             raise Abort("gates_red", f"gates still RED after {attempts} gate-fix attempts; not sending "
                                      "broken code to review.\n" + res.feedback()[:3000])
-        self.state["gate_fix_attempts"] = attempts + 1
         difficulty = self.state["difficulty"] if attempts == 0 else bump(self.state["difficulty"])
         prompt = prompts.gate_fix_prompt(self.state["task"], self.language, res.feedback(),
                                          attempts + 1, self.state.get("baseline_red"))
@@ -708,6 +871,7 @@ class Orchestrator:
         fix = self.call_agent("fixer", f"gatefix-r{self.state['round']}-a{attempts + 1}",
                               self.spec("fixer", difficulty), prompt, write=True, schema=None, skill="rustflow-fix")
         after = self.snapshot()
+        self.state["gate_fix_attempts"] = attempts + 1
         if not fix.ok and after == before and not self.opts.dry_run:
             self.state["gate_fix_attempts"] = attempts      # resume repeats this attempt
             raise self._agent_failed(fix, "the gate fixer")
@@ -765,19 +929,42 @@ class Orchestrator:
         if auditor and risk.escalation and rnd == 1 and self.cfg.get("roles.auditor.mode", "llm") == "llm":
             jobs.append(("auditor", AgentSpec.parse(auditor), prompts.audit_prompt(ctx, self.language)))
 
+        tickets = self.budget.reserve_group([name for name, _, _ in jobs]) if self.budget and not self.opts.dry_run else {}
         pool = ThreadPoolExecutor(max_workers=len(jobs))
+        futures = {}
         try:
             futures = {name: pool.submit(self.call_agent, name, f"r{rnd}-{name}", spec, prompt, write=False,
-                                         schema=schemas.REVIEW_SCHEMA, skill="rustflow-review")
+                                         schema=schemas.REVIEW_SCHEMA, skill="rustflow-review",
+                                         reservation=tickets.get(name), defer_limits=True)
                        for name, spec, prompt in jobs}
+            # Observe failures as soon as any worker finishes. Polling also keeps
+            # Windows lock waits interruptible and checks the shared deadline.
+            pending = set(futures.values())
+            while pending:
+                done, pending = wait_futures(pending, timeout=.1, return_when=FIRST_COMPLETED)
+                self._check_budget()
+                for future in done:
+                    result = future.result()
+                    if not result.output_complete and result.termination_reason != "agent_call_limit":
+                        self._incomplete(result.termination_reason, agent=result.name)
             results = {name: fut.result() for name, fut in futures.items()}
         except BaseException:
             # Reviewers run in their own process groups and do not see Ctrl+C: kill them now instead
             # of waiting up to timeout_min for the threads to finish.
+            if self.budget:
+                self.budget.cancel.set()  # wake retry waits and prevent any later admission
             procutil.kill_all()
             pool.shutdown(wait=False, cancel_futures=True)
+            wait_futures(futures.values(), timeout=3)
             raise
+        finally:
+            if self.budget:
+                self.budget.release_group(tickets.values())
         pool.shutdown(wait=True)
+        for name, result in results.items():
+            if not result.output_complete:
+                self._incomplete(result.termination_reason, agent=name)
+        self._check_budget()
         if not self.opts.dry_run and self.snapshot() != head:
             # Findings, anchors and the verdict describe `head`; the files are no longer that tree.
             self.state["round"] = rnd - 1
@@ -899,6 +1086,8 @@ class Orchestrator:
             try:
                 diags = gates.advisory_clippy(self.workdir, lints, ranges, cfg=gates.load_gate_config(self.workdir))
                 out += [d.short() for d in diags]
+            except gates.IncompleteGate as exc:
+                self._incomplete(exc.step.termination_reason, gate="advisory")
             except Exception as exc:  # advisory only - never fail the run
                 self.log(f"advisory clippy failed: {exc}")
         for tool in self.cfg.get("review.advisory", []) or []:
@@ -911,6 +1100,8 @@ class Orchestrator:
                 self.log(f"advisory tool not found: {tool['cmd'][0]}")
                 continue
             r = procutil.run(argv, cwd=self.workdir, timeout_s=float(tool.get("timeout_s", 600)))
+            if not r.output_complete:
+                self._incomplete(r.termination_reason, gate="advisory")
             text = (r.stdout + "\n" + r.stderr).strip()
             hits = [l for l in text.splitlines() if any(f in l for f in ranges)][:40]
             if hits:
@@ -994,7 +1185,7 @@ class Orchestrator:
 
 
 def _install_interrupt_handlers() -> None:
-    """`rustflow cancel` sends SIGINT (POSIX) / CTRL_BREAK (Windows); SIGTERM from a supervisor too.
+    """`rustflow cancel` sends SIGINT / Windows console signals; SIGTERM from a supervisor too.
     All become KeyboardInterrupt -> agents are killed, state saved as `interrupted` (resumable)."""
     import signal
     import threading
@@ -1003,6 +1194,11 @@ def _install_interrupt_handlers() -> None:
 
     def handler(signum, frame):  # noqa: ARG001
         raise KeyboardInterrupt
+    if os.name == "nt" and os.environ.get("RUSTFLOW_PRIVATE_CONSOLE") == "1":
+        import ctypes
+        # A parent's "ignore Ctrl+C" console attribute is inherited even by a new console.
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
+        signal.signal(signal.SIGINT, handler)
     for name in ("SIGTERM", "SIGBREAK"):
         sig = getattr(signal, name, None)
         if sig is not None:
