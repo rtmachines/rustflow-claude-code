@@ -81,7 +81,7 @@ def protected_edit_rules() -> list[str]:
     for p in CONFIG_PATTERNS:
         if not p.startswith(".cargo/config"):
             paths += [p, f"**/{p}"]
-    paths += [CARGO_CONFIG_RULE, RUSTFLOW_DIR_RULE]
+    paths += [CARGO_CONFIG_RULE[3:], CARGO_CONFIG_RULE, RUSTFLOW_DIR_RULE]   # `.cargo/config*` root + `**/` form
     return [f"{tool}({p})" for p in paths for tool in ("Edit", "Write")]
 
 
@@ -518,6 +518,25 @@ def _git_ok(root: Path, *args: str, env: dict | None = None) -> str:
     return r.stdout
 
 
+def _forget_worktree(root: Path, wt: Path) -> None:
+    """Delete the admin entry of THIS proof worktree only (a global `git worktree prune` would also drop the
+    user's unrelated worktrees whose directories are temporarily missing)."""
+    r = gates._git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if r.returncode != 0 or not r.stdout.strip():
+        return
+    admin = Path(r.stdout.strip()) / "worktrees"
+    if not admin.is_dir():
+        return
+    want = os.path.normcase(os.path.normpath(str(wt / ".git")))
+    for entry in admin.iterdir():
+        try:
+            gitdir = (entry / "gitdir").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if os.path.normcase(os.path.normpath(gitdir)) == want:
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def _remove_worktree(root: Path, wt: Path) -> None:
     try:
         gates._git(root, "worktree", "remove", "--force", str(wt))
@@ -525,15 +544,15 @@ def _remove_worktree(root: Path, wt: Path) -> None:
         pass
     shutil.rmtree(wt, ignore_errors=True)
     try:
-        gates._git(root, "worktree", "prune")
+        _forget_worktree(root, wt)
     except Exception:
         pass
 
 
 def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], profile: str, cfg: dict,
-          log_dir: Path | None = None) -> ProofResult:
+          log_dir: Path | None = None, target_dir: str | None = None) -> ProofResult:
     """Run the gates on `head_tree` with the base configuration restored and the added silencing attributes
-    stripped, in a temporary worktree. Passing means the provable changes do not hide any failure.
+    stripped, in a temporary worktree (built into `target_dir` when given, else `<root>/target`). Passing means the provable changes do not hide any failure.
     Fail-closed: any error or incomplete gate output is `failed`."""
     provable = [c for c in changes if c.provable]
     if not provable:
@@ -544,11 +563,11 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
     saved_base = os.environ.get("RUSTFLOW_BASE")
     try:
         _prepare_wt_parent(wt)
-        shutil.rmtree(wt, ignore_errors=True)
-        gates._git(root, "worktree", "prune")
+        _remove_worktree(root, wt)   # a crashed earlier proof; targeted, never a global prune
         env = {f"GIT_{who}_{f}": v for who in ("AUTHOR", "COMMITTER") for f, v in (("NAME", "rustflow"), ("EMAIL", "rustflow@localhost"))}
         commit = _git_ok(root, "commit-tree", head_tree, "-m", "proof", env=env).strip()
-        _git_ok(root, "worktree", "add", "--detach", str(wt), commit)
+        # no repo hooks: a post-checkout hook in the tree (core.hooksPath) would run inside the proof worktree
+        _git_ok(root, "-c", f"core.hooksPath={os.devnull}", "worktree", "add", "--detach", str(wt), commit)
         for c in provable:
             if c.kind == "config":
                 base = gates._git(root, "show", f"{base_rev}:{c.path}")
@@ -569,7 +588,7 @@ def prove(root: Path, base_rev: str, head_tree: str, changes: list[GateChange], 
                 with open(f, "w", encoding="utf-8", newline="") as fh:
                     fh.write(_strip_verified(text, added[c.path], all_added.get(c.path, set()), c.path))
         if not had_target:
-            os.environ["CARGO_TARGET_DIR"] = str(root / "target")
+            os.environ["CARGO_TARGET_DIR"] = target_dir or str(root / "target")
         os.environ["RUSTFLOW_BASE"] = base_rev   # the semver gate compares against the base, not crates.io
         res = gates.run_gates(wt, profile, cfg=cfg, strict=(profile == "full"), use_cache=False,
                               log_dir=log_dir, fix_fmt=False)

@@ -651,7 +651,8 @@ class Orchestrator:
                 e["proof"] = e["proof_tree"] = ""
         if any(e["provable"] and not e["proof"] for e in entries):
             result = integrity.prove(self.workdir, self.state["base_sha"], head, changes, "full", cfg,
-                                     log_dir=self.run_dir / "gates" / f"proof-{label}")
+                                     log_dir=self.run_dir / "gates" / f"proof-{label}",
+                                     target_dir=self.state.get("cargo_target_dir"))
             self.log(f"gate-change proof [{label}]: {result.status} - {result.summary} {result.error}".rstrip())
             integrity.apply_proof(entries, result, head)
             self._check_budget()
@@ -662,18 +663,20 @@ class Orchestrator:
                      + (f" (by {e['accepted_by']})" if e["accepted_by"] else "") + f": {e['detail'][:100]}")
 
     def _votable_gate_changes(self) -> str:
-        """Pending changes the reviewers may vote on (not provable, not unknown), with the justifications."""
-        impl = ((self.state.get("implementation") or {}).get("summary") or "").strip()
+        """Pending changes the reviewers may vote on (not provable, not unknown). Everything implementer- or
+        fixer-controlled (paths, details, summary, justification) is sanitized and bounded."""
+        safe = gates.display_safe
+        impl = safe(((self.state.get("implementation") or {}).get("summary") or "").strip(), 500)
         out = []
         for e in self.state.get("gate_changes") or []:
             if e.get("provable") or e["kind"] == "unknown" or e["status"] != "pending":
                 continue
-            lines = [f"- [{e['id']}] {e['kind']} in `{e['path']}`: {e['detail']}"]
-            if impl:
-                lines.append(f"  implementer's summary: {impl[:500]}")
+            lines = [f"- [{safe(e['id'], 200)}] {safe(e['kind'], 40)} in `{safe(e['path'], 200)}`: {safe(e['detail'], 300)}"]
             if e.get("justification"):
-                lines.append(f"  fixer's justification: {e['justification'][:500]}")
+                lines.append(f"  fixer's justification (claim): {safe(e['justification'], 500)}")
             out.append("\n".join(lines))
+        if out and impl:
+            out.append(f"implementer's summary (claim, once for all changes above): {impl}")
         return "\n".join(out)
 
     def _gate_findings(self, rnd: int, prev_open: list[fnd.Finding]) -> list[fnd.Finding]:
@@ -685,7 +688,7 @@ class Orchestrator:
             out.append(fnd.Finding(
                 id=fid, severity="P1", category="gate-integrity",
                 file=e["path"] if (self.workdir / e["path"]).exists() else "", line=0,
-                title=f"Gate-affecting change ({e['kind']}): {e['detail']}",
+                title=f"Gate-affecting change ({gates.display_safe(e['kind'], 40)}): {gates.display_safe(e['detail'], 200)}",
                 trigger="the change alters what the gates check or how strictly (detected by the orchestrator)",
                 impact="a gate can pass because of this change instead of because the code is correct",
                 rule="gate-affecting changes need a proof that they hide nothing (or reviewer consent)",

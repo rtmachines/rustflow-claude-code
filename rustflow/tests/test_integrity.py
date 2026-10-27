@@ -327,7 +327,7 @@ def test_prove_worktree_error_fails(rust_repo, monkeypatch):
     real = integrity.gates._git
 
     def fake(root, *args, **kw):
-        if args[:2] == ("worktree", "add"):
+        if "worktree" in args and "add" in args:
             import subprocess
             return subprocess.CompletedProcess(args, 1, "", "boom")
         return real(root, *args, **kw)
@@ -832,3 +832,48 @@ def test_cache_key_covers_ignored_config(repo):
     assert k1 != head(repo) and k1.startswith(head(repo))
     write(repo, ".cargo/config.toml", "[term]\nverbose = true\n")
     assert gates.cache_key(repo, head(repo)) != k1
+
+
+# ── M1/M2/M3: proof worktree hygiene ────────────────────────────────────────
+def _stub_gates(monkeypatch, seen=None):
+    from types import SimpleNamespace
+
+    def fake(wt, profile, **kw):
+        if seen is not None:
+            seen["target"] = os.environ.get("CARGO_TARGET_DIR")
+        return SimpleNamespace(steps=[], ok=True, summary_line=lambda: "stub")
+    monkeypatch.setattr(integrity.gates, "run_gates", fake)
+
+
+def test_proof_worktree_does_not_run_repo_hooks(repo, monkeypatch, tmp_path):
+    marker = tmp_path / "hook-ran"
+    write(repo, ".githooks/post-checkout", f"#!/bin/sh\ntouch '{marker}'\n")
+    os.chmod(repo / ".githooks" / "post-checkout", 0o755)
+    git(repo, "config", "core.hooksPath", ".githooks")
+    commit(repo)
+    write(repo, "src/lib.rs", "#![allow(dead_code)]\npub fn a() {}\n")
+    _stub_gates(monkeypatch)
+    assert proof(repo).status == "passed"
+    assert not marker.exists()
+
+
+def test_proof_uses_the_given_target_dir(repo, monkeypatch, tmp_path):
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    write(repo, "src/lib.rs", "#![allow(dead_code)]\npub fn a() {}\n")
+    seen: dict = {}
+    _stub_gates(monkeypatch, seen)
+    assert proof(repo, target_dir=str(tmp_path / "shared-target")).status == "passed"
+    assert seen["target"] == str(tmp_path / "shared-target")
+    assert "CARGO_TARGET_DIR" not in os.environ
+
+
+def test_proof_does_not_prune_unrelated_worktrees(repo, monkeypatch, tmp_path):
+    other = tmp_path / "other-wt"
+    git(repo, "worktree", "add", "-q", "--detach", str(other))
+    shutil.rmtree(other)   # e.g. removable media: the directory is temporarily gone
+    write(repo, "src/lib.rs", "#![allow(dead_code)]\npub fn a() {}\n")
+    _stub_gates(monkeypatch)
+    assert proof(repo).status == "passed"
+    assert "other-wt" in git(repo, "worktree", "list", "--porcelain")
+    assert not wt_dirs(repo)
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 2   # main + the unrelated one

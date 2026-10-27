@@ -307,7 +307,7 @@ def test_write_roles_get_path_deny_rules(tmp_path, fake_defaults):
     assert write.count("--disallowedTools") == 1
     rules = _arg(write, "--disallowedTools").split(",")
     assert "Edit(rustflow.toml)" in rules and "Write(.rustflow/**)" in rules
-    assert "Edit(**/.cargo/config*)" in rules and "Write(clippy.toml)" in rules
+    assert "Edit(.cargo/config*)" in rules and "Edit(**/.cargo/config*)" in rules and "Write(clippy.toml)" in rules
     read = runner.build_argv(_call(tmp_path))
     assert read.count("--disallowedTools") == 1
     assert not any("(" in r for r in _arg(read, "--disallowedTools").split(","))
@@ -319,5 +319,5 @@ def test_protected_edit_rules_exact_list():
     from rustflow import integrity
     names = ["rustflow.toml", ".config/nextest.toml", "clippy.toml", ".clippy.toml", "rustfmt.toml",
              ".rustfmt.toml", "rust-toolchain", "rust-toolchain.toml", "deny.toml", ".gitattributes"]
-    paths = [q for n in names for q in (n, f"**/{n}")] + ["**/.cargo/config*", ".rustflow/**"]
+    paths = [q for n in names for q in (n, f"**/{n}")] + [".cargo/config*", "**/.cargo/config*", ".rustflow/**"]
     assert integrity.protected_edit_rules() == [f"{t}({p})" for p in paths for t in ("Edit", "Write")]
