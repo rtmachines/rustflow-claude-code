@@ -215,6 +215,7 @@ def test_init_copies_integrity(tmp_path):
     assert (tmp_path / ".rustflow" / "integrity.py").is_file()
 
 
+@pytest.mark.skipif(os.name == "nt", reason='`"` is not allowed in Windows file names')
 def test_quoted_path_is_still_scanned(repo):
     write(repo, 'we"ird.rs', "#[test]\nfn q() {}\n")
     git(repo, "add", "-A")
@@ -242,9 +243,14 @@ def test_strip_attributes_only_added_positions():
     assert strip_attributes(src, [5]) == "#[test]\n#[ignore]\nfn a(){}\n#[test]\nfn b(){}\n"
 
 
+def set_cache_base(monkeypatch, path):
+    """Point the per-user proof cache (integrity._cache_base) at `path` on every OS."""
+    monkeypatch.setenv("LOCALAPPDATA" if os.name == "nt" else "XDG_CACHE_HOME", str(path))
+
+
 @pytest.fixture(autouse=True)
 def xdg(tmp_path_factory, monkeypatch):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path_factory.mktemp("xdg")))
+    set_cache_base(monkeypatch, tmp_path_factory.mktemp("xdg"))
 
 
 LIB_OK = "pub fn a() -> i32 {\n    1\n}\n"
@@ -411,7 +417,10 @@ def test_prove_ancestor_cargo_config_fails(rust_repo, monkeypatch, tmp_path):
     cache = tmp_path / "planted"
     cache.mkdir()
     write(cache, ".cargo/config.toml", '[build]\nrustflags = ["--cap-lints", "allow"]\n')
-    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    set_cache_base(monkeypatch, cache)
+    h = head(rust_repo)
+    changes = scan(rust_repo, "HEAD", h, gates.load_gate_config(rust_repo))
+    assert [(c.kind, c.path) for c in changes] == [("silence", "src/lib.rs")], changes
     r = proof(rust_repo)
     assert r.status == "failed" and ".cargo" in r.error, r
 

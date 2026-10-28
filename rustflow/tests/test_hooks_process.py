@@ -132,7 +132,7 @@ def test_integrity_exception_blocks(rust_repo):
     assert "Revert them" not in d["reason"]
 
 
-def test_missing_integrity_module_names_file(monkeypatch):
+def test_missing_integrity_module_names_file(monkeypatch, git_repo):
     import pytest
     from rustflow import hooks
     monkeypatch.setitem(sys.modules, "integrity", None)
@@ -140,7 +140,8 @@ def test_missing_integrity_module_names_file(monkeypatch):
     monkeypatch.delattr(__import__("rustflow"), "integrity", raising=False)
     with pytest.raises(RuntimeError, match=r"\.rustflow/integrity\.py"):
         hooks._integrity()
-    ok, why, internal = hooks._integrity_verdict(__import__("pathlib").Path("."), {})
+    # a repo with a commit: without HEAD the verdict returns "no commit yet" before importing integrity
+    ok, why, internal = hooks._integrity_verdict(git_repo, {})
     assert not ok and internal and ".rustflow/integrity.py" in why and "rustflow doctor" in why
 
 
