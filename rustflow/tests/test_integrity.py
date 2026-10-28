@@ -866,12 +866,23 @@ def test_proof_worktree_does_not_run_repo_hooks(repo, monkeypatch, tmp_path):
     assert not marker.exists()
 
 
+def test_tree_fingerprint_is_stable(repo):
+    """The same tree must always give the same fingerprint."""
+    write(repo, "src/lib.rs", "#![allow(dead_code)]\npub fn a() {}\n")
+    fps = [gates.tree_fingerprint(repo) for _ in range(5)]
+    assert None not in fps and len(set(fps)) == 1, fps
+
+
 def test_proof_uses_the_given_target_dir(repo, monkeypatch, tmp_path):
     monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
     write(repo, "src/lib.rs", "#![allow(dead_code)]\npub fn a() {}\n")
     seen: dict = {}
     _stub_gates(monkeypatch, seen)
-    assert proof(repo, target_dir=str(tmp_path / "shared-target")).status == "passed"
+    h = head(repo)
+    changes = scan(repo, "HEAD", h, gates.load_gate_config(repo))
+    assert any(c.kind == "silence" for c in changes), changes
+    r = proof(repo, target_dir=str(tmp_path / "shared-target"))
+    assert r.status == "passed" and r.summary == "stub", r
     assert seen["target"] == str(tmp_path / "shared-target")
     assert "CARGO_TARGET_DIR" not in os.environ
 
@@ -886,3 +897,21 @@ def test_proof_does_not_prune_unrelated_worktrees(repo, monkeypatch, tmp_path):
     assert "other-wt" in git(repo, "worktree", "list", "--porcelain")
     assert not wt_dirs(repo)
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 2   # main + the unrelated one
+
+
+def test_tree_fingerprint_sees_same_size_edit_in_the_index_second(repo):
+    """A same-size edit stamped within the index's own second is only detectable through git's racy-entry check,
+    which compares entries against the index file's mtime: the fingerprint's index copy must keep that mtime."""
+    import time
+    old = (repo / "src" / "lib.rs").read_bytes()
+    new = old.replace(b"fn a()", b"fn b()")
+    assert len(new) == len(old)
+    stamp = int(time.time()) - 5                      # entries and index written in one (past) second
+    ns = stamp * 1_000_000_000
+    os.utime(repo / "src" / "lib.rs", ns=(ns, ns))
+    git(repo, "update-index", "--refresh")              # the index entry records `stamp`
+    os.utime(repo / ".git" / "index", ns=(ns + 900_000_000, ns + 900_000_000))
+    (repo / "src" / "lib.rs").write_bytes(new)          # same size, same second
+    os.utime(repo / "src" / "lib.rs", ns=(ns + 500_000_000, ns + 500_000_000))
+    tree = head(repo)
+    assert git(repo, "rev-parse", f"{tree}:src/lib.rs").strip() == git(repo, "hash-object", "src/lib.rs").strip()

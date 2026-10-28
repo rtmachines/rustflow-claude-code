@@ -381,7 +381,9 @@ def tree_fingerprint(root: Path) -> str | None:
     os.close(fd)
     try:
         if real_index.is_file():
-            shutil.copyfile(real_index, tmp)
+            # copy2 keeps the index file's mtime: git re-checks entries stamped in the same second as the
+            # index (racy git). A fresh mtime made a same-size edit in that second look clean (Windows CI).
+            shutil.copy2(real_index, tmp)
         else:
             os.unlink(tmp)
         env = {"GIT_INDEX_FILE": tmp}
