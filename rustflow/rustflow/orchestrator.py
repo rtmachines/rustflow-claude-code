@@ -1117,7 +1117,9 @@ class Orchestrator:
             escalation_signals=risk.escalation,
         )
         self.state["id_counter"] = ids.n
-        agg.findings[:0] = self._mechanical_findings(rnd, prev_blocking) + self._gate_findings(rnd, prev_blocking)
+        mechanical = self._mechanical_findings(rnd, prev_blocking)
+        agg.findings = fnd.fold_into_mechanical(agg.findings, mechanical)
+        agg.findings[:0] = mechanical + self._gate_findings(rnd, prev_blocking)
         self.state["findings"] = [f.to_dict() for f in agg.findings]
         self.state["last_review_tree"] = head
         self.state["escalate"] = bool(self.state.get("escalate")) or agg.escalate

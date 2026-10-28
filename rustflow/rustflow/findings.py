@@ -131,6 +131,22 @@ def similar(a: Finding, b: Finding) -> bool:
     return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= 0.3
 
 
+def fold_into_mechanical(findings: list[Finding], mechanical: list[Finding]) -> list[Finding]:
+    """A reviewer's anchorless `not_met` for criterion [Cn] restates the mechanical T-Cn (its required test did
+    not pass): keep the one mechanical finding and record the reviewers' view in its `also`. Anchored findings
+    stay - they point at the code to fix."""
+    by_id = {m.id[2:]: m for m in mechanical if m.id.startswith("T-")}
+    kept = []
+    for f in findings:
+        cid = next((c for c in by_id if f"[{c}]" in f.title), None) if (
+            f.category == "acceptance" and not f.file and not f.mechanical) else None
+        if cid is None:
+            kept.append(f)
+            continue
+        by_id[cid].also.append({"reviewer": ", ".join(f.reviewers), "title": f.title, "trigger": f.trigger})
+    return kept
+
+
 def _evidence(f: Finding) -> dict:
     return {"reviewer": ",".join(f.reviewers), "file": f.file, "line": f.line, "title": f.title,
             "trigger": f.trigger, "impact": f.impact}

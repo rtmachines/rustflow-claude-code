@@ -211,6 +211,22 @@ def test_rereview_auto_is_the_default_and_validated():
         Config(data).validate()
 
 
+def test_reviewer_not_met_folds_into_the_mechanical_finding_of_the_same_criterion():
+    mech = fnd.Finding(id="T-C1", severity="P1", category="acceptance", file="", line=0,
+                       title="Required test `tests::t` (C1): did not run", reviewers=["orchestrator"])
+    folded = fnd.Finding(id="F1", severity="P1", category="acceptance", file="", line=0,
+                         title="Acceptance criterion not met: [C1] keys are trimmed", trigger="no trim",
+                         reviewers=["reviewer_a", "reviewer_b"])
+    other = fnd.Finding(id="F2", severity="P1", category="acceptance", file="", line=0,
+                        title="Acceptance criterion not met: [C2] errors are typed", reviewers=["reviewer_b"])
+    anchored = fnd.Finding(id="F3", severity="P1", category="docs", file="src/lib.rs", line=3,
+                           title="no trim", rule="Unmet acceptance criterion: [C1] keys are trimmed",
+                           reviewers=["reviewer_a"])
+    kept = fnd.fold_into_mechanical([folded, other, anchored], [mech])
+    assert [f.id for f in kept] == ["F2", "F3"]       # other criterion and anchored code defects stay
+    assert [(a["reviewer"], a["trigger"]) for a in mech.also] == [("reviewer_a, reviewer_b", "no trim")]
+
+
 def test_p0_blocks_even_with_low_confidence(src):
     agg = fnd.aggregate({"a": _review([_f(sev="P0", conf="low")])}, root=src, round_no=1, previous=[],
                         ids=fnd.IdAllocator(), block_on=["P1"])

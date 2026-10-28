@@ -147,7 +147,7 @@ def review(prompt):
     if SCENARIO in TR_SCENARIOS and not (SCENARIO == "tests_removed_more" and earlier_calls(ROLE) > 0):  # consent in the first review only
         votes = [{"id": g, "decision": "accept", "reason": "obsolete test"} for g in gate_ids(prompt)]
     return {"summary": f"{ROLE} review", "verdict": verdict, "gate_changes": votes, "findings": findings, "disputes": disputes,
-            "acceptance": [{"criterion": "trim whitespace",
+            "acceptance": [{"criterion": ("[C1] " if "[C1]" in prompt else "") + "trim whitespace",
                             "status": "met" if fixed or blind or SCENARIO == "dispute" else "not_met", "note": ""}],
             "residual_risks": []}
 
