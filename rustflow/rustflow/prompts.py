@@ -160,6 +160,8 @@ Method:
 4. Re-read every cited line. `file` is repo-relative, `line` is the line number in the NEW version.
 5. acceptance: list every explicit requirement of the TASK (and the acceptance criteria below) with
    met | not_met | unclear; for a listed criterion begin `criterion` with its id, e.g. `[C1] ...`.
+   For not_met, report the gap once as an anchored finding and set `finding` to its 0-based index in
+   your `findings`; otherwise `finding` is null.
    Whether a named required test passes is checked by the orchestrator, not
    by you; your job is whether the code meets the criterion and whether that test really exercises it
    (a test that would pass without the change, or asserts nothing relevant, makes it not_met).

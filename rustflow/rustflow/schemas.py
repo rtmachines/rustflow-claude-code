@@ -45,6 +45,8 @@ REVIEW_SCHEMA = _obj({
         "criterion": STR,
         "status": {"type": "string", "enum": ["met", "not_met", "unclear"]},
         "note": STR,
+        # not_met: 0-based index into this review's `findings` of the finding that describes the gap, else null
+        "finding": {"type": ["integer", "null"]},
     })},
     "residual_risks": STR_LIST,
     # votes on gate-affecting changes listed in the prompt; absent = no vote (the validator defaults it to [])

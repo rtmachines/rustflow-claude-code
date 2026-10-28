@@ -9,7 +9,7 @@ import pytest
 from conftest import git
 
 from rustflow import findings as fnd
-from rustflow import gates, gitutil, hooks, procutil, schemas, triage
+from rustflow import gates, gitutil, hooks, procutil, prompts, schemas, triage
 from rustflow.agents import AgentCall, ClaudeRunner, CodexRunner, compose_prompt
 from rustflow.config import AgentSpec, Config, ConfigError, deep_merge, load_defaults
 from rustflow.installer import Installer
@@ -54,6 +54,7 @@ def test_spec_parse():
 ])
 def test_triage(task, expected):
     assert triage.heuristic(task, None, Config(load_defaults())).difficulty == expected
+
 
 
 # ── schemas ──────────────────────────────────────────────────────────────────
@@ -121,6 +122,38 @@ def test_merge_confirm_and_policy(src):
     assert len(agg.dropped) == 1                       # ghost file
     statuses = sorted(f.status for f in agg.findings)
     assert statuses == ["advisory", "advisory", "open"]  # P2 -> advisory; single low-confidence P1 -> advisory
+
+
+def _not_met(link):
+    return {"criterion": "[C3] doc comments with an example on public items", "status": "not_met",
+            "note": "the error enum has no example", "finding": link}
+
+
+def test_not_met_linked_to_own_finding_promotes_it_instead_of_duplicating(src):
+    # Live runs: a reviewer reported "enum lacks an example" as P2/P3 AND not_met; rustflow added a second,
+    # anchorless P1 for the same defect. An unmet requirement is P1 (REVIEW.md) - once, on the anchored finding.
+    review = _review([_f(line=7, sev="P3", cat="docs", title="enum lacks an example", conf="medium")])
+    review["acceptance"] = [_not_met(0)]
+    review = schemas.validate(review, schemas.REVIEW_SCHEMA)
+    agg = fnd.aggregate({"b": review}, root=src, round_no=1, previous=[], ids=fnd.IdAllocator(), block_on=["P0", "P1"])
+    assert len(agg.findings) == 1
+    f = agg.findings[0]
+    assert (f.severity, f.file, f.line, f.status) == ("P1", "src/lib.rs", 7, "open")
+    assert "[C3]" in f.rule
+
+
+def test_not_met_without_a_valid_link_still_blocks_as_its_own_finding(src):
+    for link in (None, 5):
+        review = _review([])
+        review["acceptance"] = [_not_met(link)]
+        agg = fnd.aggregate({"b": review}, root=src, round_no=1, previous=[], ids=fnd.IdAllocator(),
+                            block_on=["P0", "P1"])
+        assert [(f.category, f.severity) for f in agg.blocking()] == [("acceptance", "P1")]
+
+
+def test_review_prompt_asks_to_link_unmet_criteria_to_findings():
+    ctx = prompts.ReviewContext(task="t", base="b", head_tree="h", diff_stat="", diff_inline="", gates_summary="")
+    assert "`finding`" in prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")
 
 
 def test_p0_blocks_even_with_low_confidence(src):
