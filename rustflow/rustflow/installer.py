@@ -164,6 +164,8 @@ class Installer:
         self.out("")
         self.out("Next: `rustflow doctor`, then commit the files above (hooks/skills must be committed for")
         self.out("worktree isolation and for your team). In Claude Code run /hooks to confirm the hooks.")
+        self.out("Then `rustflow lints` measures lints that enforce REVIEW.md rules (unwrap, `let _ =`, #[allow]")
+        self.out("without reason, ...); `--apply` adopts the ones the code already satisfies.")
 
     def _block(self, name: str, block: str) -> None:
         path = self.repo / name

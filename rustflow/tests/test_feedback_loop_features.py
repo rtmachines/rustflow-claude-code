@@ -25,7 +25,7 @@ def _ws(tmp_path):
         "//! core\n/// Parses.\npub fn parse(s: &str) -> Option<i32> {\n    s.trim().parse().ok()\n}\n\n"
         "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        assert_eq!(super::parse(\" 4 \").unwrap(), 4);\n    }\n}\n")
     (ws / "crates" / "cli" / "src" / "main.rs").write_text(
-        'fn main() {\n    let v: i32 = "3".parse().unwrap();\n    println!("{v}");\n}\n')
+        'fn main() {\n    let v: i32 = "3".parse().unwrap();\n    let _ = std::fs::remove_file("none");\n    println!("{v}");\n}\n')
     return ws
 
 
@@ -38,14 +38,26 @@ def test_lint_ratchet_adopts_only_satisfied_lints(tmp_path, monkeypatch):
     root = (ws / "Cargo.toml").read_text()
     assert 'unsafe_code = "forbid"' in root and 'await_holding_lock = "deny"' in root
     assert "unwrap_used" not in root and "print_stdout" not in root      # cli violates them
+    # REVIEW.md rules as lints: `let _ =` / `.ok()` swallowing, `#[allow]` without a reason, panicking indexing
+    assert "let_underscore_must_use" not in root                          # cli swallows a Result
+    for lint in ("unused_result_ok", "allow_attributes_without_reason", "indexing_slicing"):
+        assert f'{lint} = "warn"' in root
     assert (ws / "crates" / "core" / "Cargo.toml").read_text().rstrip().endswith("[lints]\nworkspace = true")
-    assert "allow-expect-in-tests = true" in (ws / "clippy.toml").read_text()
+    conf = (ws / "clippy.toml").read_text()
+    assert "allow-expect-in-tests = true" in conf and "allow-indexing-slicing-in-tests = true" in conf
     assert any("clippy -D warnings after apply: PASS" in l for l in out)
     # second run: everything already configured, nothing written twice
     out2: list[str] = []
     lints.run(ws, do_apply=True, exclude={"missing_docs"}, out=out2.append)
     assert (ws / "Cargo.toml").read_text().count("unsafe_code") == 1
     assert any("already configured" in l for l in out2)
+
+
+def test_init_points_to_the_lint_ratchet(tmp_path):
+    (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
+    out: list[str] = []
+    Installer(tmp_path, with_rust_skills=False, python_cmd="python3", ci=False, out=out.append).run()
+    assert any("rustflow lints" in line for line in out)
 
 
 def test_insert_entries_into_existing_section():
