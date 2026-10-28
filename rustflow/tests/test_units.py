@@ -607,6 +607,35 @@ def test_semver_skipped_without_tool(tmp_path, monkeypatch):
     assert not st2.ok and not st2.skipped
 
 
+REGISTRY_MISS = ("error: failed to retrieve index of crate versions from registry\n\nCaused by:\n"
+                 "    tc3emu not found in registry (crates.io). For workarounds check https://github.com/obi1kenobi/"
+                 "cargo-semver-checks#does-the-crate-im-checking-have-to-be-published-on-cratesio\n")
+
+
+def _semver(tmp_path, monkeypatch, mode, stderr, rc=1):
+    monkeypatch.setattr(gates, "has_tool", lambda *a: True)
+    monkeypatch.delenv("RUSTFLOW_BASE", raising=False)
+    runner = gates.GateRunner(tmp_path, {**gates.DEFAULT_GATES, "semver": mode})
+    monkeypatch.setattr(runner, "publishable_libs", lambda: ["tc3emu"])
+    monkeypatch.setattr(runner, "_exec", lambda name, argv, timeout=3600: (rc, "", stderr, 0.5))
+    return runner.semver()
+
+
+def test_semver_without_a_registry_baseline_is_not_an_api_break(tmp_path, monkeypatch):
+    # Live: an unpublished crate without `publish = false` turned standalone/CI gates red with
+    # "public API change without a semver-compatible version bump".
+    st = _semver(tmp_path, monkeypatch, "auto", REGISTRY_MISS)
+    assert st.ok and st.skipped
+    assert "public API change" not in st.reason and "publish = false" in st.reason
+    st2 = _semver(tmp_path, monkeypatch, "always", REGISTRY_MISS)
+    assert not st2.ok and not st2.skipped and "public API change" not in st2.reason
+
+
+def test_semver_real_api_break_still_fails(tmp_path, monkeypatch):
+    st = _semver(tmp_path, monkeypatch, "auto", "--- failure function_missing: pub fn removed or renamed ---\n")
+    assert not st.ok and st.reason == "public API change without a semver-compatible version bump"
+
+
 def test_risk_files():
     assert gates.risk_files(DIFF) == {"src/lib.rs": 3}
 

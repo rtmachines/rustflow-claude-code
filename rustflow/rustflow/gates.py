@@ -590,6 +590,9 @@ def database_url(root: Path) -> str:
     return ""
 
 
+_SEMVER_NO_BASELINE = re.compile(r"failed to retrieve index of crate versions|not found in registry", re.I)
+
+
 def publishable_libs_from_metadata(meta: dict) -> list[str]:
     out = []
     ws = set(meta.get("workspace_members") or [])
@@ -904,6 +907,13 @@ class GateRunner:
         if not libs:
             return self._step("semver", True, argv, skipped=True, reason="no publishable library crates")
         rc, out, err, dur = self._exec("semver", argv)
+        if rc != 0 and _SEMVER_NO_BASELINE.search(out + err):
+            # Without --baseline-rev the baseline comes from crates.io: an unpublished crate (or no network)
+            # is a missing baseline, not an API break.
+            why = ("no semver baseline: the crate is not on crates.io or the registry is unreachable (set "
+                   "`publish = false` for unpublished crates; rustflow runs compare against their base commit)")
+            return self._step("semver", mode != "always", argv, skipped=mode != "always", duration_s=dur,
+                              tail="" if mode != "always" else self._tail(out + err), reason=why)
         return self._step("semver", rc == 0, argv, duration_s=dur, tail="" if rc == 0 else self._tail(out + err),
                     reason="" if rc == 0 else "public API change without a semver-compatible version bump")
 
