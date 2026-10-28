@@ -145,7 +145,7 @@ Model triage uses the generic 30-minute role timeout and has no packaged per-cal
 | `max_review_rounds` | `3` | Maximum review rounds, including the first review; must be at least one. A remaining blocker at the limit ends with `max_rounds`. |
 | `max_gate_fix_attempts` | `2` | Maximum fixer attempts for a gate failure before stopping. |
 | `block_on` | `["P0", "P1"]` | Finding severities that can block. Allowed entries: `P0`, `P1`, `P2`, `P3`. Other severities remain advisory. Mechanical gate/acceptance failures are handled separately. |
-| `rereview` | `"both"` | `both` reruns both reviewers; `first` runs only `reviewer_a` from round two onward. |
+| `rereview` | `"auto"` | From round two: `auto` reruns only the reviewers whose blocking findings are still open, as long as the fix delta stays in the files those findings point at; both rerun when gate changes need votes, the delta has unsafe/FFI/atomics signals, the previous round lacked a reviewer, or a finding has no reviewer owner or no file. `both` always reruns both; `first` runs only `reviewer_a`. |
 | `allow_reject` | `true` | Allow the fixer to reject a finding with a reason through the resolution/dispute protocol. |
 | `min_confidence_single` | `"medium"` | Single-reviewer findings below this confidence become advisory. Choices: `low`, `medium`, `high`. |
 

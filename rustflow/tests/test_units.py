@@ -180,6 +180,37 @@ def test_review_prompt_asks_to_link_unmet_criteria_to_findings():
     assert "`finding`" in prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")
 
 
+def _open(reviewers, file="src/lib.rs", cat="correctness"):
+    return fnd.Finding(id="F1", severity="P1", category=cat, file=file, line=3, title="t", reviewers=list(reviewers))
+
+
+@pytest.mark.parametrize("kwargs,expected", [
+    ({}, ["reviewer_b"]),                                                       # only b has open findings
+    ({"delta_files": {"src/lib.rs", "src/other.rs"}}, ["reviewer_a", "reviewer_b"]),  # fix spread further
+    ({"gate_votes": True}, ["reviewer_a", "reviewer_b"]),                       # consent needs both votes
+    ({"risky_delta": True}, ["reviewer_a", "reviewer_b"]),                      # unsafe/FFI/atomics in the fix
+    ({"degraded": True}, ["reviewer_a", "reviewer_b"]),                         # last round lacked a reviewer
+    ({"open_findings": [_open(["reviewer_a", "reviewer_b"])]}, ["reviewer_a", "reviewer_b"]),
+    ({"open_findings": [_open(["orchestrator"], cat="tests")]}, ["reviewer_a", "reviewer_b"]),  # nobody owns it
+    ({"open_findings": [_open(["reviewer_b"], file="", cat="acceptance")]}, ["reviewer_a", "reviewer_b"]),
+    # live run A: an anchored P1 plus anchorless not_met entries, all from reviewer_b
+    ({"open_findings": [_open(["reviewer_b"]), _open(["reviewer_b"], file="", cat="acceptance")]}, ["reviewer_b"]),
+])
+def test_auto_rereview_selection(kwargs, expected):
+    from rustflow.orchestrator import auto_rereviewers
+    args = {"open_findings": [_open(["reviewer_b"])], "delta_files": {"src/lib.rs"}, "gate_votes": False,
+            "risky_delta": False, "degraded": False, **kwargs}
+    assert auto_rereviewers(**args) == expected
+
+
+def test_rereview_auto_is_the_default_and_validated():
+    assert Config(load_defaults()).get("loop.rereview") == "auto"
+    data = load_defaults()
+    data["loop"]["rereview"] = "some"
+    with pytest.raises(ConfigError, match="auto"):
+        Config(data).validate()
+
+
 def test_p0_blocks_even_with_low_confidence(src):
     agg = fnd.aggregate({"a": _review([_f(sev="P0", conf="low")])}, root=src, round_no=1, previous=[],
                         ids=fnd.IdAllocator(), block_on=["P1"])

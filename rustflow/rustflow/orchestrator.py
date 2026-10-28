@@ -39,6 +39,24 @@ RESUMABLE = ("interrupted", "budget", "crashed", "tree_changed", "agent_failed",
 CONTINUABLE = ("max_rounds", "stalled", "final_gates_red", "criteria_unmet", "gate_changes_pending")
 
 
+REVIEWERS = ["reviewer_a", "reviewer_b"]
+
+
+def auto_rereviewers(open_findings: list, delta_files: set[str], gate_votes: bool, risky_delta: bool,
+                     degraded: bool) -> list[str]:
+    """`rereview = "auto"`: from round 2 only the reviewers whose blocking findings are still open re-review,
+    as long as the fix stayed in the files those findings point at (findings without a file, e.g. unmet
+    acceptance criteria, pick their reviewer but say nothing about files). Both review when gate changes
+    need their votes, the delta carries unsafe/FFI/atomics signals, the last round lacked a reviewer, a
+    finding has no reviewer owner (mechanical, gate integrity), or no open finding points at a file."""
+    owners = {r for f in open_findings for r in f.reviewers if r in REVIEWERS}
+    files = {f.file for f in open_findings if f.file}
+    unowned = any(not set(f.reviewers) & set(REVIEWERS) for f in open_findings)
+    if gate_votes or risky_delta or degraded or unowned or not files or not delta_files <= files:
+        return list(REVIEWERS)
+    return [r for r in REVIEWERS if r in owners]
+
+
 @dataclass
 class Options:
     mode: str = "run"                 # run | review
@@ -1005,9 +1023,17 @@ class Orchestrator:
         difficulty = self.state["difficulty"]
         if risk.escalation:
             difficulty = "hard"
-        reviewers = ["reviewer_a", "reviewer_b"]
+        reviewers = list(REVIEWERS)
         if rnd > 1 and self.cfg.get("loop.rereview") == "first":
             reviewers = ["reviewer_a"]
+        elif rnd > 1 and self.cfg.get("loop.rereview") == "auto" and ctx.prev_tree:
+            delta_text = gitutil.diff(self.workdir, ctx.prev_tree, head)
+            reviewers = auto_rereviewers(
+                prev_blocking, set(gitutil.changed_files(self.workdir, ctx.prev_tree, head)), bool(ctx.gate_changes),
+                bool(gitutil.risk_signals(delta_text).escalation),
+                bool((self.state.get("rounds") or [{}])[-1].get("failed_reviewers")))
+            if reviewers != REVIEWERS:
+                self.log(f"rereview auto: only {', '.join(reviewers)} (open findings; fix stayed in their files)")
         jobs: list[tuple[str, AgentSpec, str]] = []
         for r in reviewers:
             lens = self.cfg.role_opt(r, "lens", "correctness")

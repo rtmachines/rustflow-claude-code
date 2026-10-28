@@ -147,8 +147,8 @@ class Config:
                 raise ConfigError(f"loop.block_on: unknown severity '{sev}'")
         if int(self.get("loop.max_review_rounds", 0)) < 1:
             raise ConfigError("loop.max_review_rounds must be >= 1")
-        if self.get("loop.rereview") not in ("both", "first"):
-            raise ConfigError("loop.rereview must be both | first")
+        if self.get("loop.rereview") not in ("both", "first", "auto"):
+            raise ConfigError("loop.rereview must be both | first | auto")
         if self.get("project.isolation") not in ("branch", "worktree", "none"):
             raise ConfigError("project.isolation must be branch | worktree | none")
         sources = str(self.get("providers.claude.setting_sources", "") or "").replace(" ", "")
