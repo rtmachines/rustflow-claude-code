@@ -279,7 +279,7 @@ def aggregate(
             used.add(prev.id)
 
     # Open findings whose reviewers produced no result this round (failed, or skipped by
-    # rereview="first") stay open unless the fixer fixed them - nobody has verified otherwise.
+    # rereview="first"/"auto") stay open unless the fixer fixed them - nobody has verified otherwise.
     participants = set(reviews)
     for prev in previous:
         if (prev.status == "open" and prev.id not in used and not set(prev.reviewers) & participants

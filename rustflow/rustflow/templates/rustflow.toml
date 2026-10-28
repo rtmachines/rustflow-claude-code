@@ -89,7 +89,9 @@ tob_allowed_tools = ["Agent", "Read", "Write", "Edit", "Glob", "Grep", "TaskCrea
 max_review_rounds = 3       # ile razy maksymalnie: review -> fix -> review
 max_gate_fix_attempts = 2   # ile razy fixer naprawia czerwone bramki zanim przerwiemy
 block_on = ["P0", "P1"]     # które severity blokują (dodaj "P2" dla surowszego trybu)
-rereview = "both"           # both | first  (kto robi re-recenzję w rundach >= 2)
+rereview = "auto"           # auto | both | first  (kto robi re-recenzję w rundach >= 2); auto = tylko recenzent
+                            # z otwartymi findingami, gdy poprawka nie wyszła poza ich pliki; obaj przy głosach
+                            # na zmiany bramek, sygnałach unsafe/FFI/atomics w delcie lub niepełnej rundzie
 allow_reject = true         # fixer może odrzucić finding z uzasadnieniem
 min_confidence_single = "medium"  # finding zgłoszony przez 1 recenzenta poniżej progu -> doradczy
 

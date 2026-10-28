@@ -128,7 +128,8 @@ def review(prompt):
     line = line_of(text, "split_once")
     fixed = ".trim()" in text
     findings, disputes = [], []
-    if not fixed:
+    blind = SCENARIO == "only_b" and ROLE == "reviewer_a"   # only reviewer_b sees the bug (rereview=auto)
+    if not fixed and not blind:
         prev = "F1" if round2 and SCENARIO != "nolabel" else None
         findings.append(finding("P1", "correctness", "src/lib.rs", line, "Whitespace around key/value is not trimmed", prev=prev))
         if round2 and SCENARIO == "dispute":
@@ -147,7 +148,7 @@ def review(prompt):
         votes = [{"id": g, "decision": "accept", "reason": "obsolete test"} for g in gate_ids(prompt)]
     return {"summary": f"{ROLE} review", "verdict": verdict, "gate_changes": votes, "findings": findings, "disputes": disputes,
             "acceptance": [{"criterion": "trim whitespace",
-                            "status": "met" if fixed or SCENARIO == "dispute" else "not_met", "note": ""}],
+                            "status": "met" if fixed or blind or SCENARIO == "dispute" else "not_met", "note": ""}],
             "residual_risks": []}
 
 

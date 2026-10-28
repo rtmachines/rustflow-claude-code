@@ -170,7 +170,7 @@ def effective_status(state: dict) -> str:
 # ── decision protocol ────────────────────────────────────────────────────────
 def degraded(state: dict) -> list[str]:
     """Reviewers planned for the last review round that returned no result (a planned single-reviewer
-    re-review, `rereview = "first"`, is not a failure)."""
+    re-review, `rereview = "first"` or `"auto"`, is not a failure)."""
     rounds = state.get("rounds") or []
     return list(rounds[-1].get("failed_reviewers") or []) if rounds else []
 
