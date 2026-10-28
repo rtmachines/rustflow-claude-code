@@ -149,6 +149,21 @@ JSON_REPAIR_PROMPT = ("Your last answer did not produce the required structured 
 ORCHESTRATED_NOTE = (" You were launched by the rustflow orchestrator: this prompt and its skill take precedence "
                      "over interactive-session rules in CLAUDE.md/AGENTS.md (e.g. 'use /rustflow-pr-review').")
 
+# Claude's system prompt is the same for every role: the prompt cache keys on the exact prefix, so a per-role
+# line there made the fixer re-write the implementer's ~35k-token prefix (measured live). The role goes into
+# the prompt instead (with_role).
+SHARED_SYSTEM = "You are an agent in an automated Rust workflow; your role is stated at the top of the prompt."
+
+
+def with_role(call: AgentCall) -> AgentCall:
+    role = ROLE_SYSTEM.get(call.role, "")
+    if not role:
+        return call
+    if call.prompt.startswith("/"):  # a slash command expands only as the first line (ToB audit)
+        command, _, rest = call.prompt.partition("\n")
+        return replace(call, prompt=f"{command}\n\n{role}\n{rest}")
+    return replace(call, prompt=f"{role}\n\n{call.prompt}")
+
 
 def skill_exists(cwd: Path, provider: str, skill: str) -> Path | None:
     base = ".claude/skills" if provider == "claude" else ".agents/skills"
@@ -321,9 +336,9 @@ class ClaudeRunner(BaseRunner):
         argv = [*self.binary(), "-p", "--output-format", "json",
                 "--model", call.spec.model, "--effort", call.spec.effort,
                 "--permission-prompts", "none"]
-        system = ROLE_SYSTEM.get(call.role, "") + ORCHESTRATED_NOTE
+        system = SHARED_SYSTEM + ORCHESTRATED_NOTE
         if call.extra_skills and p.get("extra_skills_via", "system") == "system":
-            # One file per role: identical across calls -> stays in the prompt cache; no argv length limit.
+            # Identical across calls and roles (same skills) -> stays in the prompt cache; no argv length limit.
             from rustflow import skills as sk
             text = system + "\n\n# Always-on project skills (follow them)\n\n" + sk.bundle(call.extra_skills, call.cwd)
             f = call.log_dir / "skills" / f"{call.role}.system.md"
@@ -376,7 +391,7 @@ class ClaudeRunner(BaseRunner):
 
     def run(self, call: AgentCall) -> AgentResult:
         argv = self.build_argv(call)
-        prompt = compose_prompt(call, self.pcfg.get("skill_invocation", "slash"),
+        prompt = compose_prompt(with_role(call), self.pcfg.get("skill_invocation", "slash"),
                                 extras_inline=self.pcfg.get("extra_skills_via", "system") == "inline")
         res = self._tracked_attempt(call, lambda c: self._prepare_attempt(c, argv, prompt))
         if (call.schema is not None and not res.ok and res.session_id and "structured" in res.error
@@ -568,8 +583,9 @@ class DryRunner(BaseRunner):
         except procutil.CommandNotFound as exc:
             argv = [f"<{exc}>"]
         inv = runner.pcfg.get("skill_invocation", "slash")
-        inline = isinstance(runner, CodexRunner) or runner.pcfg.get("extra_skills_via", "system") == "inline"
-        self._write(call, "prompt.md", compose_prompt(call, inv, extras_inline=inline))
+        codex = isinstance(runner, CodexRunner)
+        inline = codex or runner.pcfg.get("extra_skills_via", "system") == "inline"
+        self._write(call, "prompt.md", compose_prompt(call if codex else with_role(call), inv, extras_inline=inline))
         self._write(call, "argv.json", json.dumps(argv, indent=2))
         data = _dry_output(call.schema)
         return AgentResult(call.name, call.role, str(call.spec), ok=True, data=data, text="(dry run)", argv=argv)

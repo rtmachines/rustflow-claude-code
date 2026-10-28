@@ -4,7 +4,7 @@ Model-invoked skills are loaded only when the model decides a description matche
 rust-skills may silently never be read. rustflow therefore attaches them
 deterministically:
 
-- Claude: `--append-system-prompt-file` (stable per role -> prompt-cache friendly, no command-line
+- Claude: `--append-system-prompt-file` (same text for every role -> prompt-cache friendly, no command-line
   length limit on Windows);
 - Codex: inlined at the top of the prompt (stdin);
 - interactive `rustflow-reviewer` subagent: `skills:` preload in its frontmatter (installed by init).

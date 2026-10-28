@@ -109,11 +109,14 @@ Pomiary z runów na żywo (Claude Code 2.1.310, haiku):
 Wnioski:
 - **Najwięcej tokenów to tury wewnątrz jednej sesji agenta**, a tam cache działa normalnie. Hooki
   (feedback z `cargo check`, blokada Stop) tylko dopisują wiadomości na końcu, nie zmieniają prefiksu.
-- **Między rolami cache i tak nie może być współdzielony**: inne modele (cache jest per model), inny
-  zestaw narzędzi (recenzent bez Edit/Write, z narzędziem structured output). To cecha separacji ról,
-  nie błąd architektury; koszt to jednorazowy zapis ~15-30k tokenów na wywołanie.
-- **Ta sama rola w kolejnej rundzie korzysta z cache** (prefiks narzędzia + system + skill), bo
-  rustflow trzyma stały `--append-system-prompt` per rola, a wszystko zmienne (diff, runda, findingi)
+- **Między rolami o innym modelu lub zestawie narzędzi cache nie jest współdzielony** (cache jest per
+  model; recenzent nie ma Edit/Write). Implementer i fixer mają jednak ten sam model i te same narzędzia,
+  więc system prompt jest **identyczny dla wszystkich ról** (`SHARED_SYSTEM` + skille always-on), a linia
+  roli trafia do promptu za komendą skilla. Zmierzone na żywo przed tą zmianą: fixer startujący 3,5 min po
+  implementerze zapisał do cache cały prefiks od nowa (~35k tokenów, cache_read = 0), bo różniła się
+  tylko linia roli; zapis cache to ~54% kosztu Claude w runie.
+- **Ta sama rola w kolejnej rundzie korzysta z cache** (prefiks narzędzia + system + skill; zmierzone:
+  24k tokenów odczytu w pierwszej turze recenzenta r2), bo wszystko zmienne (rola, diff, runda, findingi)
   jest w wiadomości użytkownika.
 - `--exclude-dynamic-system-prompt-sections` (domyślnie włączone) przenosi cwd/git status do pierwszej
   wiadomości: nazwa gałęzi `rustflow/<run>` i ścieżka worktree są unikalne per run i inaczej
@@ -235,8 +238,8 @@ Zweryfikowane na żywo (Claude Code 2.1.310, haiku jako dyspozytor i recenzenci)
 
 Skill wywoływany przez model ładuje się tylko wtedy, gdy model uzna, że opis pasuje do zadania, więc skill
 stacku czy rust-skills może nie zostać przeczytany wcale. `[skills]` (domyślnie `all = ["auto"]`) dołącza je
-deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (plik stały dla roli, więc
-zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
+deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (treść identyczna dla
+wszystkich ról z tymi samymi skillami, więc zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
 Brak jawnie wymienionego skilla to błąd w preflight, a `max_kb` chroni kontekst. Zweryfikowane na żywo:
 fraza ukryta w skillu dołączonym przez `--append-system-prompt-file` wróciła w odpowiedzi modelu.
 

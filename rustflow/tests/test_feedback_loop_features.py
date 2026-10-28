@@ -181,6 +181,55 @@ def test_claude_gets_system_prompt_file_codex_gets_inline(tmp_path, monkeypatch)
     assert "APOLLO-RULES" not in compose_prompt(call, "slash")    # Claude: not duplicated into the prompt
 
 
+def test_claude_system_prompt_is_identical_across_roles(tmp_path, monkeypatch):
+    # Measured live: the fixer started 3.5 min after the implementer and re-wrote the whole ~35k-token
+    # prefix to the cache because only the role line in the system prompt differed.
+    from rustflow import procutil
+    from rustflow.agents import AgentCall, ClaudeRunner
+    from rustflow.config import AgentSpec, Config, load_defaults
+    _skill(tmp_path, ".claude/skills", "rust-best-practices", "APOLLO-RULES")
+    monkeypatch.setattr(procutil, "resolve_command", lambda name: [name])
+    runner = ClaudeRunner(Config(load_defaults()))
+
+    def system_text(role, extra=True):
+        call = AgentCall(role=role, name=role, spec=AgentSpec("claude", "opus", "high"), prompt="TASK",
+                         write=role in ("implementer", "fixer"), schema=None, cwd=tmp_path, log_dir=tmp_path / "logs",
+                         extra_skills=sk.resolve({"all": ["auto"]}, role, tmp_path, "claude") if extra else [])
+        argv = runner.build_argv(call)
+        if extra:
+            return Path(argv[argv.index("--append-system-prompt-file") + 1]).read_text()
+        return argv[argv.index("--append-system-prompt") + 1]
+
+    roles = ("implementer", "fixer", "reviewer_a", "planner")
+    assert len({system_text(r) for r in roles}) == 1
+    assert len({system_text(r, extra=False) for r in roles}) == 1
+
+
+def test_claude_prompt_carries_the_role_after_the_skill_command(tmp_path, monkeypatch):
+    from rustflow import procutil
+    from rustflow.agents import AgentCall, make_runners
+    from rustflow.config import AgentSpec, Config, load_defaults
+    _skill(tmp_path, ".claude/skills", "rustflow-fix", "FIX-PROCEDURE")
+    monkeypatch.setattr(procutil, "resolve_command", lambda name: [name])
+    call = AgentCall(role="fixer", name="fix-r1", spec=AgentSpec("claude", "opus", "high"), prompt="TASK", write=True,
+                     schema=None, cwd=tmp_path, log_dir=tmp_path / "logs", skill="rustflow-fix")
+    make_runners(Config(load_defaults()), dry_run=True)["claude"].run(call)
+    prompt = (tmp_path / "logs" / "fix-r1.prompt.md").read_text()
+    assert prompt.startswith("/rustflow-fix\n")              # the slash command must stay first to expand
+    assert "You are the FIXER" in prompt and prompt.index("You are the FIXER") < prompt.index("TASK")
+
+
+def test_role_line_never_displaces_a_leading_slash_command(tmp_path):
+    from rustflow.agents import AgentCall, with_role
+    from rustflow.config import AgentSpec
+    call = AgentCall(role="tob_audit", name="audit-tob", spec=AgentSpec("claude", "opus", "high"),
+                     prompt="/rust-review:rust-review scope src\n\nNon-interactive run.", write=True, schema=None,
+                     cwd=tmp_path, log_dir=tmp_path)
+    prompt = with_role(call).prompt
+    assert prompt.startswith("/rust-review:rust-review scope src\n") and "SOUNDNESS/SECURITY" not in prompt.split("\n")[0]
+    assert "audit plugin" in prompt
+
+
 def test_installer_preloads_always_on_skills_in_reviewer_agent(tmp_path):
     (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
     _skill(tmp_path, ".claude/skills", "rust-best-practices")
