@@ -17,6 +17,7 @@ import sys
 import time
 import traceback
 import threading
+from collections import Counter
 from copy import deepcopy
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from typing import Any
 
 from rustflow import criteria as crit_mod
 from rustflow import findings as fnd
-from rustflow import gates, gitutil, procutil, prompts, report, runs, schemas, triage, usage
+from rustflow import gates, gitutil, integrity, procutil, prompts, report, runs, schemas, triage, usage
 from rustflow.agents import AgentCall, AgentResult, make_runners, run_with_retry
 from rustflow.config import AgentSpec, Config, bump, gates_command, max_difficulty
 from rustflow.budget import BudgetManager, BudgetExceeded, DEFAULT_LIMITS, validate_limits
@@ -35,7 +36,25 @@ RUNS_DIR = Path(".rustflow") / "runs"
 RUNTIME_GITIGNORE = "runs/\ncache/\nwt/\n__pycache__/\n"
 RESUMABLE = ("interrupted", "budget", "crashed", "tree_changed", "agent_failed", "incomplete")
 # Finished, but another fix round can still help: `rustflow resume <run> --extra-rounds N`.
-CONTINUABLE = ("max_rounds", "stalled", "final_gates_red", "criteria_unmet")
+CONTINUABLE = ("max_rounds", "stalled", "final_gates_red", "criteria_unmet", "gate_changes_pending")
+
+
+REVIEWERS = ["reviewer_a", "reviewer_b"]
+
+
+def auto_rereviewers(open_findings: list, delta_files: set[str], gate_votes: bool, risky_delta: bool,
+                     degraded: bool) -> list[str]:
+    """`rereview = "auto"`: from round 2 only the reviewers whose blocking findings are still open re-review,
+    as long as the fix stayed in the files those findings point at (findings without a file, e.g. unmet
+    acceptance criteria, pick their reviewer but say nothing about files). Both review when gate changes
+    need their votes, the delta carries unsafe/FFI/atomics signals, the last round lacked a reviewer, a
+    finding has no reviewer owner (mechanical, gate integrity), or no open finding points at a file."""
+    owners = {r for f in open_findings for r in f.reviewers if r in REVIEWERS}
+    files = {f.file for f in open_findings if f.file}
+    unowned = any(not set(f.reviewers) & set(REVIEWERS) for f in open_findings)
+    if gate_votes or risky_delta or degraded or unowned or not files or not delta_files <= files:
+        return list(REVIEWERS)
+    return [r for r in REVIEWERS if r in owners]
 
 
 @dataclass
@@ -207,7 +226,7 @@ class Orchestrator:
         self.state = {
             "run_id": run_id, "created": _now(), "task": task, "mode": self.opts.mode,
             "repo": str(self.repo), "workdir": str(self.repo), "phase": "preflight", "round": 0,
-            "gate_fix_attempts": 0, "findings": [], "id_counter": 0, "rounds": [], "agents": [],
+            "gate_fix_attempts": 0, "findings": [], "gate_changes": [], "id_counter": 0, "rounds": [], "agents": [],
             "cost_usd": 0.0, "tokens": {}, "status": "running", "dry_run": self.opts.dry_run,
             "options": self.opts.__dict__.copy(), "pid": os.getpid(),
             "criteria": [c.to_dict() for c in criteria], "mechanical": [], "seen_trees": [],
@@ -273,6 +292,12 @@ class Orchestrator:
                 return 2
             self.state.pop("termination_reason", None)
             self.state.pop("output_complete", None)
+            if "gates_cfg" not in self.state and self.state.get("base_sha"):
+                try:
+                    self._gate_cfg()
+                except gates.GateConfigError as exc:
+                    self.log(f"refusing to resume: cannot read the gate configuration from the base commit ({exc})")
+                    return 2
             if self.state.get("isolation") == "worktree":
                 self.state["worktree_removed"] = False
             try:
@@ -304,7 +329,10 @@ class Orchestrator:
         for key in ("outcome", "finished", "final_gates", "final_gates_ok", "final_gates_feedback"):
             self.state.pop(key, None)
         self.state["gate_fix_attempts"] = 0
-        if any(f.get("status") == "open" for f in self.state.get("findings", [])):
+        open_f = [f for f in self.state.get("findings", []) if f.get("status") == "open"]
+        # Gate-change findings are recomputed from the tree: a human may have reverted them by hand, so
+        # re-gate (refresh -> review) instead of sending the fixer after a change that may be gone.
+        if open_f and not all(f.get("category") == "gate-integrity" for f in open_f):
             self.state["phase"] = "fix"
         else:  # final gates red / required tests missing: gates (+ gate fixer) -> review recomputes findings
             self.state["phase"], self.state["gates_after"] = "gates", "continue"
@@ -545,6 +573,15 @@ class Orchestrator:
     def spec(self, role: str, difficulty: str | None = None) -> AgentSpec:
         return self.cfg.spec_for(role, difficulty or self.state["difficulty"])
 
+    def _gate_cfg(self) -> dict:
+        """Gate configuration frozen from the base commit (never the work tree the agents edit)."""
+        if "gates_cfg" not in self.state:
+            self.state["gates_cfg"] = gates.load_gate_config_at(self.repo, self.state["base_sha"])
+        cfg = dict(self.state["gates_cfg"])
+        cfg["max_output_bytes"] = (self.budget.limits["max_output_bytes"] if self.budget
+                                   else self.cfg.get("process.max_output_bytes", 16777216))
+        return cfg
+
     def run_gates(self, label: str, *, strict: bool = False, fix_fmt: bool | None = None,
                   use_cache: bool = True) -> gates.GateResult:
         self._check_budget()
@@ -557,8 +594,7 @@ class Orchestrator:
             overrides["CARGO_TARGET_DIR"] = self.state["cargo_target_dir"]
         saved = {k: os.environ.get(k) for k in overrides}
         os.environ.update(overrides)
-        gate_cfg = gates.load_gate_config(self.workdir)
-        gate_cfg["max_output_bytes"] = self.budget.limits["max_output_bytes"] if self.budget else self.cfg.get("process.max_output_bytes", 16777216)
+        gate_cfg = self._gate_cfg()
         try:
             res = gates.run_gates(self.workdir, "full", cfg=gate_cfg, strict=strict, use_cache=use_cache and not strict,
                                   log_dir=self.run_dir / "gates" / label, fix_fmt=fix_fmt)
@@ -620,6 +656,65 @@ class Orchestrator:
                 round=rnd))
         return out
 
+    def _refresh_gate_changes(self, label: str) -> None:
+        """Scan base..tree for gate-affecting changes, prove the provable ones harmless, record the verdicts."""
+        if self.opts.dry_run:
+            return
+        head = self.snapshot()
+        cfg = self._gate_cfg()
+        changes = integrity.scan(self.workdir, self.state["base_sha"], head, cfg, self.state.get("ignored_config"))
+        entries = integrity.reconcile(self.state.get("gate_changes") or [], changes)
+        for e in entries:   # a proof is about one tree: other code may now be hidden by the same config
+            if e["provable"] and e["proof"] and e["proof_tree"] != head:
+                e["proof"] = e["proof_tree"] = ""
+        if any(e["provable"] and not e["proof"] for e in entries):
+            result = integrity.prove(self.workdir, self.state["base_sha"], head, changes, "full", cfg,
+                                     log_dir=self.run_dir / "gates" / f"proof-{label}",
+                                     target_dir=self.state.get("cargo_target_dir"))
+            self.log(f"gate-change proof [{label}]: {result.status} - {result.summary} {result.error}".rstrip())
+            integrity.apply_proof(entries, result, head)
+            self._check_budget()
+        integrity.decide(entries)
+        self.state["gate_changes"] = entries
+        for e in entries:
+            self.log(f"   gate change [{e['id']}] {e['status']}"
+                     + (f" (by {e['accepted_by']})" if e["accepted_by"] else "") + f": {e['detail'][:100]}")
+
+    def _votable_gate_changes(self) -> str:
+        """Pending changes the reviewers may vote on (not provable, not unknown). Everything implementer- or
+        fixer-controlled (paths, details, summary, justification) is sanitized and bounded."""
+        safe = gates.display_safe
+        impl = safe(((self.state.get("implementation") or {}).get("summary") or "").strip(), 500)
+        out = []
+        for e in self.state.get("gate_changes") or []:
+            if e.get("provable") or e["kind"] == "unknown" or e["status"] != "pending":
+                continue
+            lines = [f"- [{safe(e['id'], 200)}] {safe(e['kind'], 40)} in `{safe(e['path'], 200)}`: {safe(e['detail'], 300)}"]
+            if e.get("justification"):
+                lines.append(f"  fixer's justification (claim): {safe(e['justification'], 500)}")
+            out.append("\n".join(lines))
+        if out and impl:
+            out.append(f"implementer's summary (claim, once for all changes above): {impl}")
+        return "\n".join(out)
+
+    def _gate_findings(self, rnd: int, prev_open: list[fnd.Finding]) -> list[fnd.Finding]:
+        was_open = {f.id for f in prev_open}
+        out = []
+        for e in self.state.get("gate_changes") or []:
+            fid = e["id"]
+            accepted = e["status"] == "accepted"
+            out.append(fnd.Finding(
+                id=fid, severity="P1", category="gate-integrity",
+                file=e["path"] if (self.workdir / e["path"]).exists() else "", line=0,
+                title=f"Gate-affecting change ({gates.display_safe(e['kind'], 40)}): {gates.display_safe(e['detail'], 200)}",
+                trigger="the change alters what the gates check or how strictly (detected by the orchestrator)",
+                impact="a gate can pass because of this change instead of because the code is correct",
+                rule="gate-affecting changes need a proof that they hide nothing (or reviewer consent)",
+                fix="revert the change unless the task explicitly requires it; if it does, reject with the justification",
+                confidence="high", reviewers=["orchestrator"], previous_id=fid if fid in was_open else None,
+                status="accepted_gate_change" if accepted else "open", round=rnd))
+        return out
+
     def _seen_tree(self, tree: str) -> bool:
         """Remember a tree produced by a write agent; True if it was produced before (oscillation)."""
         seen = self.state.setdefault("seen_trees", [])
@@ -650,6 +745,10 @@ class Orchestrator:
         self.state.update(base_ref=base_ref, base_sha=base_sha, base_tree=gitutil.tree_of(repo, base_sha),
                           original_branch=gitutil.head_branch(repo), isolation=isolation,
                           checkpoints=bool(self.cfg.get("project.checkpoint_commits", True)) and isolation != "none")
+        try:
+            self.state["gates_cfg"] = gates.load_gate_config_at(repo, base_sha)
+        except gates.GateConfigError as exc:
+            raise Abort("error", f"cannot read the gate configuration from the base commit: {exc}") from exc
         branch = f"rustflow/{self.state['run_id']}"
         if not self.opts.dry_run and isolation in ("branch", "worktree"):
             # Never roll back a branch that existed before this preflight.
@@ -677,6 +776,11 @@ class Orchestrator:
             self._preflight_checks(review_mode)
             # Cargo.lock from baseline is part of the starting point, not agent work.
             self.state["start_tree"] = self.snapshot()
+            try:   # gitignored config files already in place are part of the environment, not a change
+                self.state["ignored_config"] = gates.ignored_config_files(
+                    self.workdir, list(self.state["gates_cfg"].get("integrity_extra_paths") or []))
+            except (OSError, RuntimeError, gates.IncompleteGate) as exc:
+                raise Abort("error", f"cannot list gitignored config files: {exc}") from exc
         except (Abort, BudgetExceeded, gates.IncompleteGate, gitutil.GitError, KeyboardInterrupt):
             # Cleanup gets its own bounded grace period after the run deadline.
             with execution_scope(deadline=time.monotonic() + 3, cancel=None,
@@ -717,7 +821,7 @@ class Orchestrator:
             res = self.run_gates("baseline", strict=True, fix_fmt=False)
             if not res.ok:
                 self.state["baseline_red"] = res.feedback()
-                self.state["baseline_signatures"] = sorted(res.signatures())
+                self.state["baseline_signatures"] = sorted(res.signature_counts().elements())
                 self._write_baseline()
                 if not self.opts.accept_red_baseline:
                     raise Abort("baseline_red", "gates are already RED on the base. Fix the base first or "
@@ -829,10 +933,9 @@ class Orchestrator:
     def _gates_ok(self, res: gates.GateResult) -> bool:
         if res.ok:
             return True
-        base = set(self.state.get("baseline_signatures") or [])
-        sigs = res.signatures()
-        # "step|*" = a failure we could not itemize; it can never be proven pre-existing.
-        if base and sigs <= base and not any(x.endswith("|*") for x in sigs):
+        base = Counter(self.state.get("baseline_signatures") or [])
+        # Occurrences are counted; "step|*" (an unitemized failure) can never be proven pre-existing.
+        if base and not gates.new_failures(res.signature_counts(), base):
             self.log("gates: only pre-existing baseline failures remain - treated as green")
             return True
         return False
@@ -853,6 +956,7 @@ class Orchestrator:
         if self._gates_ok(res):
             self.state["last_gates"] = res.summary_line()
             self.state["last_gates_feedback"] = ""
+            self._refresh_gate_changes(label)
             self.state["round"] += 1
             self.state["phase"] = "review"
             return
@@ -902,6 +1006,7 @@ class Orchestrator:
             diff_inline=inline, gates_summary=self.state.get("last_gates", "n/a"),
             advisory=advisory, risk=risk.describe(),
             acceptance=[c.for_prompt() for c in self.criteria], round_no=rnd,
+            gate_changes=self._votable_gate_changes(),
         )
         if rnd > 1 and self.state.get("last_review_tree"):
             prev_tree = self.state["last_review_tree"]
@@ -918,9 +1023,17 @@ class Orchestrator:
         difficulty = self.state["difficulty"]
         if risk.escalation:
             difficulty = "hard"
-        reviewers = ["reviewer_a", "reviewer_b"]
+        reviewers = list(REVIEWERS)
         if rnd > 1 and self.cfg.get("loop.rereview") == "first":
             reviewers = ["reviewer_a"]
+        elif rnd > 1 and self.cfg.get("loop.rereview") == "auto" and ctx.prev_tree:
+            delta_text = gitutil.diff(self.workdir, ctx.prev_tree, head)
+            reviewers = auto_rereviewers(
+                prev_blocking, set(gitutil.changed_files(self.workdir, ctx.prev_tree, head)), bool(ctx.gate_changes),
+                bool(gitutil.risk_signals(delta_text).escalation),
+                bool((self.state.get("rounds") or [{}])[-1].get("failed_reviewers")))
+            if reviewers != REVIEWERS:
+                self.log(f"rereview auto: only {', '.join(reviewers)} (open findings; fix stayed in their files)")
         jobs: list[tuple[str, AgentSpec, str]] = []
         for r in reviewers:
             lens = self.cfg.role_opt(r, "lens", "correctness")
@@ -991,6 +1104,11 @@ class Orchestrator:
         else:
             self.state.pop("degraded_review", None)
 
+        entries = self.state.get("gate_changes") or []
+        for name, data in reviews.items():
+            if name in integrity.REVIEWERS:
+                integrity.apply_votes(entries, name, data.get("gate_changes") or [])
+        integrity.decide(entries)
         ids = fnd.IdAllocator(int(self.state.get("id_counter", 0)))
         agg = fnd.aggregate(
             reviews, root=self.workdir, round_no=rnd, previous=prev_findings, ids=ids,
@@ -999,7 +1117,7 @@ class Orchestrator:
             escalation_signals=risk.escalation,
         )
         self.state["id_counter"] = ids.n
-        agg.findings[:0] = self._mechanical_findings(rnd, prev_blocking)
+        agg.findings[:0] = self._mechanical_findings(rnd, prev_blocking) + self._gate_findings(rnd, prev_blocking)
         self.state["findings"] = [f.to_dict() for f in agg.findings]
         self.state["last_review_tree"] = head
         self.state["escalate"] = bool(self.state.get("escalate")) or agg.escalate
@@ -1027,6 +1145,13 @@ class Orchestrator:
         max_rounds = int(self.opts.max_rounds or self.cfg.get("loop.max_review_rounds", 3))
         if self.opts.mode == "review" and not self.opts.fix:
             self.state["outcome"] = "changes_requested"
+            self.state["phase"] = "final"
+            return
+        by_id = {e["id"]: e for e in self.state.get("gate_changes") or []}
+        if all(f.category == "gate-integrity" and by_id.get(f.id, {}).get("fix_rounds", 0) >= 1 for f in blocking):
+            # Only gate changes are left and the fixer has already seen them: a human decides.
+            self.state["outcome"] = "gate_changes_pending"
+            self.log("only unaccepted gate-affecting changes remain after a fix round")
             self.state["phase"] = "final"
             return
         if rnd >= max_rounds:
@@ -1084,7 +1209,7 @@ class Orchestrator:
         lints = list(self.cfg.get("review.advisory_clippy", []) or [])
         if lints:
             try:
-                diags = gates.advisory_clippy(self.workdir, lints, ranges, cfg=gates.load_gate_config(self.workdir))
+                diags = gates.advisory_clippy(self.workdir, lints, ranges, cfg=self._gate_cfg())
                 out += [d.short() for d in diags]
             except gates.IncompleteGate as exc:
                 self._incomplete(exc.step.termination_reason, gate="advisory")
@@ -1143,6 +1268,13 @@ class Orchestrator:
             self.log("fixer changed nothing and did not argue the findings - stopping")
             self.state["phase"] = "final"
             return
+        notes = {r.get("id"): r.get("note", "") for r in (res.data or {}).get("resolutions", [])} if res.ok else {}
+        seen = {f.id for f in blocking if f.category == "gate-integrity"}
+        for e in self.state.get("gate_changes") or []:
+            if e["id"] in seen:
+                e["fix_rounds"] = int(e.get("fix_rounds", 0)) + 1
+                if notes.get(e["id"]):
+                    e["justification"] = notes[e["id"]]
         self.checkpoint(f"fix round {rnd}")
         self.state["gate_fix_attempts"] = 0
         self.state["gates_after"] = "fix"
@@ -1152,19 +1284,26 @@ class Orchestrator:
         res = self.run_gates("final", strict=True, fix_fmt=False, use_cache=False)
         self.state["final_gates"] = res.summary_line()
         self.state["final_gates_ok"] = self._gates_ok(res)
+        if self.state["final_gates_ok"]:
+            self._refresh_gate_changes("final")
         self._evaluate_mechanical(res)
         missing = crit_mod.unmet(self.state.get("mechanical") or [])
         if not self.state["final_gates_ok"]:
             self.state["final_gates_feedback"] = res.feedback()
         outcome = self.state.get("outcome", "approved")
         findings = [fnd.Finding.from_dict(f) for f in self.state.get("findings", [])]
-        if outcome == "approved" and self.state["final_gates_ok"] and missing:
+        entries = self.state.get("gate_changes") or []
+        clean = outcome in ("approved", "gate_changes_pending")
+        if clean and self.state["final_gates_ok"] and missing:
             status = "criteria_unmet"
             self.log("required tests not proven on the final tree: " + ", ".join(r["test"] for r in missing))
-        elif outcome == "approved" and self.state["final_gates_ok"]:
-            has_adv = any(f.status in ("advisory", "disputed") for f in findings)
+        elif clean and self.state["final_gates_ok"] and integrity.pending(entries):
+            status = "gate_changes_pending"
+            self.log("gate-affecting changes without acceptance: " + ", ".join(e["id"] for e in integrity.pending(entries)))
+        elif clean and self.state["final_gates_ok"]:
+            has_adv = bool(entries) or any(f.status in ("advisory", "disputed") for f in findings)
             status = "approved_with_advisories" if has_adv else "approved"
-        elif outcome == "approved":
+        elif clean:
             status = "final_gates_red"
         else:
             status = outcome

@@ -116,6 +116,28 @@ rustflow run "Add an add function and a tests::adds unit test" --criteria criter
 
 The named test must actually run and pass on the checked tree. Short names match suffixes: at least one matching test must pass and no observed matching test may fail. Prefer a fully qualified name to avoid collisions. Zero executed tests, ignored tests, or a different passing test do not satisfy it. Criteria without `test` are assessed by reviewers. Hard-task planning can also supply criteria. Missing required tests become blocking `T-<id>` findings and can end as `criteria_unmet`. The report includes mechanical evidence and reviewer assessments. See [`criteria.py`](../rustflow/criteria.py) and [`test_criteria.py`](../tests/test_criteria.py).
 
+### Gate-affecting changes
+
+Rustflow also checks changes that could make the gates weaker than the base commit. Each such change has a kind:
+
+- `config`: `rustflow.toml`, `.cargo/config`, `.cargo/config.toml`, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`, `.gitattributes` (each name matches at any depth), and paths matched by `integrity_extra_paths`. Files of these names that `.gitignore` hides count as well (see [configuration](configuration.md#gate-integrity)).
+- `cargo-lints`: `[lints]`, `[workspace.lints]`, or `[profile.*]` in a `Cargo.toml`. Adding a dependency is not a change.
+- `silence`: an added `#[allow(`, `#![allow(`, `#[expect(`, `cfg_attr(…, allow/expect(`, or `#[ignore` attribute.
+- `tests-removed`: a net decrease in test attributes across the diff. Moving a test is fine.
+- `unknown`: the scan failed. This always blocks.
+
+Acceptance is automatic; no CLI or MCP option overrides it:
+
+- `config` and `silence` need a proof. Rustflow reruns the gates with the changed configuration restored to the base version and the added attributes stripped. Green accepts the change (`accepted_by: proof`). Red means the change hides a real failure and blocks it; reviewers cannot override that.
+- `cargo-lints` and `tests-removed` are accepted only when both reviewers vote `accept` for the current version of that change (a per-change digest).
+
+Every change that is not accepted becomes a blocking finding `G-<kind>-<path>`. Reviewers and the fixer cannot close it. When only these findings remain after a fix round, or at the final check, the run ends as `gate_changes_pending` (exit code 2, resumable). Its `next_actions` (`rustflow status <id> --json`) offers two recovery paths:
+
+1. Revert the change by hand, then run `rustflow resume <id> --extra-rounds 1`. This reruns the gates and review without the fixer.
+2. Commit the change yourself as a gate-policy change on the base branch, then start a new run.
+
+Approved runs with accepted gate changes end at most as `approved_with_advisories`. The report has a section "## Zmiany wpływające na bramki" that lists the id, kind, path, status, `accepted_by`, proof, votes, and justification of each change.
+
 ## Review existing changes
 
 ```bash
@@ -164,13 +186,15 @@ Normal local gates can format eligible Rust files and cache a passing result. Th
 
 Compilation failures can skip redundant tests. nextest is preferred when installed, with Cargo test fallback; doctests are a separate full step. Inspect skipped optional checks and configure required checks as described in [configuration](configuration.md).
 
-`rustflow lints` measures candidate Rust/Clippy lints and reports rules with no current violations. `--apply` writes adoptable rules to manifests and test exemptions to Clippy configuration, then rechecks Clippy. Review its file changes before committing. `--exclude print_stdout,missing_docs` removes selected candidates. Adoption is not a guarantee about future code.
+`rustflow lints` measures candidate Rust/Clippy lints and reports rules with no current violations. Besides the general set, candidates cover REVIEW.md rules so the compiler enforces them instead of a reviewer: `undocumented_unsafe_blocks`, `let_underscore_must_use` and `unused_result_ok` (swallowed errors), `allow_attributes_without_reason`, and `indexing_slicing` (tests exempt via `allow-indexing-slicing-in-tests`). `rustflow init` points to this command. `--apply` writes adoptable rules to manifests and test exemptions to Clippy configuration, then rechecks Clippy. Review its file changes before committing. `--exclude print_stdout,missing_docs` removes selected candidates. Adoption is not a guarantee about future code.
 
 `init --stack axum-sqlx` adds stack guidance and Ubuntu CI with PostgreSQL, migrations, and required SQLx checks. Standard generated CI uses Ubuntu and Windows. These workflows are separate from [Rustflow package CI](../../.github/workflows/test.yml). They require external Actions/tool downloads and were not executed by the local documentation quickstart.
 
 ## Claude Code hooks and interactive review
 
 Initialization registers `PostToolUse` formatting/check feedback, a `Stop` gate, `PreToolUse` command/edit guards, and normally a `UserPromptSubmit` review router. Stop blocks at most three times by default, then emits a manual-review warning; this does not turn failed gates green. Orchestrated reviewers skip write-oriented interactive hooks; the driving session respects the active checkout.
+
+Stop and the commit gate read the gate configuration from `HEAD` and check for unproven [gate-affecting changes](#gate-affecting-changes) in interactive sessions. Stop blocks on them, but that block is capped by `stop_max_blocks`, after which the session ends with a notice. Only the commit gate denies unconditionally; revert such a change, or ask the user to commit it. Orchestrator agents are not checked for gate-affecting changes by hooks, although their Stop gates still run with the base configuration; the orchestrator performs the check itself.
 
 In a trusted Claude Code project, `/rustflow-pr-review [base]` invokes the installed interactive reviewer. This forked read-only interface is separate from the two-reviewer workflow. Hooks validate its Markdown report and can suggest a Trail of Bits audit for unsafe/FFI signals. `init --with-plugins` enables that optional plugin integration; an orchestrated plugin audit also needs auditor configuration. Folder trust and permissions affect hook activation. `doctor --selftest` replays local hook scenarios.
 
@@ -211,7 +235,7 @@ Responses include text and `structuredContent`. `next_actions` supplies CLI acti
 
 ## CLI reference
 
-Use `rustflow --help`, `rustflow --version`, or `rustflow <command> --help`. Put options after the subcommand. All except `mcp` accept `--repo PATH` and `--config PATH`; repo defaults to the current Git toplevel, or the supplied directory outside Git. Some handlers read repository-local configuration directly: `init`, `doctor --selftest`, `lints`, and `gates` do not apply alternate `--config` files. Gates inside a run also read its checkout's file. Keep gate settings there; see [configuration](configuration.md).
+Use `rustflow --help`, `rustflow --version`, or `rustflow <command> --help`. Put options after the subcommand. All except `mcp` accept `--repo PATH` and `--config PATH`; repo defaults to the current Git toplevel, or the supplied directory outside Git. Some handlers read repository-local configuration directly: `init`, `doctor --selftest`, `lints`, and `gates` do not apply alternate `--config` files. Gates inside a run read `[gates]` from the run's base commit, not from the checkout; commit gate settings before you start. See [configuration](configuration.md).
 
 | Command | Specific arguments/options |
 | --- | --- |

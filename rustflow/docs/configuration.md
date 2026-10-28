@@ -12,7 +12,7 @@ For handlers using `Config.load` (`run`, `review`, `resume`, `triage`, and ordin
 
 Command options override the corresponding defaults where provided: `--base`, `--difficulty`, `--isolation`, `--max-rounds`, `--no-plan`, `--max-agent-calls`, `--max-active-seconds`, and `--max-output-bytes`. The public review interfaces use `isolation = "none"` regardless of `[project].isolation` and never run the planner; `--isolation` is a run-only CLI option.
 
-**Gate configuration has a separate loader.** Standalone gates and hooks read `[gates]` and `[process].max_output_bytes` from `rustflow.toml` in their detected project root. The orchestrator also reloads gates from its working checkout. Consequently, an alternate `--config` file controls orchestration but does not replace the checkout's `[gates]` settings. The orchestrator does apply its effective output limit to its own gate runs. Put gate settings in the checkout's `rustflow.toml`, including when using worktree isolation. Invalid TOML makes the standalone loader warn and use gate defaults; the Stop hook surfaces this once per session. This differs from the orchestrator's configuration validation.
+**Gate configuration has a separate loader.** Standalone gates and hooks read `[gates]` and `[process].max_output_bytes` from `rustflow.toml` in their detected project root. Where `[gates]` comes from depends on the caller. Orchestrator runs read it from `rustflow.toml` at the run's base commit, and that value is frozen in the run state, including on resume. Interactive hooks read it from `HEAD`. Hooks of orchestrator agents read it from `$RUSTFLOW_BASE`. Only standalone `gates.py`, CI, `rustflow lints`, and the MCP tool `rustflow_gates` read the working tree. Consequently, an alternate `--config` file controls orchestration but does not replace `[gates]`. The orchestrator does apply its effective output limit to its own gate runs. Commit gate settings: an uncommitted `rustflow.toml` means default `[gates]` at the base, and `rustflow doctor` warns about it. Invalid TOML makes the standalone loader warn and use gate defaults; the Stop hook surfaces this once per session. This differs from the orchestrator's configuration validation.
 
 Configuration validation covers model and effort allowlists, the documented routing enums, review severity/confidence options, and positive execution limits. It is not a complete schema validator: unknown keys are retained, and many gate/provider settings are consumed without enum or type validation. A misspelled key can therefore have no effect. Use `rustflow doctor` after editing configuration. See [the loader](../rustflow/config.py) and [gate defaults and loader](../rustflow/gates.py) for exact behavior.
 
@@ -145,7 +145,7 @@ Model triage uses the generic 30-minute role timeout and has no packaged per-cal
 | `max_review_rounds` | `3` | Maximum review rounds, including the first review; must be at least one. A remaining blocker at the limit ends with `max_rounds`. |
 | `max_gate_fix_attempts` | `2` | Maximum fixer attempts for a gate failure before stopping. |
 | `block_on` | `["P0", "P1"]` | Finding severities that can block. Allowed entries: `P0`, `P1`, `P2`, `P3`. Other severities remain advisory. Mechanical gate/acceptance failures are handled separately. |
-| `rereview` | `"both"` | `both` reruns both reviewers; `first` runs only `reviewer_a` from round two onward. |
+| `rereview` | `"auto"` | From round two: `auto` reruns only the reviewers whose blocking findings are still open, as long as the fix delta stays in the files those findings point at; both rerun when gate changes need votes, the delta has unsafe/FFI/atomics signals, the previous round lacked a reviewer, or a finding has no reviewer owner or no file. `both` always reruns both; `first` runs only `reviewer_a`. |
 | `allow_reject` | `true` | Allow the fixer to reject a finding with a reason through the resolution/dispute protocol. |
 | `min_confidence_single` | `"medium"` | Single-reviewer findings below this confidence become advisory. Choices: `low`, `medium`, `high`. |
 
@@ -261,7 +261,7 @@ Role skills (`rustflow-plan`, `rustflow-implement`, `rustflow-review`, `rustflow
 
 Names resolve under `.claude/skills/<name>/SKILL.md` for Claude and `.agents/skills/<name>/SKILL.md` for Codex. `all` and the role group are concatenated, then duplicate names are removed. `auto` selects installed `rustflow-stack-*` skills plus `rust-skills` and optional `rust-best-practices`; it does not select arbitrary installed skills or duplicate the role skill. An explicitly named missing skill is an error; an absent auto-discovered skill is simply absent. Preflight checks role/provider combinations across all difficulty routes.
 
-Only `SKILL.md` is attached. Reference files remain on disk, with their location included for agents to open as needed. Claude defaults to a per-role system-prompt file, Codex always receives extras inline, and `init` embeds interactive reviewer preloads in its generated definition. Rerun `init` to regenerate that definition after changing its preload configuration. Triage and the `tob_audit` role have no extra-skill group mapping.
+Only `SKILL.md` is attached. Reference files remain on disk, with their location included for agents to open as needed. Claude defaults to a system-prompt file whose content is the same for every role with the same skills (the role is stated in the prompt, so implementer and fixer share the prompt cache), Codex always receives extras inline, and `init` embeds interactive reviewer preloads in its generated definition. Rerun `init` to regenerate that definition after changing its preload configuration. Triage and the `tob_audit` role have no extra-skill group mapping.
 
 ```toml
 [skills]
@@ -274,7 +274,7 @@ Both provider skill directories must contain explicitly requested skills when th
 
 ## Deterministic gates
 
-Gates are shared by hooks, orchestration, and CI. Their configuration comes from the working checkout as described under [Loading and precedence](#loading-and-precedence).
+Gates are shared by hooks, orchestration, and CI. Their configuration comes from `rustflow.toml` as described under [Loading and precedence](#loading-and-precedence), but the source of that file depends on the caller: orchestrator runs read `[gates]` from the run's base commit (also on resume), and interactive hooks read it from `HEAD`. Editing `[gates]` in the working tree never changes a running task's gates; the Stop hook and commit gate pick it up once committed.
 
 | Key in `[gates]` | Default | Behavior |
 | --- | --- | --- |
@@ -293,8 +293,22 @@ Gates are shared by hooks, orchestration, and CI. Their configuration comes from
 | `semver` | `"auto"` | `auto`, `always`, or `off`; details below. |
 | `sqlx` | `"auto"` | `auto`, `require`, or `off`; details below. |
 | `extra` | `[]` (implicit) | Additional gate command definitions. |
+| `integrity_extra_paths` | `[]` | List of globs. Matching changed files are treated as gate configuration (kind `config`) and need a proof; see below. |
 
 There is no general gate-timeout TOML key. Most built-in gate commands use a one-hour timeout, subject to the run's remaining deadline; individual helpers have shorter fixed timeouts. Custom commands accept `timeout_s`.
+
+### Gate integrity
+
+Changes to gate configuration can weaken the gates themselves, so the diff between the base and the current tree is scanned. Files named in the built-in list (`rustflow.toml`, `.cargo/config`, `.cargo/config.toml`, `.config/nextest.toml`, `clippy.toml`, `.clippy.toml`, `rustfmt.toml`, `.rustfmt.toml`, `rust-toolchain`, `rust-toolchain.toml`, `deny.toml`, `.gitattributes`; each name matches at any depth) and paths matching `integrity_extra_paths` are classified as `config`. The extra patterns are fnmatch globs in which `*` also matches `/`. Each such change needs a proof: the gates are re-run in a temporary worktree with the changed configuration restored to the base version. A red proof blocks the change. Projects without the key keep the default `[]`.
+
+**Gitignored config files.** Cargo and the gates also read config files that `.gitignore` hides from git (for example `.cargo/config.toml` listed in `.gitignore` for a local linker setting). They are treated as `config` changes too, because a hidden `--cap-lints allow` would otherwise mask every lint. In interactive sessions every such file present in the working tree is a change, proven by re-running the gates in a worktree that does not contain it (a harmless local config passes with a note; the proof costs a gates run per distinct tree). In an orchestrated run, the ignored config files present at the start are recorded as part of the environment; a file that is new or whose content changed during the run is a change. The gate-result cache and the proof cache include a digest of these files, so a green result is never reused after one appears or changes. Their absence in the proof worktree can make a proof fail when the project truly needs the file to build; commit such settings or accept the block.
+
+```toml
+[gates]
+integrity_extra_paths = ["ci/*.sh"]
+```
+
+The changes are described in [usage](usage.md#gate-affecting-changes).
 
 ### Profiles and strict mode
 

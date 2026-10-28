@@ -149,7 +149,7 @@ def test_same_logical_name_preserves_attempt_artifacts_and_latest_paths(tmp_path
     original = {path: (tmp_path / path).read_bytes() for path in row["artifacts"].values()}
     new_call, _ = call_and_runner(tmp_path, monkeypatch)
     runner.run(new_call)
-    assert (tmp_path / "agents" / "review.prompt.md").read_text() == "p"
+    assert (tmp_path / "agents" / "review.prompt.md").read_text().endswith("\n\np")  # role line + prompt
     assert json.loads((tmp_path / "agents" / "review.result.json").read_text())["ok"] is True
     for path, content in original.items():
         assert (tmp_path / path).read_bytes() == content

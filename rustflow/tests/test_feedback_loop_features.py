@@ -25,7 +25,7 @@ def _ws(tmp_path):
         "//! core\n/// Parses.\npub fn parse(s: &str) -> Option<i32> {\n    s.trim().parse().ok()\n}\n\n"
         "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        assert_eq!(super::parse(\" 4 \").unwrap(), 4);\n    }\n}\n")
     (ws / "crates" / "cli" / "src" / "main.rs").write_text(
-        'fn main() {\n    let v: i32 = "3".parse().unwrap();\n    println!("{v}");\n}\n')
+        'fn main() {\n    let v: i32 = "3".parse().unwrap();\n    let _ = std::fs::remove_file("none");\n    println!("{v}");\n}\n')
     return ws
 
 
@@ -38,14 +38,26 @@ def test_lint_ratchet_adopts_only_satisfied_lints(tmp_path, monkeypatch):
     root = (ws / "Cargo.toml").read_text()
     assert 'unsafe_code = "forbid"' in root and 'await_holding_lock = "deny"' in root
     assert "unwrap_used" not in root and "print_stdout" not in root      # cli violates them
+    # REVIEW.md rules as lints: `let _ =` / `.ok()` swallowing, `#[allow]` without a reason, panicking indexing
+    assert "let_underscore_must_use" not in root                          # cli swallows a Result
+    for lint in ("unused_result_ok", "allow_attributes_without_reason", "indexing_slicing"):
+        assert f'{lint} = "warn"' in root
     assert (ws / "crates" / "core" / "Cargo.toml").read_text().rstrip().endswith("[lints]\nworkspace = true")
-    assert "allow-expect-in-tests = true" in (ws / "clippy.toml").read_text()
+    conf = (ws / "clippy.toml").read_text()
+    assert "allow-expect-in-tests = true" in conf and "allow-indexing-slicing-in-tests = true" in conf
     assert any("clippy -D warnings after apply: PASS" in l for l in out)
     # second run: everything already configured, nothing written twice
     out2: list[str] = []
     lints.run(ws, do_apply=True, exclude={"missing_docs"}, out=out2.append)
     assert (ws / "Cargo.toml").read_text().count("unsafe_code") == 1
     assert any("already configured" in l for l in out2)
+
+
+def test_init_points_to_the_lint_ratchet(tmp_path):
+    (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
+    out: list[str] = []
+    Installer(tmp_path, with_rust_skills=False, python_cmd="python3", ci=False, out=out.append).run()
+    assert any("rustflow lints" in line for line in out)
 
 
 def test_insert_entries_into_existing_section():
@@ -179,6 +191,55 @@ def test_claude_gets_system_prompt_file_codex_gets_inline(tmp_path, monkeypatch)
                          "extra_skills": sk.resolve({"all": ["auto"]}, "reviewer_b", tmp_path, "codex")})
     assert compose_prompt(call2, "mention", extras_inline=True).startswith('<skill name="rust-best-practices"')
     assert "APOLLO-RULES" not in compose_prompt(call, "slash")    # Claude: not duplicated into the prompt
+
+
+def test_claude_system_prompt_is_identical_across_roles(tmp_path, monkeypatch):
+    # Measured live: the fixer started 3.5 min after the implementer and re-wrote the whole ~35k-token
+    # prefix to the cache because only the role line in the system prompt differed.
+    from rustflow import procutil
+    from rustflow.agents import AgentCall, ClaudeRunner
+    from rustflow.config import AgentSpec, Config, load_defaults
+    _skill(tmp_path, ".claude/skills", "rust-best-practices", "APOLLO-RULES")
+    monkeypatch.setattr(procutil, "resolve_command", lambda name: [name])
+    runner = ClaudeRunner(Config(load_defaults()))
+
+    def system_text(role, extra=True):
+        call = AgentCall(role=role, name=role, spec=AgentSpec("claude", "opus", "high"), prompt="TASK",
+                         write=role in ("implementer", "fixer"), schema=None, cwd=tmp_path, log_dir=tmp_path / "logs",
+                         extra_skills=sk.resolve({"all": ["auto"]}, role, tmp_path, "claude") if extra else [])
+        argv = runner.build_argv(call)
+        if extra:
+            return Path(argv[argv.index("--append-system-prompt-file") + 1]).read_text()
+        return argv[argv.index("--append-system-prompt") + 1]
+
+    roles = ("implementer", "fixer", "reviewer_a", "planner")
+    assert len({system_text(r) for r in roles}) == 1
+    assert len({system_text(r, extra=False) for r in roles}) == 1
+
+
+def test_claude_prompt_carries_the_role_after_the_skill_command(tmp_path, monkeypatch):
+    from rustflow import procutil
+    from rustflow.agents import AgentCall, make_runners
+    from rustflow.config import AgentSpec, Config, load_defaults
+    _skill(tmp_path, ".claude/skills", "rustflow-fix", "FIX-PROCEDURE")
+    monkeypatch.setattr(procutil, "resolve_command", lambda name: [name])
+    call = AgentCall(role="fixer", name="fix-r1", spec=AgentSpec("claude", "opus", "high"), prompt="TASK", write=True,
+                     schema=None, cwd=tmp_path, log_dir=tmp_path / "logs", skill="rustflow-fix")
+    make_runners(Config(load_defaults()), dry_run=True)["claude"].run(call)
+    prompt = (tmp_path / "logs" / "fix-r1.prompt.md").read_text()
+    assert prompt.startswith("/rustflow-fix\n")              # the slash command must stay first to expand
+    assert "You are the FIXER" in prompt and prompt.index("You are the FIXER") < prompt.index("TASK")
+
+
+def test_role_line_never_displaces_a_leading_slash_command(tmp_path):
+    from rustflow.agents import AgentCall, with_role
+    from rustflow.config import AgentSpec
+    call = AgentCall(role="tob_audit", name="audit-tob", spec=AgentSpec("claude", "opus", "high"),
+                     prompt="/rust-review:rust-review scope src\n\nNon-interactive run.", write=True, schema=None,
+                     cwd=tmp_path, log_dir=tmp_path)
+    prompt = with_role(call).prompt
+    assert prompt.startswith("/rust-review:rust-review scope src\n") and "SOUNDNESS/SECURITY" not in prompt.split("\n")[0]
+    assert "audit plugin" in prompt
 
 
 def test_installer_preloads_always_on_skills_in_reviewer_agent(tmp_path):

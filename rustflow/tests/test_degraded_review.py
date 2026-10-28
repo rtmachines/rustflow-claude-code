@@ -49,10 +49,19 @@ def test_degraded_run_can_be_reviewed_again(rust_repo, monkeypatch):
 
 def test_planned_single_reviewer_rereview_is_not_degraded(rust_repo, monkeypatch, tmp_path):
     cfg = tmp_path / "rf.toml"
-    cfg.write_text((rust_repo / "rustflow.toml").read_text().replace('rereview = "both"', 'rereview = "first"'))
+    cfg.write_text((rust_repo / "rustflow.toml").read_text().replace('rereview = "auto"', 'rereview = "first"'))
     rc, st = _run(rust_repo, "happy", monkeypatch, config=cfg)
     assert st["status"].startswith("approved") and len(st["rounds"]) == 2
     assert list(st["rounds"][1]["verdicts"]) == ["reviewer_a"]          # by configuration, not a failure
+    assert "degraded_review" not in st and runs.summary(st)["degraded"] == []
+
+
+def test_auto_rereview_skips_the_reviewer_with_nothing_open(rust_repo, monkeypatch):
+    # Live run A: reviewer_a approved round 1 with no findings and still re-reviewed (18% of the run cost).
+    rc, st = _run(rust_repo, "only_b", monkeypatch)
+    assert st["status"].startswith("approved") and len(st["rounds"]) == 2, st.get("stop_reason")
+    assert st["rounds"][0]["verdicts"] == {"reviewer_a": "APPROVE", "reviewer_b": "REQUEST_CHANGES"}
+    assert list(st["rounds"][1]["verdicts"]) == ["reviewer_b"]
     assert "degraded_review" not in st and runs.summary(st)["degraded"] == []
 
 

@@ -4,7 +4,9 @@ Every rule the compiler enforces is one finding an LLM reviewer no longer has to
 every edit). Turning lints on in an existing codebase usually turns the gates red, so this command
 MEASURES each candidate with one clippy run and adopts only the lints the code already satisfies.
 The rest are reported with counts, ready to adopt once cleaned up. Candidates come from the
-rust-feedback-loop workspace lint set (+ undocumented_unsafe_blocks for the REVIEW.md SAFETY rule).
+rust-feedback-loop workspace lint set, plus lints that enforce REVIEW.md rules a reviewer would otherwise
+have to catch: undocumented_unsafe_blocks (SAFETY comments), let_underscore_must_use / unused_result_ok
+(swallowed errors), allow_attributes_without_reason (#[expect(lint, reason)]) and indexing_slicing.
 """
 
 from __future__ import annotations
@@ -46,6 +48,12 @@ CANDIDATES: tuple[Candidate, ...] = (
     Candidate("clippy", "unimplemented", "warn", "unimplemented!() left in code"),
     Candidate("clippy", "dbg_macro", "warn", "dbg!() left in code", "allow-dbg-in-tests"),
     Candidate("clippy", "undocumented_unsafe_blocks", "warn", "unsafe block without // SAFETY: (REVIEW.md)"),
+    Candidate("clippy", "let_underscore_must_use", "warn", "`let _ =` swallowing a Result/#[must_use] value (REVIEW.md)"),
+    Candidate("clippy", "unused_result_ok", "warn", "`.ok();` discarding an error (REVIEW.md)"),
+    Candidate("clippy", "allow_attributes_without_reason", "warn",
+              "#[allow] without reason = \"...\" (REVIEW.md: #[expect(lint, reason)])"),
+    Candidate("clippy", "indexing_slicing", "warn", "panicking index/slice on input-dependent paths",
+              "allow-indexing-slicing-in-tests"),
     Candidate("clippy", "large_futures", "warn", "huge futures moved around (stack/perf)"),
     Candidate("clippy", "unused_async", "warn", "async fn that never awaits"),
     Candidate("clippy", "print_stderr", "warn", "eprintln! instead of tracing (services/libraries)"),
@@ -188,7 +196,7 @@ def apply(root_manifest: Path, members: list[Path], is_ws: bool, adopt: list[Can
         add = [f"{k} = true" for k in keys if k not in have]
         if add:
             clippy_toml.write_text(existing.rstrip() + ("\n" if existing else "")
-                                   + "# tests may unwrap/expect/panic/dbg (assert! panics too)\n"
+                                   + "# tests may unwrap/expect/panic/dbg/index (assert! panics too)\n"
                                    + "\n".join(add) + "\n", encoding="utf-8")
             notes.append(f"{clippy_toml.name}: " + ", ".join(add))
     return notes

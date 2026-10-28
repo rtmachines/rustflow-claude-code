@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from rustflow import gates, usage
+from rustflow import gates, integrity, usage
 
 RUNS = Path(".rustflow") / "runs"
 APPROVED = ("approved", "approved_with_advisories")
@@ -170,7 +170,7 @@ def effective_status(state: dict) -> str:
 # ── decision protocol ────────────────────────────────────────────────────────
 def degraded(state: dict) -> list[str]:
     """Reviewers planned for the last review round that returned no result (a planned single-reviewer
-    re-review, `rereview = "first"`, is not a failure)."""
+    re-review, `rereview = "first"` or `"auto"`, is not a failure)."""
     rounds = state.get("rounds") or []
     return list(rounds[-1].get("failed_reviewers") or []) if rounds else []
 
@@ -178,6 +178,34 @@ def degraded(state: dict) -> list[str]:
 def _mcp(tool: str, **arguments) -> dict:
     """The same step as the action's CLI `command`, as an MCP tool call for a driver on `mcp__rustflow__*`."""
     return {"tool": tool, "arguments": arguments}
+
+
+MAX_GATE_ITEMS = 15
+
+
+_display_safe = gates.display_safe
+
+
+def _gate_changes_question(state: dict) -> str:
+    """Driver-facing text: scanner-generated fields only (no justification or vote reasons), bounded in size."""
+    entries = integrity.pending(state.get("gate_changes") or [])
+    items = []
+    for e in entries[:MAX_GATE_ITEMS]:
+        votes = ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "none"
+        items.append(f"[{_display_safe(e.get('id'))}] {e.get('kind')} `{_display_safe(e.get('path', ''))}` "
+                     f"({_display_safe(e.get('detail') or '', 300)}; proof: {e.get('proof') or 'none'}; votes: {votes})")
+    more = f"; +{len(entries) - MAX_GATE_ITEMS} more - see report.md" if len(entries) > MAX_GATE_ITEMS else ""
+    return ("The change touches files that decide what the gates check, and it is not accepted: "
+            + "; ".join(items) + more + ". Either revert it by hand in the work tree and run `resume --extra-rounds 1` "
+            "(gates and review run again), or commit it on the base as a policy change and start the run again.")
+
+
+def _accepted_gate_note(state: dict) -> str:
+    ids = [_display_safe(e.get("id")) for e in state.get("gate_changes") or [] if e.get("status") == "accepted"]
+    if not ids:
+        return ""
+    more = f", +{len(ids) - MAX_GATE_ITEMS} more" if len(ids) > MAX_GATE_ITEMS else ""
+    return "includes accepted gate changes: " + ", ".join(ids[:MAX_GATE_ITEMS]) + more
 
 
 def next_actions(state: dict) -> list[dict]:
@@ -196,7 +224,9 @@ def next_actions(state: dict) -> list[dict]:
                  "mcp": _mcp("rustflow_wait", run=rid, timeout_s=600),
                  "note": "do not edit files or change git state in this checkout meanwhile"}]
     if st in APPROVED:
-        acts.append({"action": "present_result", "note": "summarize the change and the report for the user"})
+        gate_note = _accepted_gate_note(state)
+        acts.append({"action": "present_result", "note": "summarize the change and the report for the user"
+                     + (f"; {gate_note}" if gate_note else "")})
         if failed_reviewers := degraded(state):
             errors = (state.get("degraded_review") or {}).get("errors") or {}
             why = "; ".join(f"{n}: {errors[n][:120]}" for n in failed_reviewers if errors.get(n))
@@ -215,7 +245,8 @@ def next_actions(state: dict) -> list[dict]:
                          "note": "unsafe/FFI/atomics changed - soundness audit recommended before merge"})
         if branch and state.get("isolation") == "branch":
             acts.append({"action": "merge", "needs_user": True,
-                         "command": f"git switch {orig} && git merge --squash {branch}"})
+                         "command": f"git switch {orig} && git merge --squash {branch}",
+                         **({"note": gate_note} if gate_note else {})})
         elif branch and state.get("isolation") == "worktree":
             wt = state.get("workdir", "")
             if state.get("worktree_removed"):
@@ -225,10 +256,17 @@ def next_actions(state: dict) -> list[dict]:
                         f"merge in the main checkout; afterwards `git worktree remove {wt}`")
             else:
                 note = f"in the main checkout ({orig} is checked out there); afterwards `git worktree remove {wt}`"
+            if gate_note:
+                note += f"; {gate_note}"
             acts.append({"action": "merge", "needs_user": True, "command": f"git merge --squash {branch}",
                          "note": note})
         acts.append({"action": "comment_pr", "command": f"rustflow comment {rid}", "needs_user": True})
         return acts
+    if st == "gate_changes_pending":
+        return [{"action": "ask_user", "needs_user": True,
+                 "question": _gate_changes_question(state),
+                 "command": f"rustflow resume {rid} --extra-rounds 1 --detach",
+                 "mcp": _mcp("rustflow_resume", run=rid, extra_rounds=1)}]
     if st == "changes_requested":
         return [{"action": "ask_user", "question": f"{len(open_)} blocking finding(s). Run the fix loop?",
                  "command": f"rustflow review --fix --base {base} --detach",
@@ -288,7 +326,10 @@ def summary(state: dict, *, findings_limit: int = MAX_BRIEF_FINDINGS) -> dict:
     def brief(f: dict) -> dict:
         return {"id": f["id"], "severity": f["severity"],
                 "where": f"{f['file']}:{f['line']}" if f.get("file") else "", "title": f["title"][:160]}
+    gate_changes = state.get("gate_changes") or []
     return {
+        "gate_changes": {"pending": len(integrity.pending(gate_changes)),
+                         "accepted": sum(1 for e in gate_changes if e.get("status") == "accepted")},
         "run_id": state.get("run_id"), "status": st, "phase": state.get("phase"), "round": state.get("round"),
         "difficulty": state.get("difficulty"), "cost_usd": state.get("cost_usd", 0.0),
         "usage_summary": usage.summary_for_state(state),
@@ -329,6 +370,9 @@ def brief_markdown(s: dict, mcp: bool = False) -> str:
         if s[key]:
             lines.append(f"{label}:")
             lines += [f"  [{f['id']}] {f['severity']} {f['where']} {f['title']}" for f in s[key]]
+    gc = s.get("gate_changes") or {}
+    if gc.get("pending") or gc.get("accepted"):
+        lines.append(f"gate changes: {gc.get('pending', 0)} pending, {gc.get('accepted', 0)} accepted")
     if s["advisory_count"]:
         lines.append(f"advisory: {s['advisory_count']}")
     if s.get("degraded"):
@@ -362,7 +406,8 @@ def exit_code(status: str) -> int:
 
 # ── wait / cancel ────────────────────────────────────────────────────────────
 def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channel: str = "cli") -> dict:
-    """Block until the run finishes or timeout; stream only NEW orchestrator log lines (compact).
+    """Block until the run finishes (final status saved and its ACTIVE lock released) or timeout; stream only
+    NEW orchestrator log lines (compact).
     channel: each kind of waiter (CLI, MCP server) has its own read position, so one does not consume the
     progress lines the other has not seen yet."""
     log = run_dir / "rustflow.log"
@@ -385,9 +430,16 @@ def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channe
         offset_file.write_text(str(offset), encoding="utf-8")
         state = load_state(run_dir)
         status = effective_status(state)
-        if status != "running" or time.monotonic() >= deadline:
+        if time.monotonic() >= deadline or (status != "running" and not _holds_lock(run_dir, state)):
             return summary(state)
         time.sleep(poll_s)
+
+
+def _holds_lock(run_dir: Path, state: dict) -> bool:
+    """The orchestrator saves the final status, then writes the report and only then releases ACTIVE.json;
+    a waiter that acted in between was still locked out of the checkout (hooks, `acquire`)."""
+    act = gates.read_active(run_dir.parent.parent.parent)
+    return bool(act) and act.get("run_id") == state.get("run_id")
 
 
 def _windows_interrupt(pid: int, private_console: bool = False) -> None:

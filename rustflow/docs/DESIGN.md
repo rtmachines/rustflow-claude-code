@@ -15,11 +15,11 @@ Problemy:
 |---|---|---|---|
 | 1 | Kompilacja dopiero na końcu | Dwóch drogich recenzentów czyta kod, który się nie kompiluje; fixer może zepsuć build i nikt tego nie wie aż do końca | Bramki deterministyczne (fmt, clippy `-D warnings`, testy, doctesty) **po każdym kroku zmieniającym kod i zawsze przed recenzją**. Czerwone → fixer naprawia build (limit prób) → nadal czerwone = stop |
 | 2 | Brak kroku "czy baza jest zielona" | Agent dostaje winę za cudze błędy, pętla naprawia nie to, co trzeba | Preflight: bramki na bazie; czerwona baza = stop albo `--accept-red-baseline` (blokują tylko NOWE błędy) |
-| 3 | Brak specyfikacji dla recenzentów | Recenzent ocenia "czy ładne", a nie "czy spełnia zadanie" | Planner dla zadań hard: kroki + **kryteria akceptacji**; recenzenci zawsze zwracają status każdego wymagania (`met/not_met/unclear`); `not_met` = blokujący finding |
+| 3 | Brak specyfikacji dla recenzentów | Recenzent ocenia "czy ładne", a nie "czy spełnia zadanie" | Planner dla zadań hard: kroki + **kryteria akceptacji**; recenzenci zawsze zwracają status każdego wymagania (`met/not_met/unclear`); `not_met` = blokujący finding (P1; gdy recenzent wskaże swój finding polem `finding`, ten finding zostaje podniesiony do P1 zamiast dublowania go bez kotwicy) |
 | 4 | "Dwóch niezależnych" bez mechanizmu niezależności | Dwa takie same modele z tym samym promptem dają skorelowane błędy | Różne rodziny modeli (Claude + Codex) i różne soczewki (poprawność/soundness vs design/idiomy); równolegle, bez wglądu w siebie nawzajem |
 | 5 | Nie wiadomo, kto rozstrzyga między recenzentami | Fixer dostaje sprzeczne, zduplikowane lub zmyślone uwagi | **Deterministyczna agregacja** (bez LLM): walidacja `plik:linia` (nieistniejący plik = odrzucony), deduplikacja, potwierdzenie przez 2 recenzentów, polityka P0–P3, próg pewności |
 | 6 | Fixer musi przyjąć każdą uwagę | Fałszywe alarmy psują kod | Fixer zwraca status per finding: `fixed/partial/rejected` z dowodem; recenzent w kolejnej rundzie akceptuje odrzucenie albo je podtrzymuje; 2 razy spór = decyzja człowieka |
-| 7 | Powrót do pełnej recenzji w każdej rundzie | Koszt rośnie liniowo, recenzent gubi kontekst poprawek | Re-recenzja **przyrostowa**: delta od ostatniej recenzji + lista poprzednich findingów z odpowiedziami fixera; opcja `rereview = "first"` (jeden recenzent) |
+| 7 | Powrót do pełnej recenzji w każdej rundzie | Koszt rośnie liniowo, recenzent gubi kontekst poprawek | Re-recenzja **przyrostowa**: delta od ostatniej recenzji + lista poprzednich findingów z odpowiedziami fixera; domyślnie `rereview = "auto"`: w rundzie >= 2 recenzuje tylko autor otwartych findingów, jeśli poprawka nie wyszła poza ich pliki (zmierzone: recenzent bez findingów w r2 to 18% kosztu runu); opcja `rereview = "first"` (jeden recenzent) |
 | 8 | Tylko limit rund jako warunek stopu | Pętla kręci się bez postępu do limitu | Wykrywanie zastoju (te same blokujące ID po fixie albo fixer nic nie zmienił), eskalacja effortu fixera przy powtórce, budżet $ na cały run |
 | 9 | Brak izolacji i punktów kontrolnych | Trudno cofnąć, trudno przejrzeć zmiany | Gałąź `rustflow/<run>` (albo worktree), commit-checkpoint po każdej fazie, scalenie przez człowieka (`merge --squash`) |
 | 10 | Brak ścieżki dla `unsafe`/FFI | Zwykły recenzent nie zrobi audytu soundness | Sygnały ryzyka w dodanych liniach → recenzenci na poziomie hard, opcjonalny trzeci recenzent-audytor, flaga **ESCALATE** w raporcie (np. `/rust-review:rust-review` Trail of Bits) |
@@ -69,6 +69,7 @@ Domyślnie: reviewer_a = Claude (soczewka poprawności), reviewer_b = Codex (soc
 | `rustflow/criteria.py` | kryteria akceptacji, ocena wymaganych testów z wyniku bramek (bez LLM) |
 | `rustflow/gates.py` | bramki (standalone; kopiowane do `.rustflow/gates.py`) |
 | `rustflow/hooks.py` | hooki Claude Code (standalone; `.rustflow/hooks.py`) |
+| `rustflow/integrity.py` | scan zmian wpływających na bramki, dowód, zgody (standalone; kopiowane do `.rustflow/integrity.py`) |
 | `rustflow/triage.py` | heurystyka trudności + schemat triage LLM |
 | `rustflow/prompts.py` | prompty ról |
 | `rustflow/templates/` | rustflow.toml, skills, REVIEW.md, bloki AGENTS/CLAUDE.md, CI |
@@ -80,6 +81,18 @@ Domyślnie: reviewer_a = Claude (soczewka poprawności), reviewer_b = Codex (soc
 - Sandbox Codex na Windows jest słabszy niż na Linux/macOS; dla Codex-implementera na Windows rozważ WSL.
 - Izolacja `worktree` wymaga, by `.rustflow/`, `.claude/`, `.agents/` były zacommitowane (worktree powstaje z HEAD).
 - `cargo` w bramkach wykonuje `build.rs` i makra proc zależności - niezaufane repo uruchamiaj w kontenerze.
+- Tryb interaktywny (bez `rustflow run`) gwarantuje tylko zielone bramki dla tego, co trafia do HEAD/merge; pełny cykl (triage, plan, dwie recenzje, fix, bramki final) jest opcjonalny.
+- Dowód sprawdza tylko bieżące drzewo: zaakceptowana zmiana konfiguracji może osłabić bramki dla przyszłych zmian po merge'u (widoczne w raporcie).
+- Zgoda recenzentów dla `cargo-lints` i `tests-removed` to osąd dwóch modeli; skorelowany błąd albo prompt injection w diffie może dać fałszywą zgodę (ślad w raporcie, status `approved_with_advisories`).
+- W trybie interaktywnym zgodą dla zmian bez dowodu jest commit człowieka poza Claude Code; bramka commita rozpoznaje tylko komendy pasujące do wzorca `git commit` i ocenia drzewo robocze, nie indeks.
+- `cargo-lints` bez parsera TOML (Python < 3.11 bez `tomli`) działa zachowawczo i może blokować zmiany neutralne.
+- Cache wyników bramek i dowodu w `.rustflow/cache/` nie jest chroniony przed zapisem przez agenta.
+- Reguły `--disallowedTools` dla ról piszących nie obejmują zapisu przez Bash; o blokadzie decyduje detekcja w diffie.
+- Przy `--accept-red-baseline` dowód nie uwzględnia czerwonej bazy, więc zmiany dowodliwe kończą się porażką dowodu (blokują zachowawczo).
+- Wykrywanie w diffie to stały zestaw wzorców, nie analiza semantyczna. Znane luki poza specyfikacją: test zakomentowany blokowo (`/* #[test] ... */`), `#[should_panic]` dodane do padającego testu, `#[cfg(any())]` / `#[cfg(all(test, any()))]` na module testów, `#[cfg_attr(x, ignore)]`, `# [allow(..)]` i atrybut rozbity na wiele linii (rustfmt zwykle to normalizuje), `[lib] test = false` / `autotests = false` w `Cargo.toml` oraz osłabienie ciała testu (`assert!(true)`).
+- Hook Stop i bramka commita (bramki + dowód) mają limit czasu 1800 s; po jego przekroczeniu Claude Code traktuje hook jako niekrytyczny błąd (fail-open) i nic nie trafia do cache.
+- Pliki konfiguracji ukryte w `.gitignore` (np. `.cargo/config.toml`) są traktowane jak zmiany `config`: w trybie interaktywnym każdy obecny, w orkiestratorze nowy lub zmieniony względem stanu z preflightu. Dowód uruchamia bramki w worktree bez nich, więc projekt, który faktycznie wymaga takiego pliku do budowy, zostanie zablokowany.
+- Wygenerowane CI uruchamia `gates.py` na roboczym `rustflow.toml` PR-a i bez skanu integralności, więc PR, który osłabia `[gates]`, osłabia także własne bramki CI.
 
 ## 6. Prompt caching
 
@@ -96,11 +109,14 @@ Pomiary z runów na żywo (Claude Code 2.1.310, haiku):
 Wnioski:
 - **Najwięcej tokenów to tury wewnątrz jednej sesji agenta**, a tam cache działa normalnie. Hooki
   (feedback z `cargo check`, blokada Stop) tylko dopisują wiadomości na końcu, nie zmieniają prefiksu.
-- **Między rolami cache i tak nie może być współdzielony**: inne modele (cache jest per model), inny
-  zestaw narzędzi (recenzent bez Edit/Write, z narzędziem structured output). To cecha separacji ról,
-  nie błąd architektury; koszt to jednorazowy zapis ~15-30k tokenów na wywołanie.
-- **Ta sama rola w kolejnej rundzie korzysta z cache** (prefiks narzędzia + system + skill), bo
-  rustflow trzyma stały `--append-system-prompt` per rola, a wszystko zmienne (diff, runda, findingi)
+- **Między rolami o innym modelu lub zestawie narzędzi cache nie jest współdzielony** (cache jest per
+  model; recenzent nie ma Edit/Write). Implementer i fixer mają jednak ten sam model i te same narzędzia,
+  więc system prompt jest **identyczny dla wszystkich ról** (`SHARED_SYSTEM` + skille always-on), a linia
+  roli trafia do promptu za komendą skilla. Zmierzone na żywo przed tą zmianą: fixer startujący 3,5 min po
+  implementerze zapisał do cache cały prefiks od nowa (~35k tokenów, cache_read = 0), bo różniła się
+  tylko linia roli; zapis cache to ~54% kosztu Claude w runie.
+- **Ta sama rola w kolejnej rundzie korzysta z cache** (prefiks narzędzia + system + skill; zmierzone:
+  24k tokenów odczytu w pierwszej turze recenzenta r2), bo wszystko zmienne (rola, diff, runda, findingi)
   jest w wiadomości użytkownika.
 - `--exclude-dynamic-system-prompt-sections` (domyślnie włączone) przenosi cwd/git status do pierwszej
   wiadomości: nazwa gałęzi `rustflow/<run>` i ścieżka worktree są unikalne per run i inaczej
@@ -222,8 +238,8 @@ Zweryfikowane na żywo (Claude Code 2.1.310, haiku jako dyspozytor i recenzenci)
 
 Skill wywoływany przez model ładuje się tylko wtedy, gdy model uzna, że opis pasuje do zadania, więc skill
 stacku czy rust-skills może nie zostać przeczytany wcale. `[skills]` (domyślnie `all = ["auto"]`) dołącza je
-deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (plik stały dla roli, więc
-zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
+deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (treść identyczna dla
+wszystkich ról z tymi samymi skillami, więc zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
 Brak jawnie wymienionego skilla to błąd w preflight, a `max_kb` chroni kontekst. Zweryfikowane na żywo:
 fraza ukryta w skillu dołączonym przez `--append-system-prompt-file` wróciła w odpowiedzi modelu.
 

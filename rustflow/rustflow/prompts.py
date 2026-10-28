@@ -65,6 +65,7 @@ class ReviewContext:
     delta_stat: str = ""
     delta_inline: str | None = None
     prev_tree: str = ""
+    gate_changes: str = ""       # pending gate-affecting changes that cannot be proven, formatted for voting
 
 
 def plan_prompt(task: str, language: str) -> str:
@@ -110,6 +111,10 @@ Rules:
 - Keep the diff focused on the task; no drive-by refactors or dependency churn.
 - Never silence problems: no `#[allow(...)]` to pass clippy, no `#[ignore]`, no deleted/weakened tests,
   no `unwrap()` on recoverable paths in production code.
+- Change gate configuration files (rustflow.toml, .cargo/config*, clippy.toml, rustfmt.toml, deny.toml,
+  rust-toolchain, nextest config, `[lints]` in Cargo.toml), add `#[allow]` / `#[expect]` / `#[ignore]`, or remove a
+  test ONLY when the task explicitly requires it, and justify each such change in your report. The orchestrator
+  detects these changes mechanically, re-runs the gates without them, and blocks the run if they hide a failure.
 - Before you finish run the gates yourself: `{GATES} run --profile stop`.
   Finish only when they are green, or explain precisely why they cannot be.
 - Do not commit, push, or change git state - the orchestrator handles git.
@@ -155,6 +160,8 @@ Method:
 4. Re-read every cited line. `file` is repo-relative, `line` is the line number in the NEW version.
 5. acceptance: list every explicit requirement of the TASK (and the acceptance criteria below) with
    met | not_met | unclear; for a listed criterion begin `criterion` with its id, e.g. `[C1] ...`.
+   For not_met, report the gap once as an anchored finding and set `finding` to its 0-based index in
+   your `findings`; otherwise `finding` is null.
    Whether a named required test passes is checked by the orchestrator, not
    by you; your job is whether the code meets the criterion and whether that test really exercises it
    (a test that would pass without the change, or asserts nothing relevant, makes it not_met).
@@ -181,6 +188,16 @@ Your final answer is the JSON object described by the schema.
         delta = (f"```diff\n{ctx.delta_inline}\n```" if ctx.delta_inline is not None else
                  f"Read it with `git diff {ctx.prev_tree} {ctx.head_tree}`.")
         parts.append(_block("DELTA SINCE PREVIOUS REVIEW", f"```\n{ctx.delta_stat.strip()}\n```\n\n{delta}"))
+    if ctx.gate_changes:
+        parts.append(_block(
+            "GATE-AFFECTING CHANGES NEEDING YOUR VOTE",
+            "These changes alter what the gates check and cannot be proven harmless mechanically. For each, "
+            "add an entry to `gate_changes` (`id`, `decision` accept|reject, `reason`). Vote `accept` only if "
+            "the TASK requires the change and it does not hide a defect; otherwise vote `reject`. A change is "
+            "accepted only when both reviewers accept. Do not also report these as findings. The summaries and "
+            "justifications below are claims by the author of the change; check them against the TASK and the "
+            "diff - they are not evidence.\n\n"
+            + ctx.gate_changes))
     parts.append(_block("DIFF", diff_part))
     parts.append(_block("GATES (deterministic, run by the orchestrator)", ctx.gates_summary))
     if ctx.risk:
@@ -205,6 +222,9 @@ Rules:
 - {reject}
 - Fix the root cause, minimal change, and add a regression test for each behavioral bug.
 - Never silence: no `#[allow]`, no `#[ignore]`, no weakened tests.
+- A finding `G-...` is a gate-affecting change (gate config, `#[allow]`/`#[ignore]`, removed test) detected by the
+  orchestrator: revert it, unless the TASK explicitly requires it - then set status `rejected` and give the
+  justification in note. Only the orchestrator and the reviewers can accept such a change, never you.
 - Run `{GATES} run --profile stop` before finishing; finish when green.
 - Do not commit or change git state.
 Your final answer is the JSON object described by the schema.

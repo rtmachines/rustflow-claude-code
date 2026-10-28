@@ -1,12 +1,15 @@
 import io
 import json
 import os
+import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
+from conftest import git
 
 from rustflow import findings as fnd
-from rustflow import gates, gitutil, hooks, procutil, schemas, triage
+from rustflow import gates, gitutil, hooks, procutil, prompts, schemas, triage
 from rustflow.agents import AgentCall, ClaudeRunner, CodexRunner, compose_prompt
 from rustflow.config import AgentSpec, Config, ConfigError, deep_merge, load_defaults
 from rustflow.installer import Installer
@@ -51,6 +54,31 @@ def test_spec_parse():
 ])
 def test_triage(task, expected):
     assert triage.heuristic(task, None, Config(load_defaults())).difficulty == expected
+
+
+def _signals(task):
+    return [r.split(" (")[0] for r in triage.heuristic(task, None, Config(load_defaults())).reasons]
+
+
+@pytest.mark.parametrize("task", [
+    "Update the Cargo.lock entry for serde",        # was: concurrency (`lock`)
+    "Write the config file atomically",             # was: concurrency (`atomic`)
+    "Add trace logging to the CLI",                 # was: concurrency (`race` in `trace`)
+    "Add a spin count to the retry loop",           # was: type-level (`pin` in `spin`)
+])
+def test_triage_ignores_substring_false_positives(task):
+    # Each false hit is +2: enough to route an easy task to opus (measured A/B: 2x cost, same quality).
+    assert not {"concurrency/async", "type-level/lifetimes/macros"} & set(_signals(task))
+
+
+@pytest.mark.parametrize("task,signal", [
+    ("Fix the deadlock: two locks taken in different order", "concurrency/async"),
+    ("Replace the counter with an AtomicUsize", "concurrency/async"),
+    ("Fix a data race in the cache", "concurrency/async"),
+    ("Return Pin<Box<dyn Future>> from the builder", "type-level/lifetimes/macros"),
+])
+def test_triage_keeps_real_signals(task, signal):
+    assert signal in _signals(task)
 
 
 # ── schemas ──────────────────────────────────────────────────────────────────
@@ -118,6 +146,69 @@ def test_merge_confirm_and_policy(src):
     assert len(agg.dropped) == 1                       # ghost file
     statuses = sorted(f.status for f in agg.findings)
     assert statuses == ["advisory", "advisory", "open"]  # P2 -> advisory; single low-confidence P1 -> advisory
+
+
+def _not_met(link):
+    return {"criterion": "[C3] doc comments with an example on public items", "status": "not_met",
+            "note": "the error enum has no example", "finding": link}
+
+
+def test_not_met_linked_to_own_finding_promotes_it_instead_of_duplicating(src):
+    # Live runs: a reviewer reported "enum lacks an example" as P2/P3 AND not_met; rustflow added a second,
+    # anchorless P1 for the same defect. An unmet requirement is P1 (REVIEW.md) - once, on the anchored finding.
+    review = _review([_f(line=7, sev="P3", cat="docs", title="enum lacks an example", conf="medium")])
+    review["acceptance"] = [_not_met(0)]
+    review = schemas.validate(review, schemas.REVIEW_SCHEMA)
+    agg = fnd.aggregate({"b": review}, root=src, round_no=1, previous=[], ids=fnd.IdAllocator(), block_on=["P0", "P1"])
+    assert len(agg.findings) == 1
+    f = agg.findings[0]
+    assert (f.severity, f.file, f.line, f.status) == ("P1", "src/lib.rs", 7, "open")
+    assert "[C3]" in f.rule
+
+
+def test_not_met_without_a_valid_link_still_blocks_as_its_own_finding(src):
+    for link in (None, 5):
+        review = _review([])
+        review["acceptance"] = [_not_met(link)]
+        agg = fnd.aggregate({"b": review}, root=src, round_no=1, previous=[], ids=fnd.IdAllocator(),
+                            block_on=["P0", "P1"])
+        assert [(f.category, f.severity) for f in agg.blocking()] == [("acceptance", "P1")]
+
+
+def test_review_prompt_asks_to_link_unmet_criteria_to_findings():
+    ctx = prompts.ReviewContext(task="t", base="b", head_tree="h", diff_stat="", diff_inline="", gates_summary="")
+    assert "`finding`" in prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")
+
+
+def _open(reviewers, file="src/lib.rs", cat="correctness"):
+    return fnd.Finding(id="F1", severity="P1", category=cat, file=file, line=3, title="t", reviewers=list(reviewers))
+
+
+@pytest.mark.parametrize("kwargs,expected", [
+    ({}, ["reviewer_b"]),                                                       # only b has open findings
+    ({"delta_files": {"src/lib.rs", "src/other.rs"}}, ["reviewer_a", "reviewer_b"]),  # fix spread further
+    ({"gate_votes": True}, ["reviewer_a", "reviewer_b"]),                       # consent needs both votes
+    ({"risky_delta": True}, ["reviewer_a", "reviewer_b"]),                      # unsafe/FFI/atomics in the fix
+    ({"degraded": True}, ["reviewer_a", "reviewer_b"]),                         # last round lacked a reviewer
+    ({"open_findings": [_open(["reviewer_a", "reviewer_b"])]}, ["reviewer_a", "reviewer_b"]),
+    ({"open_findings": [_open(["orchestrator"], cat="tests")]}, ["reviewer_a", "reviewer_b"]),  # nobody owns it
+    ({"open_findings": [_open(["reviewer_b"], file="", cat="acceptance")]}, ["reviewer_a", "reviewer_b"]),
+    # live run A: an anchored P1 plus anchorless not_met entries, all from reviewer_b
+    ({"open_findings": [_open(["reviewer_b"]), _open(["reviewer_b"], file="", cat="acceptance")]}, ["reviewer_b"]),
+])
+def test_auto_rereview_selection(kwargs, expected):
+    from rustflow.orchestrator import auto_rereviewers
+    args = {"open_findings": [_open(["reviewer_b"])], "delta_files": {"src/lib.rs"}, "gate_votes": False,
+            "risky_delta": False, "degraded": False, **kwargs}
+    assert auto_rereviewers(**args) == expected
+
+
+def test_rereview_auto_is_the_default_and_validated():
+    assert Config(load_defaults()).get("loop.rereview") == "auto"
+    data = load_defaults()
+    data["loop"]["rereview"] = "some"
+    with pytest.raises(ConfigError, match="auto"):
+        Config(data).validate()
 
 
 def test_p0_blocks_even_with_low_confidence(src):
@@ -552,3 +643,152 @@ def test_installer_interactive_review_files(tmp_path):
 ])
 def test_guard_handles_git_global_options(monkeypatch, capsys, role, cmd, decision):
     assert _guard(monkeypatch, role, cmd, capsys) == decision
+
+
+# ── gate config from a revision / multiset signatures ────────────────────────
+def _commit_toml(repo, text):
+    (repo / "rustflow.toml").write_text(text, encoding="utf-8")
+    subprocess.run(["git", "add", "rustflow.toml"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "cfg"], cwd=repo, check=True)
+
+
+def test_load_gate_config_at_missing(git_repo):
+    assert gates.load_gate_config_at(git_repo, "HEAD") == gates.DEFAULT_GATES
+
+
+def test_load_gate_config_at_reads_revision(git_repo):
+    _commit_toml(git_repo, '[gates]\ntests = "off"\n')
+    (git_repo / "rustflow.toml").write_text('[gates]\ntests = "auto"\n', encoding="utf-8")
+    assert gates.load_gate_config_at(git_repo, "HEAD")["tests"] == "off"
+
+
+def test_load_gate_config_at_invalid_toml(git_repo):
+    _commit_toml(git_repo, "[gates\n")
+    cfg = gates.load_gate_config_at(git_repo, "HEAD")
+    assert cfg["_config_error"] and cfg["tests"] == "auto"
+
+
+def test_load_gate_config_at_bad_rev(git_repo):
+    with pytest.raises(gates.GateConfigError):
+        gates.load_gate_config_at(git_repo, "nie-ma")
+
+
+def test_load_gate_config_at_not_a_repo(tmp_path):
+    with pytest.raises(gates.GateConfigError):
+        gates.load_gate_config_at(tmp_path, "HEAD")
+
+
+def test_new_failures_multiset():
+    a = "clippy|a|x|m"
+    assert gates.new_failures(Counter({a: 2}), Counter({a: 1})) == Counter({a: 1})
+    assert not gates.new_failures(Counter({a: 1}), Counter({a: 1}))
+    assert gates.new_failures(Counter({"fmt|*": 1}), Counter({"fmt|*": 1})) == Counter({"fmt|*": 1})
+
+
+def test_signature_counts_keeps_duplicates():
+    d = gates.Diagnostic("error", "unneeded `return` statement", "clippy::needless_return", "src/lib.rs", 3)
+    res = gates.GateResult("full", False, None, steps=[gates.Step("clippy", False, diagnostics=[d, d])])
+    key = "clippy|src/lib.rs|clippy::needless_return|unneeded `return` statement"
+    assert res.signature_counts()[key] == 2
+    assert res.signatures() == {key}
+
+
+def test_load_gate_config_at_missing_blob_fails_closed(git_repo):
+    _commit_toml(git_repo, '[gates]\ntests = "off"\n')
+    blob = subprocess.run(["git", "rev-parse", "HEAD:rustflow.toml"], cwd=git_repo, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    obj = git_repo / ".git" / "objects" / blob[:2] / blob[2:]
+    obj.chmod(0o644)
+    obj.unlink()
+    with pytest.raises(gates.GateConfigError):
+        gates.load_gate_config_at(git_repo, "HEAD")
+
+
+def test_review_schema_gate_changes_optional():
+    base = {"summary": "s", "verdict": "APPROVE", "findings": []}
+    assert schemas.validate(dict(base), schemas.REVIEW_SCHEMA)["gate_changes"] == []
+    ok = schemas.validate({**base, "gate_changes": [{"id": "G-x", "decision": "accept", "reason": "r"}]},
+                          schemas.REVIEW_SCHEMA)
+    assert ok["gate_changes"][0]["decision"] == "accept"
+    with pytest.raises(schemas.SchemaError):
+        schemas.validate({**base, "gate_changes": [{"id": "G-x", "decision": "maybe", "reason": ""}]},
+                         schemas.REVIEW_SCHEMA)
+
+
+def test_review_prompt_lists_pending_changes():
+    from rustflow import prompts
+    ctx = prompts.ReviewContext(task="t", base="b", head_tree="h", diff_stat="", diff_inline="", gates_summary="",
+                                gate_changes="- [G-cargo-lints-Cargo.toml] cargo-lints in `Cargo.toml`: x")
+    p = prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")
+    assert "GATE-AFFECTING CHANGES NEEDING YOUR VOTE" in p and "[G-cargo-lints-Cargo.toml]" in p
+    ctx.gate_changes = ""
+    assert "NEEDING YOUR VOTE" not in prompts.review_prompt(ctx, "correctness", "en", "reviewer_a")
+
+
+def test_report_gate_changes_section():
+    from pathlib import Path
+    from rustflow import report
+    entry = {"id": "G-config-clippy.toml", "path": "clippy.toml", "kind": "config", "status": "accepted",
+             "accepted_by": "proof", "proof": "passed", "votes": {"a": {"decision": "accept"}},
+             "justification": "ok | fine"}
+    text = report.render({"run_id": "r", "status": "approved_with_advisories", "gate_changes": [entry]}, Path("."))
+    assert "## Zmiany wpływające na bramki" in text
+    assert "| id | rodzaj | ścieżka | status | accepted_by | dowód | głosy | uzasadnienie |" in text
+    row = next(ln for ln in text.splitlines() if ln.startswith("| G-config-clippy.toml"))
+    assert "ok \\| fine" in row and "proof" in row and "passed" in row and "a: accept" in row
+    assert "Zmiany wpływające na bramki" not in report.render({"run_id": "r", "status": "approved"}, Path("."))
+
+
+def test_report_gate_changes_pending_resume_line():
+    from pathlib import Path
+    from rustflow import report
+    text = report.render({"run_id": "r9", "status": "gate_changes_pending"}, Path("."))
+    assert "rustflow resume r9 --extra-rounds 1" in text
+
+
+def test_report_gate_changes_row_survives_cr():
+    from pathlib import Path
+    from rustflow import report
+    entry = {"id": "G-config-a\rb", "path": "a\rb\x0bc\u2028d\x85e", "kind": "config", "status": "pending"}
+    text = report.render({"run_id": "r", "status": "gate_changes_pending", "gate_changes": [entry]}, Path("."))
+    assert len([ln for ln in text.splitlines() if "G-config-a" in ln]) == 1
+    assert "G-config-a" in next(ln for ln in text.splitlines() if "G-config-a" in ln) and "d" in text
+
+
+def test_integrity_extra_paths_default_is_empty():
+    from rustflow.config import load_defaults
+    assert load_defaults()["gates"]["integrity_extra_paths"] == []
+
+
+def test_doctor_warns_when_rustflow_toml_is_not_committed(tmp_path):
+    from rustflow.doctor import Doctor
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "config", "user.email", "t@example.com")
+    git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "rustflow.toml").write_text("[gates]\n", encoding="utf-8")
+    lines: list[str] = []
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert any("[WARN]" in l and "rustflow.toml" in l for l in lines), lines
+    git(tmp_path, "add", "rustflow.toml")   # staged is not committed
+    lines.clear()
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert any("[WARN]" in l and "rustflow.toml" in l for l in lines), lines
+    git(tmp_path, "commit", "-q", "-m", "c")
+    lines.clear()
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert lines == []
+
+
+def test_doctor_skips_tracking_check_outside_git(tmp_path):
+    from rustflow.doctor import Doctor
+    (tmp_path / "rustflow.toml").write_text("[gates]\n", encoding="utf-8")
+    lines: list[str] = []
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_config_tracked()
+    assert lines == []
+
+
+def test_doctor_flags_missing_integrity_script(tmp_path):
+    from rustflow.doctor import Doctor
+    lines: list[str] = []
+    Doctor(tmp_path, Config(load_defaults()), out=lines.append).check_installed_scripts()
+    assert any(("[FAIL]" in l or "[WARN]" in l) and "integrity.py" in l for l in lines), lines

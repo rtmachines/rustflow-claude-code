@@ -90,7 +90,7 @@ TOOLS: list[dict] = [
      "inputSchema": _obj({"run": RUN_REF})},
     {"name": "rustflow_resume",
      "description": "Resume an interrupted / budget-stopped / crashed / agent_failed run in the background. With "
-                    "extra_rounds: continue a run that ended max_rounds / stalled / final_gates_red / criteria_unmet "
+                    "extra_rounds: continue a run that ended max_rounds / stalled / final_gates_red / criteria_unmet / gate_changes_pending "
                     "with up to that many more fix rounds on its own branch or worktree.",
      "inputSchema": _obj({**LIMIT_PROPERTIES, "run": RUN_REF, "extra_rounds": {"type": "integer", "minimum": 1, "maximum": 5}})},
     {"name": "rustflow_gates",
