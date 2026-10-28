@@ -17,6 +17,8 @@ Profiles
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -25,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PureWindowsPath
 
@@ -54,6 +57,12 @@ DEFAULT_GATES = {
     "tree_stable": True,
 }
 RUNTIME_PATHS = ("target", ".rustflow/runs", ".rustflow/cache", ".rustflow/wt")
+CONFIG_PATTERNS: tuple[str, ...] = (
+    "rustflow.toml", ".cargo/config", ".cargo/config.toml", ".config/nextest.toml",
+    "clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml",
+    "rust-toolchain", "rust-toolchain.toml", "deny.toml",
+    ".gitattributes",   # changes how diffs (and checkout eol) are seen
+)
 MANIFEST_SPECS = ("Cargo.toml", "Cargo.lock", "*/Cargo.toml", "**/Cargo.toml")
 
 
@@ -115,15 +124,22 @@ class GateResult:
     def failed_steps(self) -> list[Step]:
         return [s for s in self.steps if not s.ok and not s.skipped]
 
-    def signatures(self) -> set[str]:
-        """Identity of each failure, to compare against a red baseline."""
-        sig: set[str] = set()
+    def signature_counts(self) -> Counter[str]:
+        """Failure identities with multiplicity (identical diagnostics are counted separately)."""
+        sig: Counter[str] = Counter()
         for s in self.failed_steps():
             # No line numbers: they shift when unrelated code changes.
             items = [f"{d.file}|{d.code}|{d.message}" for d in s.diagnostics if d.level == "error"]
             items += s.failed_tests
-            sig.update(f"{s.name}|{i}" for i in items) if items else sig.add(f"{s.name}|*")
+            if items:
+                sig.update(f"{s.name}|{i}" for i in items)
+            else:
+                sig[f"{s.name}|*"] += 1
         return sig
+
+    def signatures(self) -> set[str]:
+        """Identity of each failure, to compare against a red baseline."""
+        return set(self.signature_counts())
 
     def summary_line(self) -> str:
         if self.cached:
@@ -172,6 +188,34 @@ def _git(root: Path, *args: str, env: dict | None = None) -> subprocess.Complete
     return gate_process(["git", *args], cwd=root, env=full_env, timeout_s=120)
 
 
+_CONTROL_CHARS = "\x00-\x1f\x7f-\x9f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069"
+_UNSAFE_CHARS = re.compile("[" + _CONTROL_CHARS + "`]")
+_UNSAFE_NO_TICK = re.compile("[" + _CONTROL_CHARS + "]")
+
+
+def display_safe(text: object, limit: int = 200, ellipsis: str = "\u2026", replacement: str = "?",
+                 backticks: bool = True) -> str:
+    """Display form of an implementer-controlled string: control/bidi chars (and backticks) replaced, capped."""
+    t = (_UNSAFE_CHARS if backticks else _UNSAFE_NO_TICK).sub(replacement, str(text))
+    return t if len(t) <= limit else t[:limit] + ellipsis
+
+
+class GateConfigError(RuntimeError):
+    """The gate configuration could not be read from a git revision."""
+
+
+def new_failures(counts: Counter, baseline: Counter) -> Counter:
+    """Failures in `counts` beyond `baseline` (multiset difference).
+
+    An opaque "<step>|*" signature carries no identity, so it is always new.
+    """
+    result = counts - baseline
+    for sig, n in counts.items():
+        if sig.endswith("|*") and n > 0:
+            result[sig] = n
+    return result
+
+
 def find_root(start: Path | None = None) -> Path:
     env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
     if env_dir and Path(env_dir).is_dir():
@@ -189,28 +233,59 @@ def find_root(start: Path | None = None) -> Path:
     return start
 
 
-def load_gate_config(root: Path) -> dict:
+def _parse_gate_config(text: str) -> dict:
     cfg = dict(DEFAULT_GATES)
-    path = root / "rustflow.toml"
-    if path.is_file():
+    try:
+        import tomllib as toml  # Python 3.11+
+    except ImportError:
         try:
-            import tomllib as toml  # Python 3.11+
+            import tomli as toml  # type: ignore[no-redef]
         except ImportError:
-            try:
-                import tomli as toml  # type: ignore[no-redef]
-            except ImportError:
-                print("rustflow gates: Python < 3.11 without tomli - using default [gates] settings",
-                      file=sys.stderr)
-                return cfg
-        try:
-            with path.open("rb") as fh:
-                data = toml.load(fh)
-            cfg.update(data.get("gates", {}) or {})
-            cfg["max_output_bytes"] = data.get("process", {}).get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
-        except (OSError, ValueError) as exc:  # TOMLDecodeError subclasses ValueError
-            print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
-            cfg["_config_error"] = str(exc)   # hooks surface it: stderr of a passing hook reaches nobody
+            print("rustflow gates: Python < 3.11 without tomli - using default [gates] settings",
+                  file=sys.stderr)
+            return cfg
+    try:
+        data = toml.loads(text)
+        cfg.update(data.get("gates", {}) or {})
+        cfg["max_output_bytes"] = data.get("process", {}).get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+    except ValueError as exc:  # TOMLDecodeError subclasses ValueError
+        print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
+        cfg["_config_error"] = str(exc)   # hooks surface it: stderr of a passing hook reaches nobody
     return cfg
+
+
+def load_gate_config(root: Path) -> dict:
+    path = root / "rustflow.toml"
+    if not path.is_file():
+        return dict(DEFAULT_GATES)
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, ValueError) as exc:
+        print(f"rustflow gates: cannot read rustflow.toml: {exc}", file=sys.stderr)
+        return {**DEFAULT_GATES, "_config_error": str(exc)}
+    return _parse_gate_config(text)
+
+
+def load_gate_config_at(root: Path, rev: str) -> dict:
+    """Like load_gate_config, but from `rustflow.toml` as committed at `rev`.
+
+    Missing file at `rev` -> defaults; invalid TOML -> defaults + "_config_error";
+    any other git failure (bad rev, git missing, ...) -> GateConfigError.
+    """
+    try:
+        if _git(root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").returncode != 0:
+            raise GateConfigError(f"cannot resolve revision {rev!r}")
+        ls = _git(root, "ls-tree", "--full-tree", rev, "--", "rustflow.toml")
+        if ls.returncode != 0:
+            raise GateConfigError(f"git ls-tree {rev} failed: {(ls.stderr or '').strip()}")
+        if not ls.stdout.strip():
+            return dict(DEFAULT_GATES)   # revision is valid, the path is not in its tree
+        r = _git(root, "show", f"{rev}:rustflow.toml")
+    except (OSError, subprocess.SubprocessError, IncompleteGate) as exc:
+        raise GateConfigError(f"git failed reading rustflow.toml at {rev!r}: {exc}") from exc
+    if r.returncode != 0:
+        raise GateConfigError(f"git show {rev}:rustflow.toml failed: {(r.stderr or '').strip()}")
+    return _parse_gate_config(r.stdout)
 
 
 _FMT_DIFF = re.compile(r"^Diff in (.+?)(?::\d+:| at line \d+:)\s*$", re.M)
@@ -306,7 +381,9 @@ def tree_fingerprint(root: Path) -> str | None:
     os.close(fd)
     try:
         if real_index.is_file():
-            shutil.copyfile(real_index, tmp)
+            # copy2 keeps the index file's mtime: git re-checks entries stamped in the same second as the
+            # index (racy git). A fresh mtime made a same-size edit in that second look clean (Windows CI).
+            shutil.copy2(real_index, tmp)
         else:
             os.unlink(tmp)
         env = {"GIT_INDEX_FILE": tmp}
@@ -320,6 +397,55 @@ def tree_fingerprint(root: Path) -> str | None:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def is_config_path(path: str, extra: list[str] | tuple[str, ...] = ()) -> bool:
+    """True when `path` matches a config pattern on the path, its basename or any trailing sub-path."""
+    parts = path.split("/")
+    candidates = ["/".join(parts[i:]) for i in range(len(parts))]  # includes the basename
+    return any(fnmatch.fnmatchcase(c, pat) for pat in (*CONFIG_PATTERNS, *extra) for c in candidates)
+
+
+def ignored_config_files(root: Path, extra: list[str] | tuple[str, ...] = ()) -> dict[str, str]:
+    """Gitignored (untracked) gate config files present in the working tree, `{path: sha256 of content}`.
+
+    Cargo and the gates read them although git (and so the tree fingerprint and the integrity scan) never
+    sees them. RUNTIME_PATHS are skipped. Raises RuntimeError when git cannot list them (callers fail closed).
+    """
+    r = _git(root, "-c", "core.quotepath=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "").strip() or "git ls-files failed")
+    out: dict[str, str] = {}
+    for path in r.stdout.split("\0"):
+        if not path or any(path == p or path.startswith(p + "/") for p in RUNTIME_PATHS):
+            continue
+        if not is_config_path(path, extra):
+            continue
+        try:
+            digest = hashlib.sha256((root / path).read_bytes()).hexdigest()
+        except OSError as exc:   # unreadable: still a distinct, fail-closed digest
+            digest = hashlib.sha256(f"unreadable: {exc.__class__.__name__}".encode()).hexdigest()
+        out[path] = digest
+    return out
+
+
+def ignored_digest(files: dict[str, str]) -> str:
+    """One short digest of `ignored_config_files` ("" when there are none)."""
+    if not files:
+        return ""
+    return hashlib.sha256("\n".join(f"{p}\t{d}" for p, d in sorted(files.items())).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def cache_key(root: Path, fp: str | None, extra: list[str] | tuple[str, ...] = ()) -> str | None:
+    """Gate-result cache key: the tree fingerprint plus a digest of the ignored config files that cargo still
+    reads. None (= no caching) when `fp` is missing or the ignored files cannot be listed."""
+    if not fp:
+        return None
+    try:
+        ig = ignored_digest(ignored_config_files(root, extra))
+    except (OSError, RuntimeError, subprocess.SubprocessError, IncompleteGate):
+        return None
+    return f"{fp}+{ig}" if ig else fp
 
 
 def manifests_changed(root: Path) -> bool:
@@ -932,8 +1058,13 @@ def _run_gates(root: Path, profile: str, *, ci: bool = False, strict: bool = Fal
               fix_fmt: bool | None = None) -> GateResult:
     root = root.resolve()
     strict = strict or ci
+    try:
+        extra = list((cfg or load_gate_config(root)).get("integrity_extra_paths") or [])
+    except GateConfigError:
+        extra = []   # the runner below reports the broken configuration
     fp = tree_fingerprint(root)
-    if use_cache and not strict and cache_lookup(root, profile, fp):
+    key = cache_key(root, fp, extra)
+    if use_cache and not strict and cache_lookup(root, profile, key):
         return GateResult(profile, True, fp, cached=True)
     runner = GateRunner(root, cfg, ci=ci, strict=strict, log_dir=log_dir)
     check_tree = profile == "full" and bool(runner.cfg.get("tree_stable", True))
@@ -947,7 +1078,7 @@ def _run_gates(root: Path, profile: str, *, ci: bool = False, strict: bool = Fal
             steps.append(step)
     ok = all(s.output_complete and (s.ok or s.skipped) for s in steps)
     if ok and not strict:
-        cache_store(root, profile, fp_after)
+        cache_store(root, profile, cache_key(root, fp_after, extra))
     return GateResult(profile, ok, fp_after, steps=steps)
 
 

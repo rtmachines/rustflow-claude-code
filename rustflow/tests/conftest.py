@@ -22,6 +22,18 @@ def git(cwd, *args):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
+@pytest.fixture
+def git_repo(tmp_path):
+    """Minimal git repo without cargo: one empty commit."""
+    repo = tmp_path / "git_repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@example.com")
+    git(repo, "config", "user.name", "t")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    return repo
+
+
 @pytest.fixture(scope="session")
 def shared_target(tmp_path_factory):
     return tmp_path_factory.mktemp("cargo-target")

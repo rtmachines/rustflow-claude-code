@@ -27,7 +27,7 @@ class Finding:
     confidence: str = "medium"
     reviewers: list[str] = field(default_factory=list)
     previous_id: str | None = None
-    status: str = "open"          # open | fixed | rejected | disputed | advisory | accepted_rejection
+    status: str = "open"          # open | fixed | rejected | disputed | advisory | accepted_rejection | accepted_gate_change
     round: int = 1
     anchor_ok: bool = True
     dispute_count: int = 0
@@ -260,7 +260,7 @@ def aggregate(
     # Advisory/disputed items are not re-reviewed in later rounds (reviewers focus on the delta and
     # the blocking items) - carry them forward so they reach the final report.
     for prev in previous:
-        if (prev.status in ("advisory", "disputed", "accepted_rejection") and prev.id not in used
+        if (prev.status in ("advisory", "disputed", "accepted_rejection", "accepted_gate_change") and prev.id not in used
                 and prev.resolution_status != "fixed"):
             merged.append(Finding.from_dict(prev.to_dict()))
             used.add(prev.id)

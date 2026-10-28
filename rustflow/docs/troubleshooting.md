@@ -43,6 +43,7 @@ An agent's `ok` result and a reviewer's `APPROVE` do not independently approve a
 | `baseline_red` | The starting implementation baseline fails. Fix it or start a new run with `--accept-red-baseline`. |
 | `gates_red` | Gate repair allowance was exhausted. Inspect raw gates and fix the code or start another run. Plain resume does not reopen this finished status. |
 | `final_gates_red` | Review approved, but strict final verification failed. Inspect final logs and continue with `--extra-rounds`. |
+| `gate_changes_pending` | The run's changes alter gate configuration, lints, silencing attributes or tests in a way that was neither proven harmless nor accepted by both reviewers. The user decides: revert the change (the cleanest choice), or commit a deliberate gate change himself. Then continue with `--extra-rounds`. Never accept it from an automated driver. |
 | `criteria_unmet` | Review and final gates were accepted, but named required tests were not proven. Fix/add those tests and continue with `--extra-rounds`. |
 | `max_rounds` | Blocking findings remain at the review-round limit. Continue with `--extra-rounds` after assessing them. |
 | `stalled` | A fixer made no progress, repeated findings survived, or the tree oscillated. Inspect the dispute and choose a direction before continuing. |
@@ -66,7 +67,7 @@ rustflow resume <run-id> --detach
 rustflow resume <run-id> --extra-rounds 2
 ```
 
-Plain resume is supported for `budget`, `interrupted`, `crashed`, `tree_changed`, `agent_failed`, and `incomplete` (and a saved `running` state after process loss). `--extra-rounds N` reopens `max_rounds`, `stalled`, `final_gates_red`, or `criteria_unmet`; it also allows another review of an approved run whose final round was degraded. The extra allowance continues the same run directory, finding IDs, branch/worktree, checkpoints, and usage history. It does not start an unrelated review checkout.
+Plain resume is supported for `budget`, `interrupted`, `crashed`, `tree_changed`, `agent_failed`, and `incomplete` (and a saved `running` state after process loss). `--extra-rounds N` reopens `max_rounds`, `stalled`, `final_gates_red`, `criteria_unmet`, or `gate_changes_pending`; it also allows another review of an approved run whose final round was degraded. The extra allowance continues the same run directory, finding IDs, branch/worktree, checkpoints, and usage history. It does not start an unrelated review checkout.
 
 For branch isolation, switch to the run's recorded branch before resuming:
 

@@ -37,7 +37,7 @@ These are limitations or follow-up candidates found while documenting behavior; 
 | Observation | Source / consequence |
 | --- | --- |
 | Full-report localization is partial | [`report.py`](../rustflow/report.py) has fixed Polish headings/status text. `project.language = "en"` requests English agent prose but does not translate the report shell. |
-| Alternate config has limited reach | [`cli.py`](../rustflow/cli.py) accepts common `--config` even on handlers that do not consume it; [`orchestrator.py`](../rustflow/orchestrator.py) reloads gate settings from the working checkout. Keep gate settings there. |
+| Alternate config has limited reach | [`cli.py`](../rustflow/cli.py) accepts common `--config` even on handlers that do not consume it; [`orchestrator.py`](../rustflow/orchestrator.py) reads gate settings from the run's base commit and freezes them in the run state. Commit them before you start. |
 | Configuration validation is partial | [`config.py`](../rustflow/config.py) does not reject every unknown key or validate every gate/provider type/enum. A typo can be ineffective. |
 | Final workflow gates differ from CI mode | Final uses strict full gates but not `ci=True`; conditional extras and deny policy can differ. The report's fixed label still refers to final gates as CI. |
 | Accepted baseline failures remain accepted at final | [`Orchestrator._gates_ok`](../rustflow/orchestrator.py) applies recorded signature acceptance to final gates as well. Approval does not mean all baseline failures disappeared. |

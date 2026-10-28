@@ -120,6 +120,7 @@ class Installer:
         self._copy(PACKAGE_DIR / "process.py", ".rustflow/process.py", managed=True)
         self._copy(PACKAGE_DIR / "gates.py", ".rustflow/gates.py", managed=True)
         self._copy(PACKAGE_DIR / "hooks.py", ".rustflow/hooks.py", managed=True)
+        self._copy(PACKAGE_DIR / "integrity.py", ".rustflow/integrity.py", managed=True)
         gi = self.repo / ".rustflow" / ".gitignore"
         wanted = ["runs/", "cache/", "wt/", "__pycache__/"]
         have = gi.read_text(encoding="utf-8").split() if gi.exists() else []

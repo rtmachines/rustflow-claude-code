@@ -69,6 +69,7 @@ Domyślnie: reviewer_a = Claude (soczewka poprawności), reviewer_b = Codex (soc
 | `rustflow/criteria.py` | kryteria akceptacji, ocena wymaganych testów z wyniku bramek (bez LLM) |
 | `rustflow/gates.py` | bramki (standalone; kopiowane do `.rustflow/gates.py`) |
 | `rustflow/hooks.py` | hooki Claude Code (standalone; `.rustflow/hooks.py`) |
+| `rustflow/integrity.py` | scan zmian wpływających na bramki, dowód, zgody (standalone; kopiowane do `.rustflow/integrity.py`) |
 | `rustflow/triage.py` | heurystyka trudności + schemat triage LLM |
 | `rustflow/prompts.py` | prompty ról |
 | `rustflow/templates/` | rustflow.toml, skills, REVIEW.md, bloki AGENTS/CLAUDE.md, CI |
@@ -80,6 +81,18 @@ Domyślnie: reviewer_a = Claude (soczewka poprawności), reviewer_b = Codex (soc
 - Sandbox Codex na Windows jest słabszy niż na Linux/macOS; dla Codex-implementera na Windows rozważ WSL.
 - Izolacja `worktree` wymaga, by `.rustflow/`, `.claude/`, `.agents/` były zacommitowane (worktree powstaje z HEAD).
 - `cargo` w bramkach wykonuje `build.rs` i makra proc zależności - niezaufane repo uruchamiaj w kontenerze.
+- Tryb interaktywny (bez `rustflow run`) gwarantuje tylko zielone bramki dla tego, co trafia do HEAD/merge; pełny cykl (triage, plan, dwie recenzje, fix, bramki final) jest opcjonalny.
+- Dowód sprawdza tylko bieżące drzewo: zaakceptowana zmiana konfiguracji może osłabić bramki dla przyszłych zmian po merge'u (widoczne w raporcie).
+- Zgoda recenzentów dla `cargo-lints` i `tests-removed` to osąd dwóch modeli; skorelowany błąd albo prompt injection w diffie może dać fałszywą zgodę (ślad w raporcie, status `approved_with_advisories`).
+- W trybie interaktywnym zgodą dla zmian bez dowodu jest commit człowieka poza Claude Code; bramka commita rozpoznaje tylko komendy pasujące do wzorca `git commit` i ocenia drzewo robocze, nie indeks.
+- `cargo-lints` bez parsera TOML (Python < 3.11 bez `tomli`) działa zachowawczo i może blokować zmiany neutralne.
+- Cache wyników bramek i dowodu w `.rustflow/cache/` nie jest chroniony przed zapisem przez agenta.
+- Reguły `--disallowedTools` dla ról piszących nie obejmują zapisu przez Bash; o blokadzie decyduje detekcja w diffie.
+- Przy `--accept-red-baseline` dowód nie uwzględnia czerwonej bazy, więc zmiany dowodliwe kończą się porażką dowodu (blokują zachowawczo).
+- Wykrywanie w diffie to stały zestaw wzorców, nie analiza semantyczna. Znane luki poza specyfikacją: test zakomentowany blokowo (`/* #[test] ... */`), `#[should_panic]` dodane do padającego testu, `#[cfg(any())]` / `#[cfg(all(test, any()))]` na module testów, `#[cfg_attr(x, ignore)]`, `# [allow(..)]` i atrybut rozbity na wiele linii (rustfmt zwykle to normalizuje), `[lib] test = false` / `autotests = false` w `Cargo.toml` oraz osłabienie ciała testu (`assert!(true)`).
+- Hook Stop i bramka commita (bramki + dowód) mają limit czasu 1800 s; po jego przekroczeniu Claude Code traktuje hook jako niekrytyczny błąd (fail-open) i nic nie trafia do cache.
+- Pliki konfiguracji ukryte w `.gitignore` (np. `.cargo/config.toml`) są traktowane jak zmiany `config`: w trybie interaktywnym każdy obecny, w orkiestratorze nowy lub zmieniony względem stanu z preflightu. Dowód uruchamia bramki w worktree bez nich, więc projekt, który faktycznie wymaga takiego pliku do budowy, zostanie zablokowany.
+- Wygenerowane CI uruchamia `gates.py` na roboczym `rustflow.toml` PR-a i bez skanu integralności, więc PR, który osłabia `[gates]`, osłabia także własne bramki CI.
 
 ## 6. Prompt caching
 

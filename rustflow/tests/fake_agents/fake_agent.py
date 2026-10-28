@@ -79,6 +79,25 @@ mod tests {
 '''
 
 
+LINTS_SCENARIOS = ("lints_both_accept", "lints_one_reject", "lints_degraded")
+TR_SCENARIOS = ("tests_removed_accept", "tests_removed_more")   # the base holds tests/old_a.rs (+ old_b.rs)
+GATE_SCENARIOS = ("weaken", "weaken_revert", "allow_unneeded", "digest_change", "ignored_harmless") + LINTS_SCENARIOS + TR_SCENARIOS
+CAP_LINTS = '[build]\nrustflags = ["--cap-lints", "allow"]\n'
+NEEDLESS_RETURN = "\npub fn answer() -> i32 {\n    return 1;\n}\n"
+MANY_ARGS = ("\npub fn many(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32) -> i32 {\n"
+             "    a + b + c + d + e + f + g + h\n}\n")
+
+
+def replaced(text, old, new):
+    assert old in text, f"scenario edit did not apply: {old!r}"
+    return text.replace(old, new, 1)
+
+
+def gate_ids(prompt):
+    import re
+    return re.findall(r"\[(G-[^\]]+)\]", prompt)
+
+
 def arg_after(flag):
     if flag in ARGS:
         i = ARGS.index(flag)
@@ -114,13 +133,19 @@ def review(prompt):
         findings.append(finding("P1", "correctness", "src/lib.rs", line, "Whitespace around key/value is not trimmed", prev=prev))
         if round2 and SCENARIO == "dispute":
             disputes.append({"id": "F1", "decision": "reraise", "note": "the task says trim"})
-    if not round2 and ROLE == "reviewer_b":
+    if not round2 and ROLE == "reviewer_b" and SCENARIO not in GATE_SCENARIOS:
         findings.append(finding("P1", "correctness", "src/does_not_exist.rs", 3, "Hallucinated file"))
         findings.append(finding("P3", "docs", "./src/lib.rs", 1, "Doc comment could mention separator", conf="medium"))
         if SCENARIO == "reject":
             findings.append(finding("P2", "idiom", "src/lib.rs", 2, "Return impl Iterator instead of Vec", conf="medium"))
     verdict = "REQUEST_CHANGES" if findings and any(f["severity"] in ("P0", "P1") for f in findings) else "APPROVE"
-    return {"summary": f"{ROLE} review", "verdict": verdict, "findings": findings, "disputes": disputes,
+    votes = []
+    if SCENARIO in LINTS_SCENARIOS:
+        reject = SCENARIO == "lints_one_reject" and ROLE == "reviewer_b"
+        votes = [{"id": g, "decision": "reject" if reject else "accept", "reason": "vote"} for g in gate_ids(prompt)]
+    if SCENARIO in TR_SCENARIOS and not (SCENARIO == "tests_removed_more" and earlier_calls(ROLE) > 0):  # consent in the first review only
+        votes = [{"id": g, "decision": "accept", "reason": "obsolete test"} for g in gate_ids(prompt)]
+    return {"summary": f"{ROLE} review", "verdict": verdict, "gate_changes": votes, "findings": findings, "disputes": disputes,
             "acceptance": [{"criterion": "trim whitespace",
                             "status": "met" if fixed or SCENARIO == "dispute" else "not_met", "note": ""}],
             "residual_risks": []}
@@ -155,13 +180,73 @@ def act(prompt):
         if SCENARIO in ("escalate", "tamper"):
             lib().write_text(with_unsafe(BUGGY))
             return {"summary": "with unsafe"}
+        if SCENARIO == "weaken_gates":  # failing test + switch the tests gate off in the work tree
+            lib().write_text("//! demo crate\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn fails() {\n"
+                             "        assert_eq!(1, 2);\n    }\n}\n")
+            toml = Path("rustflow.toml")
+            toml.write_text(toml.read_text().replace('tests = "auto"', 'tests = "off"'))
+            return {"summary": "weakened", "files_changed": ["src/lib.rs"], "tests_added": [],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO == "red_baseline_multiset":  # a second identical needless_return on top of the red base
+            lib().write_text(lib().read_text() + "pub fn b() -> i32 { return 2; }\n")
+            return {"summary": "added b", "files_changed": ["src/lib.rs"], "tests_added": [],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO in ("weaken", "weaken_revert"):  # needless_return hidden by --cap-lints in a cargo config
+            lib().write_text(replaced(FIXED, "#[cfg(test)]", NEEDLESS_RETURN.lstrip("\n") + "\n#[cfg(test)]"))
+            Path(".cargo").mkdir(exist_ok=True)
+            Path(".cargo/config.toml").write_text(CAP_LINTS)
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO == "allow_unneeded":  # an #[allow] that hides nothing
+            lib().write_text(replaced(FIXED, "pub fn parse_kv", "#[allow(dead_code)]\npub fn parse_kv"))
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO in LINTS_SCENARIOS:  # a lint relaxed in Cargo.toml with nothing to hide: cannot be proven
+            lib().write_text(FIXED)
+            toml = Path("Cargo.toml")
+            toml.write_text(toml.read_text() + '\n[lints.clippy]\nneedless_return = "allow"\n')
+            return {"summary": "implemented parse_kv; relaxed needless_return as the task requires",
+                    "files_changed": ["src/lib.rs", "Cargo.toml"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO == "ignored_harmless":  # a (gitignored) cargo config that hides nothing
+            lib().write_text(BUGGY)
+            Path(".cargo").mkdir(exist_ok=True)
+            Path(".cargo/config.toml").write_text("[term]\nverbose = false\n")
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
+        if SCENARIO in TR_SCENARIOS:  # an obsolete integration test is deleted along with the implementation
+            lib().write_text(BUGGY)
+            Path("tests/old_a.rs").unlink()
+            return {"summary": "implemented parse_kv; removed the obsolete test old_a", "files_changed": ["src/lib.rs"],
+                    "tests_added": ["parses_pairs"], "gates_green": True, "notes": ""}
+        if SCENARIO == "digest_change":  # a harmless clippy.toml now, a hiding one after the fixer
+            lib().write_text(BUGGY)
+            Path("clippy.toml").write_text("# nothing configured\n")
+            return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
+                    "gates_green": True, "notes": ""}
         lib().write_text(CLIPPY_RED if SCENARIO == "gatefix" else BUGGY)
         return {"summary": "implemented parse_kv", "files_changed": ["src/lib.rs"], "tests_added": ["parses_pairs"],
                 "gates_green": True, "notes": ""}
     if ROLE == "fixer":
         if "gates are RED" in prompt:
+            if SCENARIO in ("weaken_gates", "red_baseline_multiset"):
+                return {"summary": "nothing changed", "resolutions": [], "tests_added": []}
             lib().write_text(BUGGY)
             return {"summary": "removed needless return / collect", "resolutions": [], "tests_added": []}
+        if SCENARIO in ("weaken", "weaken_revert", "digest_change", "tests_removed_more") + LINTS_SCENARIOS and gate_ids(prompt):
+            if SCENARIO == "weaken_revert":
+                Path(".cargo/config.toml").unlink()
+                lib().write_text(FIXED)
+                status, note = "fixed", "reverted the cargo config and the needless return"
+            else:
+                status, note = "rejected", "the task requires this configuration"
+            return {"summary": "gate changes", "tests_added": [],
+                    "resolutions": [{"id": g, "status": status, "note": note} for g in gate_ids(prompt)]}
+        if SCENARIO == "digest_change":  # round 1 (F1): fix the bug and swap the accepted config for a hiding one
+            lib().write_text(replaced(FIXED, "#[cfg(test)]", MANY_ARGS.lstrip("\n") + "\n#[cfg(test)]"))
+            Path("clippy.toml").write_text("too-many-arguments-threshold = 100\n")
+            return {"summary": "trimmed", "resolutions": [{"id": "F1", "status": "fixed", "note": "trim + test"}],
+                    "tests_added": ["trims_whitespace"]}
         if SCENARIO == "dispute":
             return {"summary": "disagree", "resolutions": [{"id": "F1", "status": "rejected",
                     "note": "inputs are pre-trimmed by the caller"}], "tests_added": []}
@@ -179,6 +264,8 @@ def act(prompt):
             return {"summary": "could not fix", "resolutions": [{"id": "F1", "status": "partial", "note": "tried"}],
                     "tests_added": []}
         lib().write_text(with_unsafe(FIXED) if SCENARIO == "escalate" else FIXED)
+        if SCENARIO == "tests_removed_more":  # more tests of an already voted file go away after the consent
+            Path("tests/old_b.rs").unlink(missing_ok=True)
         return {"summary": "trimmed", "resolutions": [{"id": "F1", "status": "fixed", "note": "trim + test"}],
                 "tests_added": ["trims_whitespace"]}
     if ROLE in ("reviewer_a", "reviewer_b", "auditor"):
@@ -243,6 +330,9 @@ def main():
         return 1
     if ROLE == "implementer" and (SCENARIO == "impl_down" or (SCENARIO == "impl_flaky" and earlier_calls(ROLE) == 0)):
         return overloaded()
+    if SCENARIO == "lints_degraded" and ROLE == "reviewer_b":
+        print("boom", file=sys.stderr)
+        return 1
     if SCENARIO == "reviewers_down" and ROLE in ("reviewer_a", "reviewer_b"):
         return overloaded()
     gate_fix = "gates are RED" in prompt

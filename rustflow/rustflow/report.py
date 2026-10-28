@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from rustflow import usage
+from rustflow import gates, usage
 
 STATUS_TEXT = {
     "approved": "ZATWIERDZONE - bramki zielone, brak blokujących uwag",
@@ -25,6 +25,7 @@ STATUS_TEXT = {
     "error": "BŁĄD",
     "interrupted": "PRZERWANE (można wznowić)",
     "tree_changed": "PLIKI ZMIENIONE W TRAKCIE RECENZJI - wyniki odrzucone (można wznowić)",
+    "gate_changes_pending": "ZMIANY WPŁYWAJĄCE NA BRAMKI CZEKAJĄ NA DECYZJĘ CZŁOWIEKA (można wznowić)",
     "running": "W TOKU",
 }
 
@@ -34,6 +35,10 @@ def _table(rows: list[list[str]], head: list[str]) -> str:
     for r in rows:
         out.append("| " + " | ".join(c.replace("|", "\\|").replace("\n", " ") for c in r) + " |")
     return "\n".join(out)
+
+
+def _cell(text) -> str:
+    return gates.display_safe(text, limit=len(str(text)), replacement=" ", backticks=False)
 
 
 def render(state: dict, repo: Path) -> str:
@@ -218,6 +223,16 @@ def render(state: dict, repo: Path) -> str:
                                  + (f" - fixer: {f['resolution']}" if f.get("resolution") else ""))
                 lines.append("")
 
+    gate_changes = state.get("gate_changes") or []
+    if gate_changes:
+        rows = [[_cell(e.get("id", "")), e.get("kind", ""), _cell(e.get("path", "")), e.get("status", ""),
+                 e.get("accepted_by") or "-", e.get("proof") or "-",
+                 ", ".join(f"{r}: {v.get('decision', '?')}" for r, v in sorted((e.get("votes") or {}).items())) or "-",
+                 _cell((e.get("justification") or "-")[:500])] for e in gate_changes]
+        lines += ["## Zmiany wpływające na bramki", "",
+                  _table(rows, ["id", "rodzaj", "ścieżka", "status", "accepted_by", "dowód", "głosy",
+                                "uzasadnienie"]), ""]
+
     risks = [r for rec in state.get("rounds", [])[-1:] for r in rec.get("residual_risks", [])]
     if risks:
         lines += ["## Ryzyka resztkowe", ""] + [f"- {r}" for r in risks] + [""]
@@ -236,5 +251,7 @@ def render(state: dict, repo: Path) -> str:
                   f"- Usuń: `git worktree remove {state.get('workdir')}`"]
     if st in ("interrupted", "budget", "tree_changed", "incomplete"):
         lines.append(f"- Wznów: `rustflow resume {state.get('run_id')}`")
+    elif st == "gate_changes_pending":
+        lines.append(f"- Wznów po cofnięciu zmiany: `rustflow resume {state.get('run_id')} --extra-rounds 1`")
     lines.append(f"- Logi agentów: `.rustflow/runs/{state.get('run_id')}/agents/`")
     return "\n".join(lines) + "\n"

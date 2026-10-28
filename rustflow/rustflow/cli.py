@@ -359,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--detach", action="store_true", help="resume in the background")
     p.add_argument("--extra-rounds", type=int, metavar="N",
-                   help="continue a run that ended max_rounds/stalled/final_gates_red/criteria_unmet with up to N "
+                   help="continue a run that ended max_rounds/stalled/final_gates_red/criteria_unmet/gate_changes_pending with up to N "
                         "more fix rounds on its own branch/worktree")
     p.set_defaults(fn=cmd_resume)
 
