@@ -156,6 +156,7 @@ The final attempt determines the logical result. Duration, costs, and token coun
 | `estimated_cost_usd` | Timeout estimates only, kept separate from measurements. |
 | Provider `tokens.<counter>` | The same `known`, `total`, and `missing_attempts` structure for normalized token counters. |
 | `measurements.complete` / `partial` / `unknown` | Counts of attempts with cost and all provider counters, some measurements, or no measurements. |
+| `roles.<role>` | Per-role attempts, cost and duration (same structure as the totals), `tokens.<counter>` as plain sums of the known counters, and `cache_read_share`: cache-read tokens over all input-side tokens (`null` without input). The report shows it as "Zużycie per rola"; summaries written before this field have no `roles`. |
 
 An explicit numeric zero is a measurement. Missing fields, wrong types (including booleans), negative values, NaN, and infinity are not. Token counters additionally require integers. Codex cached input is already included in `input_tokens`; Claude's cache creation/read input counters are separate and included in its token total. Missing Claude cache counters make that total incomplete. Legacy `tokens` remains available, but cross-provider comparisons should use normalized provider fields in `usage_summary`.
 

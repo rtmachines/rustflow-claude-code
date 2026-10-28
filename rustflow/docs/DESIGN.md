@@ -15,7 +15,7 @@ Problemy:
 |---|---|---|---|
 | 1 | Kompilacja dopiero na końcu | Dwóch drogich recenzentów czyta kod, który się nie kompiluje; fixer może zepsuć build i nikt tego nie wie aż do końca | Bramki deterministyczne (fmt, clippy `-D warnings`, testy, doctesty) **po każdym kroku zmieniającym kod i zawsze przed recenzją**. Czerwone → fixer naprawia build (limit prób) → nadal czerwone = stop |
 | 2 | Brak kroku "czy baza jest zielona" | Agent dostaje winę za cudze błędy, pętla naprawia nie to, co trzeba | Preflight: bramki na bazie; czerwona baza = stop albo `--accept-red-baseline` (blokują tylko NOWE błędy) |
-| 3 | Brak specyfikacji dla recenzentów | Recenzent ocenia "czy ładne", a nie "czy spełnia zadanie" | Planner dla zadań hard: kroki + **kryteria akceptacji**; recenzenci zawsze zwracają status każdego wymagania (`met/not_met/unclear`); `not_met` = blokujący finding |
+| 3 | Brak specyfikacji dla recenzentów | Recenzent ocenia "czy ładne", a nie "czy spełnia zadanie" | Planner dla zadań hard: kroki + **kryteria akceptacji**; recenzenci zawsze zwracają status każdego wymagania (`met/not_met/unclear`); `not_met` = blokujący finding (P1; gdy recenzent wskaże swój finding polem `finding`, ten finding zostaje podniesiony do P1 zamiast dublowania go bez kotwicy) |
 | 4 | "Dwóch niezależnych" bez mechanizmu niezależności | Dwa takie same modele z tym samym promptem dają skorelowane błędy | Różne rodziny modeli (Claude + Codex) i różne soczewki (poprawność/soundness vs design/idiomy); równolegle, bez wglądu w siebie nawzajem |
 | 5 | Nie wiadomo, kto rozstrzyga między recenzentami | Fixer dostaje sprzeczne, zduplikowane lub zmyślone uwagi | **Deterministyczna agregacja** (bez LLM): walidacja `plik:linia` (nieistniejący plik = odrzucony), deduplikacja, potwierdzenie przez 2 recenzentów, polityka P0–P3, próg pewności |
 | 6 | Fixer musi przyjąć każdą uwagę | Fałszywe alarmy psują kod | Fixer zwraca status per finding: `fixed/partial/rejected` z dowodem; recenzent w kolejnej rundzie akceptuje odrzucenie albo je podtrzymuje; 2 razy spór = decyzja człowieka |
@@ -109,11 +109,14 @@ Pomiary z runów na żywo (Claude Code 2.1.310, haiku):
 Wnioski:
 - **Najwięcej tokenów to tury wewnątrz jednej sesji agenta**, a tam cache działa normalnie. Hooki
   (feedback z `cargo check`, blokada Stop) tylko dopisują wiadomości na końcu, nie zmieniają prefiksu.
-- **Między rolami cache i tak nie może być współdzielony**: inne modele (cache jest per model), inny
-  zestaw narzędzi (recenzent bez Edit/Write, z narzędziem structured output). To cecha separacji ról,
-  nie błąd architektury; koszt to jednorazowy zapis ~15-30k tokenów na wywołanie.
-- **Ta sama rola w kolejnej rundzie korzysta z cache** (prefiks narzędzia + system + skill), bo
-  rustflow trzyma stały `--append-system-prompt` per rola, a wszystko zmienne (diff, runda, findingi)
+- **Między rolami o innym modelu lub zestawie narzędzi cache nie jest współdzielony** (cache jest per
+  model; recenzent nie ma Edit/Write). Implementer i fixer mają jednak ten sam model i te same narzędzia,
+  więc system prompt jest **identyczny dla wszystkich ról** (`SHARED_SYSTEM` + skille always-on), a linia
+  roli trafia do promptu za komendą skilla. Zmierzone na żywo przed tą zmianą: fixer startujący 3,5 min po
+  implementerze zapisał do cache cały prefiks od nowa (~35k tokenów, cache_read = 0), bo różniła się
+  tylko linia roli; zapis cache to ~54% kosztu Claude w runie.
+- **Ta sama rola w kolejnej rundzie korzysta z cache** (prefiks narzędzia + system + skill; zmierzone:
+  24k tokenów odczytu w pierwszej turze recenzenta r2), bo wszystko zmienne (rola, diff, runda, findingi)
   jest w wiadomości użytkownika.
 - `--exclude-dynamic-system-prompt-sections` (domyślnie włączone) przenosi cwd/git status do pierwszej
   wiadomości: nazwa gałęzi `rustflow/<run>` i ścieżka worktree są unikalne per run i inaczej
@@ -235,8 +238,8 @@ Zweryfikowane na żywo (Claude Code 2.1.310, haiku jako dyspozytor i recenzenci)
 
 Skill wywoływany przez model ładuje się tylko wtedy, gdy model uzna, że opis pasuje do zadania, więc skill
 stacku czy rust-skills może nie zostać przeczytany wcale. `[skills]` (domyślnie `all = ["auto"]`) dołącza je
-deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (plik stały dla roli, więc
-zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
+deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (treść identyczna dla
+wszystkich ról z tymi samymi skillami, więc zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
 Brak jawnie wymienionego skilla to błąd w preflight, a `max_kb` chroni kontekst. Zweryfikowane na żywo:
 fraza ukryta w skillu dołączonym przez `--append-system-prompt-file` wróciła w odpowiedzi modelu.
 

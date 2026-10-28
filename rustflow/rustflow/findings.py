@@ -189,7 +189,8 @@ def aggregate(
         residual += [f"{reviewer}: {r}" for r in data.get("residual_risks", [])]
         for d in data.get("disputes", []):
             dispute_votes.setdefault(d.get("id", ""), []).append(d.get("decision", "accept_rejection"))
-        for item in data.get("findings", []):
+        own: dict[int, Finding] = {}   # index in this review's `findings` -> kept finding (acceptance links)
+        for index, item in enumerate(data.get("findings", [])):
             f = Finding(id="", severity=item["severity"], category=item["category"],
                         file=normalize_path(item.get("file", ""), root), line=int(item.get("line") or 0),
                         title=item.get("title", "").strip(), trigger=item.get("trigger", ""),
@@ -212,9 +213,21 @@ def aggregate(
                     f.line = min(max(f.line, 1), max(n_lines, 1))
                     f.confidence = {"high": "medium", "medium": "low", "low": "low"}[f.confidence]
             raw.append(f)
+            own[index] = f
         for crit in data.get("acceptance", []):
             acceptance.append({"reviewer": reviewer, **crit})
-            if crit.get("status") == "not_met":
+            if crit.get("status") != "not_met":
+                continue
+            linked = own.get(crit["finding"]) if isinstance(crit.get("finding"), int) else None
+            if linked is not None:
+                # An unmet requirement is P1 (REVIEW.md): raise the anchored finding instead of adding a duplicate.
+                if SEV_RANK[linked.severity] > SEV_RANK["P1"]:
+                    linked.severity = "P1"
+                if CONF_RANK[linked.confidence] < CONF_RANK["medium"]:
+                    linked.confidence = "medium"
+                linked.rule = f"Unmet acceptance criterion: {crit.get('criterion', '')}" + (
+                    f". {linked.rule}" if linked.rule else "")
+            else:
                 raw.append(Finding(id="", severity="P1", category="acceptance", file="", line=0,
                                    title=f"Acceptance criterion not met: {crit.get('criterion', '')}",
                                    trigger=crit.get("note", ""), confidence="medium",

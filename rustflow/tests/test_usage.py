@@ -57,6 +57,38 @@ def test_zero_in_a_partial_turn_is_still_a_measurement():
     assert measured["known_tokens"]["input_tokens"] == 0
 
 
+def _role_rows():
+    from rustflow import usage
+    return [
+        {"role": "implementer", "provider": "claude", "estimated_cost_usd": None,
+         **usage.normalize("claude", {"input_tokens": 2, "cache_creation_input_tokens": 100,
+                                      "cache_read_input_tokens": 300, "output_tokens": 10}, 0.5)},
+        {"role": "implementer", "provider": "claude", "estimated_cost_usd": None,
+         **usage.normalize("claude", {"input_tokens": 0, "cache_creation_input_tokens": 50,
+                                      "cache_read_input_tokens": 50, "output_tokens": 5}, 0.25)},
+        {"role": "reviewer_b", "provider": "codex", "estimated_cost_usd": None,
+         **usage.normalize("codex", [{"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 5}], None)},
+    ]
+
+
+def test_summary_breaks_usage_down_by_role():
+    # Live runs: cache writes were ~54% of the Claude cost, invisible in the per-provider totals.
+    from rustflow import usage
+    roles = usage.summarize(_role_rows())["roles"]
+    impl = roles["implementer"]
+    assert impl["attempt_count"] == 2 and impl["cost_usd"]["total"] == 0.75
+    assert impl["tokens"]["cache_creation_input_tokens"] == 150 and impl["tokens"]["output_tokens"] == 15
+    assert impl["cache_read_share"] == pytest.approx(350 / 502)       # Claude: input + cache write + cache read
+    assert roles["reviewer_b"]["cache_read_share"] == pytest.approx(0.8)  # Codex input already includes cached
+
+
+def test_report_shows_usage_per_role(tmp_path):
+    from rustflow import report, usage
+    text = report.render({"run_id": "r", "status": "approved", "usage_summary": usage.summarize(_role_rows())}, tmp_path)
+    section = text.split("## Zużycie per rola", 1)[1]
+    assert "| implementer | 2 | $0.750000 | 150 | 350 | 15 | 70% |" in section
+
+
 def test_summary_keeps_missing_costs_and_estimates_separate():
     from rustflow import usage
     rows = [

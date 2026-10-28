@@ -107,6 +107,18 @@ def render(state: dict, repo: Path) -> str:
                          str(tokens["known"]) + (" + ?" if tokens["total"] is None else "")])
         lines += [_table(rows, ["provider", "próby", "pełne/częściowe/nieznane", "zmierzony koszt",
                                "estymacje timeoutów", "tokeny (bez podwójnego cache)"]), ""]
+    if measured.get("roles"):  # absent in states written before the per-role breakdown
+        rows = []
+        for role, group in measured["roles"].items():
+            cost, tokens, share = group["cost_usd"], group["tokens"], group["cache_read_share"]
+            rows.append([role, str(group["attempt_count"]),
+                         f"${cost['known']:.6f}" + (" + ?" if cost["total"] is None else ""),
+                         str(tokens.get("cache_creation_input_tokens", "—")), str(tokens.get("cache_read_input_tokens", 0)),
+                         str(tokens.get("output_tokens", 0)), "—" if share is None else f"{share:.0%}"])
+        lines += ["## Zużycie per rola", "",
+                  "Zapis cache to zimny start sesji; odczyt cache to udział tokenów wejściowych czytanych z cache.", "",
+                  _table(rows, ["rola", "próby", "zmierzony koszt", "zapis cache", "odczyt cache", "output",
+                                "udział odczytu cache"]), ""]
     attempts_dir = repo / ".rustflow" / "runs" / state.get("run_id", "") / "attempts"
     attempts = usage.load_attempts(attempts_dir)
     if attempts:

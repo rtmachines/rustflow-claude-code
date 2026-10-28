@@ -261,7 +261,7 @@ Role skills (`rustflow-plan`, `rustflow-implement`, `rustflow-review`, `rustflow
 
 Names resolve under `.claude/skills/<name>/SKILL.md` for Claude and `.agents/skills/<name>/SKILL.md` for Codex. `all` and the role group are concatenated, then duplicate names are removed. `auto` selects installed `rustflow-stack-*` skills plus `rust-skills` and optional `rust-best-practices`; it does not select arbitrary installed skills or duplicate the role skill. An explicitly named missing skill is an error; an absent auto-discovered skill is simply absent. Preflight checks role/provider combinations across all difficulty routes.
 
-Only `SKILL.md` is attached. Reference files remain on disk, with their location included for agents to open as needed. Claude defaults to a per-role system-prompt file, Codex always receives extras inline, and `init` embeds interactive reviewer preloads in its generated definition. Rerun `init` to regenerate that definition after changing its preload configuration. Triage and the `tob_audit` role have no extra-skill group mapping.
+Only `SKILL.md` is attached. Reference files remain on disk, with their location included for agents to open as needed. Claude defaults to a system-prompt file whose content is the same for every role with the same skills (the role is stated in the prompt, so implementer and fixer share the prompt cache), Codex always receives extras inline, and `init` embeds interactive reviewer preloads in its generated definition. Rerun `init` to regenerate that definition after changing its preload configuration. Triage and the `tob_audit` role have no extra-skill group mapping.
 
 ```toml
 [skills]

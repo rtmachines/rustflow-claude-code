@@ -12,8 +12,8 @@ from rustflow.config import DIFFICULTIES, Config
 # (weight, regex) - matched case-insensitively against the task prompt.
 SIGNALS: list[tuple[int, str, str]] = [
     (3, "unsafe/FFI/soundness", r"\bunsafe\b|\bffi\b|extern\s*\"?c\"?|transmute|\braw pointer|wskaźnik\w* surow|soundness|\bmiri\b|no_mangle|repr\(c\)"),
-    (2, "concurrency/async", r"\basync\b|\bawait\b|tokio|współbieżn|concurren|\bthread|wątk|\block|mutex|rwlock|atomic|deadlock|zakleszcz|race|wyścig|select!|channel|kanał"),
-    (2, "type-level/lifetimes/macros", r"lifetime|czas\w* życia|\bgat\b|higher.ranked|\bhrtb\b|trait object|dyn trait|generic|generyczn|proc.?macro|makr|macro_rules|const generic|variance|pin\b|\bunpin\b"),
+    (2, "concurrency/async", r"\basync\b|\bawait\b|tokio|współbieżn|concurren|\bthread|wątk|(?<![.\w])lock(s|ed|ing)?\b|mutex|rwlock|\batomic(?!al|it)|deadlock|zakleszcz|\brac(e[sd]?|y|ing)\b|wyścig|select!|channel|kanał"),
+    (2, "type-level/lifetimes/macros", r"lifetime|czas\w* życia|\bgat\b|higher.ranked|\bhrtb\b|trait object|dyn trait|generic|generyczn|proc.?macro|makr|macro_rules|const generic|variance|\bpin\b|\bunpin\b"),
     (2, "architecture/refactor", r"refaktor|refactor|architekt|redesign|przeprojekt|migrac|migrat|cały\w* (crate|moduł|projekt)|across (the )?(workspace|crates)|wiele crate|multiple crates|public api|publiczn\w* api|breaking"),
     (1, "performance", r"wydajno|performance|optymaliz|optimi[sz]|zero.copy|allocat|alokac|benchmark|simd|\bhot path"),
     (1, "persistence/protocol", r"\bsql\b|sqlx|migration|baz\w* danych|database|protok|protocol|serializ|parser|parsow"),

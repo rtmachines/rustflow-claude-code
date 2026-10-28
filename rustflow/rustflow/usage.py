@@ -98,7 +98,25 @@ def summarize(rows: list[dict], *, history_complete: bool = True) -> dict:
                          [r["known_tokens"].get(key) for r in subset], history_complete=history_complete)
             for key in (*TOKEN_FIELDS[provider], "total_tokens")}
         out["providers"][provider] = group
+    # Per role (known counters): shows where the tokens go, e.g. cold cache writes of every fresh session.
+    out["roles"] = {}
+    for role in sorted({r.get("role", "?") for r in rows}):
+        subset = [r for r in rows if r.get("role", "?") == role]
+        group = _aggregate(subset, history_complete)
+        keys = dict.fromkeys(k for r in subset for k in TOKEN_FIELDS[r["provider"]])
+        group["tokens"] = {k: sum(r["known_tokens"].get(k) or 0 for r in subset) for k in keys}
+        prompt = sum(_prompt_tokens(r) for r in subset)
+        group["cache_read_share"] = group["tokens"].get("cache_read_input_tokens", 0) / prompt if prompt else None
+        out["roles"][role] = group
     return out
+
+
+def _prompt_tokens(row: dict) -> int:
+    """All input-side tokens of an attempt. Codex input already includes cached input."""
+    known = row["known_tokens"]
+    keys = ("input_tokens",) if row["provider"] == "codex" else (
+        "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    return sum(known.get(k) or 0 for k in keys)
 
 
 def summary_for_state(state: dict) -> dict:
