@@ -56,6 +56,30 @@ def test_triage(task, expected):
     assert triage.heuristic(task, None, Config(load_defaults())).difficulty == expected
 
 
+def _signals(task):
+    return [r.split(" (")[0] for r in triage.heuristic(task, None, Config(load_defaults())).reasons]
+
+
+@pytest.mark.parametrize("task", [
+    "Update the Cargo.lock entry for serde",        # was: concurrency (`lock`)
+    "Write the config file atomically",             # was: concurrency (`atomic`)
+    "Add trace logging to the CLI",                 # was: concurrency (`race` in `trace`)
+    "Add a spin count to the retry loop",           # was: type-level (`pin` in `spin`)
+])
+def test_triage_ignores_substring_false_positives(task):
+    # Each false hit is +2: enough to route an easy task to opus (measured A/B: 2x cost, same quality).
+    assert not {"concurrency/async", "type-level/lifetimes/macros"} & set(_signals(task))
+
+
+@pytest.mark.parametrize("task,signal", [
+    ("Fix the deadlock: two locks taken in different order", "concurrency/async"),
+    ("Replace the counter with an AtomicUsize", "concurrency/async"),
+    ("Fix a data race in the cache", "concurrency/async"),
+    ("Return Pin<Box<dyn Future>> from the builder", "type-level/lifetimes/macros"),
+])
+def test_triage_keeps_real_signals(task, signal):
+    assert signal in _signals(task)
+
 
 # ── schemas ──────────────────────────────────────────────────────────────────
 def test_schema_coercion_and_defaults():
