@@ -406,7 +406,8 @@ def exit_code(status: str) -> int:
 
 # ── wait / cancel ────────────────────────────────────────────────────────────
 def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channel: str = "cli") -> dict:
-    """Block until the run finishes or timeout; stream only NEW orchestrator log lines (compact).
+    """Block until the run finishes (final status saved and its ACTIVE lock released) or timeout; stream only
+    NEW orchestrator log lines (compact).
     channel: each kind of waiter (CLI, MCP server) has its own read position, so one does not consume the
     progress lines the other has not seen yet."""
     log = run_dir / "rustflow.log"
@@ -429,9 +430,16 @@ def wait(run_dir: Path, timeout_s: float, out=print, poll_s: float = 2.0, channe
         offset_file.write_text(str(offset), encoding="utf-8")
         state = load_state(run_dir)
         status = effective_status(state)
-        if status != "running" or time.monotonic() >= deadline:
+        if time.monotonic() >= deadline or (status != "running" and not _holds_lock(run_dir, state)):
             return summary(state)
         time.sleep(poll_s)
+
+
+def _holds_lock(run_dir: Path, state: dict) -> bool:
+    """The orchestrator saves the final status, then writes the report and only then releases ACTIVE.json;
+    a waiter that acted in between was still locked out of the checkout (hooks, `acquire`)."""
+    act = gates.read_active(run_dir.parent.parent.parent)
+    return bool(act) and act.get("run_id") == state.get("run_id")
 
 
 def _windows_interrupt(pid: int, private_console: bool = False) -> None:

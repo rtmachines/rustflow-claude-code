@@ -18,6 +18,35 @@ from rustflow.mcp_server import Server
 TASK = "Add `parse_kv(input: &str) -> Vec<(String, String)>` to src/lib.rs. Trim whitespace. Add tests."
 
 
+def _finished_run(repo, lock_run_id):
+    run_dir = repo / ".rustflow" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(json.dumps({"run_id": "r1", "status": "approved", "pid": os.getpid()}))
+    gates.active_lock_path(repo).write_text(json.dumps({"run_id": lock_run_id, "pid": os.getpid()}))
+    return run_dir
+
+
+def test_wait_returns_only_after_the_run_released_its_lock(tmp_path):
+    # CI flake: the orchestrator saves the final status, then writes the report and only then releases
+    # ACTIVE.json. A driver acting on `wait` in that window was still locked out of the checkout.
+    import threading
+    run_dir = _finished_run(tmp_path, "r1")
+    timer = threading.Timer(0.6, runs.release, (tmp_path, "r1"))
+    timer.start()
+    try:
+        s = runs.wait(run_dir, 10, out=lambda *_: None, poll_s=0.1)
+        assert s["status"] == "approved" and gates.read_active(tmp_path) is None
+    finally:
+        timer.cancel()
+
+
+def test_wait_ignores_the_lock_of_another_run(tmp_path):
+    run_dir = _finished_run(tmp_path, "other")
+    start = time.monotonic()
+    assert runs.wait(run_dir, 10, out=lambda *_: None, poll_s=0.1)["status"] == "approved"
+    assert time.monotonic() - start < 2
+
+
 def _wait_for(pred, timeout=30.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
