@@ -156,8 +156,27 @@ def find_run(repo: Path, ref: str | None) -> Path:
     return path
 
 
+def _sharing_retry(action, attempts: int = 20, delay_s: float = 0.05):
+    """Windows opens files without FILE_SHARE_DELETE: reading state.json while the orchestrator os.replace()s
+    it (every second, heartbeat), or replacing it while a waiter has it open, raises PermissionError for a
+    moment. Retry briefly; any other error, or a lasting one, propagates."""
+    for attempt in range(attempts):
+        try:
+            return action()
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay_s)
+
+
 def load_state(run_dir: Path) -> dict:
-    return json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    return json.loads(_sharing_retry(lambda: (run_dir / "state.json").read_text(encoding="utf-8")))
+
+
+def write_state(run_dir: Path, state: dict) -> None:
+    tmp = run_dir / "state.json.tmp"
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    _sharing_retry(lambda: os.replace(tmp, run_dir / "state.json"))
 
 
 def effective_status(state: dict) -> str:

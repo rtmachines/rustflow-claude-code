@@ -133,9 +133,7 @@ class Orchestrator:
         with self._state_lock:
             if self.budget:
                 self.budget.checkpoint()
-            tmp = self.run_dir / "state.json.tmp"
-            tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, self.run_dir / "state.json")
+            runs.write_state(self.run_dir, self.state)
             runs.update_lock(self.repo, self.state)
 
     def _prepare_usage(self, *, resume: bool = False) -> None:
@@ -247,7 +245,7 @@ class Orchestrator:
 
     def resume(self, run_dir: Path, extra_rounds: int = 0) -> int:
         self.run_dir = run_dir
-        self.state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.state = runs.load_state(run_dir)
         saved = self.state.get("options", {})
         for k, v in saved.items():
             if hasattr(self.opts, k) and k not in ("dry_run", "verbose", *DEFAULT_LIMITS):

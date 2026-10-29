@@ -40,6 +40,33 @@ def test_wait_returns_only_after_the_run_released_its_lock(tmp_path):
         timer.cancel()
 
 
+def _flaky(real, failures):
+    """Raise PermissionError `failures` times, then behave like `real` (Windows sharing violation)."""
+    left = [failures]
+
+    def call(*args, **kwargs):
+        if left[0]:
+            left[0] -= 1
+            raise PermissionError(13, "Permission denied")
+        return real(*args, **kwargs)
+    return call
+
+
+def test_state_is_read_through_a_windows_replace_window(tmp_path, monkeypatch):
+    # CI (windows, 3.13): `wait` opened state.json while the orchestrator's heartbeat os.replace()d it.
+    run_dir = _finished_run(tmp_path, "other")
+    monkeypatch.setattr(Path, "read_text", _flaky(Path.read_text, 2))
+    assert runs.load_state(run_dir)["status"] == "approved"
+
+
+def test_state_is_saved_through_a_windows_replace_window(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setattr(os, "replace", _flaky(os.replace, 2))
+    runs.write_state(run_dir, {"run_id": "r1", "status": "running"})
+    assert json.loads((run_dir / "state.json").read_text())["status"] == "running"
+
+
 def test_wait_ignores_the_lock_of_another_run(tmp_path):
     run_dir = _finished_run(tmp_path, "other")
     start = time.monotonic()
