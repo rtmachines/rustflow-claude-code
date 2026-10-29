@@ -119,6 +119,9 @@ def test_required_test_blocks_until_it_exists(rust_repo, monkeypatch, tmp_path):
     r1 = st["rounds"][0]
     t = next(f for f in r1["findings"] if f["id"] == "T-C1")
     assert t["status"] == "open" and t["reviewers"] == ["orchestrator"] and "did not run" in t["title"]
+    # The reviewers' `not_met` for [C1] restates T-C1: one blocking finding, their view kept in `also`.
+    assert [f["id"] for f in r1["findings"] if f["category"] == "acceptance" and f["status"] == "open"] == ["T-C1"]
+    assert [a["reviewer"] for a in t["also"]] == ["reviewer_a, reviewer_b"]   # their merged not_met
     assert r1["mechanical"][0]["status"] == "not_met"
     [m] = st["mechanical"]
     assert (m["id"], m["test"], m["status"]) == ("C1", "tests::trims_whitespace", "met")
