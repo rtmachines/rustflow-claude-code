@@ -252,16 +252,18 @@ Role skills (`rustflow-plan`, `rustflow-implement`, `rustflow-review`, `rustflow
 
 | Key in `[skills]` | Default | Applies to |
 | --- | --- | --- |
-| `all` | `["auto"]` | Every mapped role below. |
-| `planner` | `[]` | Planner. |
-| `implementer` | `[]` | Implementer. |
+| `all` | `["stack"]` | Every mapped role below. |
+| `planner` | `["auto"]` | Planner. |
+| `implementer` | `["auto"]` | Implementer. |
 | `reviewer` | `[]` | `reviewer_a`, `reviewer_b`, the LLM auditor, and the installed interactive reviewer. |
-| `fixer` | `[]` | Fixer. |
+| `fixer` | `["auto"]` | Fixer. Keep it equal to `implementer`: identical system prompts let gate fixes reuse the implementer's prompt cache. |
 | `max_kb` | `64` | Combined size of selected extra `SKILL.md` files per role/provider, in 1024-byte units. Exceeding it is an error. |
 
-Names resolve under `.claude/skills/<name>/SKILL.md` for Claude and `.agents/skills/<name>/SKILL.md` for Codex. `all` and the role group are concatenated, then duplicate names are removed. `auto` selects installed `rustflow-stack-*` skills plus `rust-skills` and optional `rust-best-practices`; it does not select arbitrary installed skills or duplicate the role skill. An explicitly named missing skill is an error; an absent auto-discovered skill is simply absent. Preflight checks role/provider combinations across all difficulty routes.
+Names resolve under `.claude/skills/<name>/SKILL.md` for Claude and `.agents/skills/<name>/SKILL.md` for Codex. `all` and the role group are concatenated, then duplicate names are removed. `stack` selects installed `rustflow-stack-*` skills; `auto` selects those plus `rust-skills` and optional `rust-best-practices`; it does not select arbitrary installed skills or duplicate the role skill. An explicitly named missing skill is an error; an absent auto-discovered skill is simply absent. Preflight checks role/provider combinations across all difficulty routes.
 
 Only `SKILL.md` is attached. Reference files remain on disk, with their location included for agents to open as needed. Claude defaults to a system-prompt file whose content is the same for every role with the same skills (the role is stated in the prompt, so implementer and fixer share the prompt cache), Codex always receives extras inline, and `init` embeds interactive reviewer preloads in its generated definition. Rerun `init` to regenerate that definition after changing its preload configuration. Triage and the `tob_audit` role have no extra-skill group mapping.
+
+By default reviewers get only stack skills. In a measured comparison (4 report-only reviews of the same diff with three injected defects) reviewers with and without the general knowledge base found the same defects; the knowledge base only added about 10k tokens of cold prompt-cache writes to every review. Add `reviewer = ["auto"]` to restore it.
 
 ```toml
 [skills]

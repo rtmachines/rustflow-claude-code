@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 AUTO = "auto"
+STACK = "stack"   # only the installed rustflow-stack-* skills (no general knowledge base)
 KNOWLEDGE_SKILLS = ("rust-skills", "rust-best-practices")
 ROLE_GROUP = {"planner": "planner", "implementer": "implementer", "fixer": "fixer",
               "reviewer_a": "reviewer", "reviewer_b": "reviewer", "auditor": "reviewer", "reviewer": "reviewer"}
@@ -32,14 +33,17 @@ def _base(cwd: Path, provider: str) -> Path:
     return cwd / SKILL_BASE.get(provider, ".claude/skills")
 
 
-def auto_names(cwd: Path, provider: str) -> list[str]:
+def stack_names(cwd: Path, provider: str) -> list[str]:
     base = _base(cwd, provider)
     if not base.is_dir():
         return []
-    names = sorted(p.name for p in base.iterdir()
-                   if p.name.startswith("rustflow-stack-") and (p / "SKILL.md").is_file())
-    names.extend(name for name in KNOWLEDGE_SKILLS if (base / name / "SKILL.md").is_file())
-    return names
+    return sorted(p.name for p in base.iterdir()
+                  if p.name.startswith("rustflow-stack-") and (p / "SKILL.md").is_file())
+
+
+def auto_names(cwd: Path, provider: str) -> list[str]:
+    base = _base(cwd, provider)
+    return stack_names(cwd, provider) + [name for name in KNOWLEDGE_SKILLS if (base / name / "SKILL.md").is_file()]
 
 
 def configured_names(section: dict, role: str) -> list[str]:
@@ -59,7 +63,8 @@ def resolve(section: dict, role: str, cwd: Path, provider: str, *, strict: bool 
     paths: list[Path] = []
     seen: set[str] = set()
     for name in configured_names(section, role):
-        names = auto_names(cwd, provider) if name == AUTO else [name]
+        names = (auto_names(cwd, provider) if name == AUTO else stack_names(cwd, provider) if name == STACK
+                 else [name])
         for n in names:
             if n in seen:
                 continue

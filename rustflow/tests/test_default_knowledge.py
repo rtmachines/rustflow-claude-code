@@ -32,9 +32,25 @@ def test_default_knowledge_installed_and_preloaded(tmp_path, knowledge_clone):
         root = tmp_path / base / "rust-skills"
         assert (root / "rules/ownership.md").read_text() == "Borrow before cloning"
         assert (root / "LICENSE").read_text() == "MIT"
-        for role in ("planner", "implementer", "fixer", "reviewer_a", "auditor"):
+        for role in ("planner", "implementer", "fixer"):
             assert skills.resolve(section, role, tmp_path, provider) == [root / "SKILL.md"]
-    assert "  - rust-skills\n" in (tmp_path / ".claude/agents/rustflow-reviewer.md").read_text()
+        # Measured (4 reviews, 3 injected defects): reviewers found the same defects without the general
+        # knowledge base; it only added a ~10k-token cold cache write to every review.
+        for role in ("reviewer_a", "reviewer_b", "auditor"):
+            assert skills.resolve(section, role, tmp_path, provider) == []
+    assert "rust-skills" not in (tmp_path / ".claude/agents/rustflow-reviewer.md").read_text()
+
+
+def test_default_stack_skill_reaches_every_role(tmp_path, knowledge_clone):
+    installer.Installer(tmp_path, ci=False, stack="axum-sqlx", out=lambda *_: None).run()
+    section = Config.load(tmp_path).data["skills"]
+    stack = tmp_path / ".claude/skills/rustflow-stack-axum-sqlx/SKILL.md"
+    knowledge = tmp_path / ".claude/skills/rust-skills/SKILL.md"
+    assert skills.resolve(section, "reviewer_a", tmp_path, "claude") == [stack]
+    # implementer and fixer get the same list, so their system prompts (and prompt cache) stay identical
+    assert skills.resolve(section, "implementer", tmp_path, "claude") == [stack, knowledge]
+    assert skills.resolve(section, "fixer", tmp_path, "claude") == [stack, knowledge]
+    assert "  - rustflow-stack-axum-sqlx\n" in (tmp_path / ".claude/agents/rustflow-reviewer.md").read_text()
 
 
 def test_knowledge_preserved_unless_forced(tmp_path, knowledge_clone):

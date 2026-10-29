@@ -305,7 +305,7 @@ def test_review_context_and_report_hooks(rust_repo):
     assert "APPROVE is invalid with P0/P1" in outs[0].stderr and "## Gates" in outs[0].stderr
 
 
-def test_always_on_skills_reach_every_agent(rust_repo, monkeypatch):
+def test_always_on_skills_reach_their_roles(rust_repo, monkeypatch):
     for base in (".claude/skills", ".agents/skills"):
         d = rust_repo / base / "rust-best-practices"
         d.mkdir(parents=True)
@@ -314,13 +314,20 @@ def test_always_on_skills_reach_every_agent(rust_repo, monkeypatch):
     git(rust_repo, "commit", "-qm", "apollo")
     rc, st = run(rust_repo, "happy", monkeypatch)
     assert st["status"].startswith("approved"), st.get("stop_reason")
-    assert all("rust-best-practices" in a["skills"] for a in st["agents"])
-    for c in read_log(rust_repo):
-        if c["provider"] == "claude":
+    # Default: the knowledge base goes to the writing roles; reviewers get only stack skills (none here).
+    writers = {"implementer", "fixer"}
+    assert {a["name"] for a in st["agents"] if "rust-best-practices" in a["skills"]} == {
+        a["name"] for a in st["agents"] if a["role"] in writers}
+    calls = read_log(rust_repo)
+    assert {c["role"] for c in calls} >= {"implementer", "reviewer_a", "reviewer_b"}
+    for c in calls:
+        if c["provider"] == "claude" and c["role"] in writers:
             f = c["argv"][c["argv"].index("--append-system-prompt-file") + 1]
             assert "APOLLO-MARKER" in Path(f).read_text()
+        elif c["provider"] == "claude":
+            assert "--append-system-prompt-file" not in c["argv"]
         else:
-            assert c["prompt_head"].startswith('<skill name="rust-best-practices"')
+            assert not c["prompt_head"].startswith('<skill name="rust-best-practices"')
 
 
 def test_missing_always_on_skill_stops_at_preflight(rust_repo, monkeypatch, tmp_path):

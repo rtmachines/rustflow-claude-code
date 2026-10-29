@@ -237,7 +237,7 @@ Zweryfikowane na żywo (Claude Code 2.1.310, haiku jako dyspozytor i recenzenci)
 ## 12. Skille zawsze aktywne
 
 Skill wywoływany przez model ładuje się tylko wtedy, gdy model uzna, że opis pasuje do zadania, więc skill
-stacku czy rust-skills może nie zostać przeczytany wcale. `[skills]` (domyślnie `all = ["auto"]`) dołącza je
+stacku czy rust-skills może nie zostać przeczytany wcale. `[skills]` (domyślnie stack dla wszystkich ról, a rust-skills dla plannera, implementera i fixera; recenzenci bez niego, bo w pomiarze wykrywali te same wady) dołącza je
 deterministycznie do każdej roli: Claude przez `--append-system-prompt-file` (treść identyczna dla
 wszystkich ról z tymi samymi skillami, więc zostaje w prompt cache), Codex na początku promptu, interaktywny recenzent przez preload `skills:`.
 Brak jawnie wymienionego skilla to błąd w preflight, a `max_kb` chroni kontekst. Zweryfikowane na żywo:
