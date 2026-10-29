@@ -157,6 +157,10 @@ bin = "codex"
 network = false             # sieć w sandboxie workspace-write (np. cargo fetch nowych crate'ów)
 add_dirs = []               # dodatkowe zapisywalne katalogi, np. ["~/.cargo"]
 skill_invocation = "mention" # mention ($skill w prompcie) | inline
+# Agenci nie uruchamiają serwerów MCP z [mcp_servers.*] w ~/.codex/config.toml (odpowiednik strict_mcp dla Claude):
+# każdy włączony dostaje -c mcp_servers.<nazwa>.enabled=false. Serwerów z pluginów Codex nie da się tak wyłączyć. Zmierzone: serwer `serena` zapisał .serena/ w checkoucie
+# podczas recenzji tylko do odczytu (run zakończony tree_changed).
+strict_mcp = true
 extra_args = []
 
 # ── Skille dołączane NA PEWNO (nie "jeśli model zechce") ─────────────────────
