@@ -242,6 +242,7 @@ Write calls also receive a rule for the configured Python gates command, its Pow
 | `network` | `false` | For write calls, request `sandbox_workspace_write.network_access=true`. Does not change read-only calls. |
 | `add_dirs` | `[]` | Additional writable directories for write calls, passed as `--add-dir`; `~` is expanded. The shared `CARGO_TARGET_DIR` is added automatically for worktree runs. |
 | `skill_invocation` | `"mention"` | `mention` invokes the role as `$skill`; `inline` embeds the role skill body. |
+| `strict_mcp` | `true` | Do not start the MCP servers defined in `[mcp_servers.*]` of `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`): each enabled one gets `-c mcp_servers.<name>.enabled=false`. The counterpart of Claude's `strict_mcp`. Servers provided by Codex plugins cannot be disabled this way (an override for them makes Codex fail with "invalid transport") and still start; `tree_changed` guards reviews against files they write. A `mcp_servers={}` override does not work, since Codex merges it with the user table. |
 | `extra_args` | `[]` | Additional CLI arguments. |
 
 Codex uses `exec`, `workspace-write` for write roles and `read-only` for read roles. The configured model and effort become `-m` and `model_reasoning_effort`. It emits JSON events plus a last-message artifact; Rustflow records token usage when provided, but has no Codex dollar-cap flag.

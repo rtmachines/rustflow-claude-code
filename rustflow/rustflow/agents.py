@@ -468,8 +468,38 @@ class ClaudeRunner(BaseRunner):
         return self._finish(call, res)
 
 
+_BARE_TOML_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 class CodexRunner(BaseRunner):
     provider = "codex"
+
+    def __init__(self, cfg: Config):
+        super().__init__(cfg)
+        self._mcp_off: list[str] | None = None
+
+    def strict_mcp_args(self) -> list[str]:
+        """Counterpart of Claude's --strict-mcp-config: `-c mcp_servers.<name>.enabled=false` for every MCP server
+        defined in the user's $CODEX_HOME/config.toml. Measured live: a user `serena` server wrote .serena/ into
+        the checkout during a read-only review. Only servers defined there can be overridden - an override for a
+        plugin-provided server creates an entry without a transport and Codex refuses to start ("invalid
+        transport"); a `-c mcp_servers={}` override is merged, not replaced. Plugin servers therefore still start;
+        tree_changed guards reviews."""
+        if not self.pcfg.get("strict_mcp", True):
+            return []
+        if self._mcp_off is None:
+            self._mcp_off = []
+            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+            try:
+                import tomllib
+                servers = tomllib.loads((home / "config.toml").read_text(encoding="utf-8")).get("mcp_servers")
+            except (OSError, ValueError):
+                servers = None
+            for name, server in (servers or {}).items() if isinstance(servers, dict) else ():
+                if isinstance(server, dict) and server.get("enabled", True) is not False:
+                    key = name if _BARE_TOML_KEY.match(name) else json.dumps(name)
+                    self._mcp_off += ["-c", f"mcp_servers.{key}.enabled=false"]
+        return list(self._mcp_off)
 
     def build_argv(self, call: AgentCall, last_msg: Path, schema_path: Path | None) -> list[str]:
         p = self.pcfg
@@ -487,6 +517,7 @@ class CodexRunner(BaseRunner):
                 dirs.append(call.env["CARGO_TARGET_DIR"])
             for d in dict.fromkeys(dirs):
                 argv += ["--add-dir", d]
+        argv += self.strict_mcp_args()
         argv += [str(a) for a in p.get("extra_args", [])]
         argv.append("-")  # prompt from stdin
         return argv

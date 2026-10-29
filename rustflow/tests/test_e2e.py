@@ -330,6 +330,19 @@ def test_always_on_skills_reach_their_roles(rust_repo, monkeypatch):
             assert not c["prompt_head"].startswith('<skill name="rust-best-practices"')
 
 
+def test_codex_agents_run_without_the_users_mcp_servers(rust_repo, monkeypatch, tmp_path):
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('[mcp_servers.serena]\ncommand = "serena"\n'
+                                      '[mcp_servers.off]\ncommand = "off"\nenabled = false\n')
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    rc, st = run(rust_repo, "happy", monkeypatch)
+    assert st["status"].startswith("approved"), st.get("stop_reason")
+    codex = [c for c in read_log(rust_repo) if c["provider"] == "codex"]
+    assert codex and all("mcp_servers.serena.enabled=false" in c["argv"] for c in codex)
+    assert not any("mcp_servers.off.enabled=false" in c["argv"] for c in codex)
+
+
 def test_missing_always_on_skill_stops_at_preflight(rust_repo, monkeypatch, tmp_path):
     cfg = tmp_path / "s.toml"
     cfg.write_text((rust_repo / "rustflow.toml").read_text().replace('reviewer = []               #',

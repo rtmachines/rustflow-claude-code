@@ -168,3 +168,72 @@ def test_doctor_hints_at_user_level_hooks(tmp_path, monkeypatch):
     lines.clear()
     Doctor(tmp_path, Config(d), out=lines.append).check_user_settings()
     assert lines == []
+
+
+# -- Codex MCP isolation -------------------------------------------------------
+CODEX_CONFIG = """
+model = "gpt-6-astra"
+[mcp_servers.serena]
+command = "serena"
+args = ["start-mcp-server", "--project-from-cwd"]
+[mcp_servers.code-review-graph]
+command = "code-review-graph"
+[mcp_servers.off]
+command = "off"
+enabled = false
+[mcp_servers."odd.name"]
+command = "odd"
+[plugins."context-mode@context-mode"]
+enabled = true
+"""
+
+
+def _codex(tmp_path, monkeypatch, config=CODEX_CONFIG, strict=True):
+    from rustflow import agents, procutil
+    from rustflow.config import AgentSpec, Config, load_defaults
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    if config is not None:
+        (home / "config.toml").write_text(config)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(procutil, "resolve_command", lambda name: [name])
+    data = load_defaults()
+    data["providers"]["codex"]["strict_mcp"] = strict
+    call = agents.AgentCall(role="reviewer_b", name="r1-reviewer_b", spec=AgentSpec("codex", "gpt-6-astra", "high"),
+                            prompt="p", write=False, schema=None, cwd=tmp_path, log_dir=tmp_path / "logs")
+    argv = agents.CodexRunner(Config(data)).build_argv(call, tmp_path / "last.txt", None)
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "-c" and argv[i + 1].startswith("mcp_servers.")], argv
+
+
+def test_codex_agents_do_not_start_the_users_mcp_servers(tmp_path, monkeypatch):
+    # Live: a `serena` server from ~/.codex/config.toml wrote .serena/ into the checkout during a read-only
+    # review (tree_changed). Claude agents already run with --strict-mcp-config.
+    overrides, argv = _codex(tmp_path, monkeypatch)
+    assert overrides == ["mcp_servers.serena.enabled=false", "mcp_servers.code-review-graph.enabled=false",
+                         'mcp_servers."odd.name".enabled=false']
+    assert argv[-1] == "-"                                   # prompt from stdin stays last
+
+
+def test_codex_overrides_only_servers_defined_in_the_config(tmp_path, monkeypatch):
+    # Live regression: overriding a plugin-provided server (`codex mcp list` shows context-mode, cua_repl, ...)
+    # creates an mcp_servers entry without a transport and every Codex call fails: "invalid transport".
+    import json as _json
+    from rustflow import procutil
+
+    class Listing:
+        returncode, stderr, output_complete = 0, "", True
+        stdout = _json.dumps([{"name": n, "enabled": True} for n in ("serena", "context-mode", "cua_repl")])
+    monkeypatch.setattr(procutil, "run", lambda argv, **kw: Listing())
+    overrides, _ = _codex(tmp_path, monkeypatch)
+    assert not any("context-mode" in o or "cua_repl" in o or ".off." in o for o in overrides)
+    assert "mcp_servers.serena.enabled=false" in overrides
+
+
+def test_codex_mcp_isolation_can_be_disabled(tmp_path, monkeypatch):
+    overrides, _ = _codex(tmp_path, monkeypatch, strict=False)
+    assert overrides == []
+
+
+@pytest.mark.parametrize("config", [None, "not [ toml", 'mcp_servers = "x"'])
+def test_codex_without_a_usable_config_gets_no_overrides(tmp_path, monkeypatch, config):
+    assert _codex(tmp_path, monkeypatch, config=config)[0] == []
