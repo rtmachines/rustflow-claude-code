@@ -72,7 +72,8 @@ class Installer:
     def _render(self, text: str) -> str:
         """Interpreter, language and optional skills baked into Claude-only templates."""
         lang = "pl"
-        skills_cfg: dict = {"all": ["auto"]}
+        from rustflow.config import load_defaults
+        skills_cfg: dict = load_defaults()["skills"]
         cfg = self.repo / "rustflow.toml"
         try:
             import tomllib

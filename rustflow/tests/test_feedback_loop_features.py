@@ -248,4 +248,5 @@ def test_installer_preloads_always_on_skills_in_reviewer_agent(tmp_path):
     Installer(tmp_path, with_rust_skills=False, python_cmd="python3", ci=False, stack="axum-sqlx", out=lambda *_: None).run()
     agent = (tmp_path / ".claude" / "agents" / "rustflow-reviewer.md").read_text()
     head = agent.split("hooks:")[0]
-    assert "  - rustflow-review\n  - rustflow-stack-axum-sqlx\n  - rust-best-practices\n" in head
+    assert "  - rustflow-review\n  - rustflow-stack-axum-sqlx\n" in head
+    assert "rust-best-practices" not in head      # default: reviewers get stack skills, no knowledge base
